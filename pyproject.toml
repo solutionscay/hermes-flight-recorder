@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-dbass"
+version = "0.0.0"
+description = "Bridge — the local-first companion for Hermes DBaaS: capture, encrypt, buffer, and reconcile Hermes agent execution events."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Solutions Cay", email = "jose@solutionscay.com" }]
+keywords = ["hermes", "agents", "observability", "local-first", "control-plane", "execution-ledger"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: System :: Monitoring",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/solutionscay/hermes-dbass"
+Issues = "https://github.com/solutionscay/hermes-dbass/issues"
+
+[project.scripts]
+hermes-dbass = "hermes_dbass.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_dbass"]

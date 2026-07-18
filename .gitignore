@@ -1,0 +1,43 @@
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── Secrets / keys (NEVER commit) ─────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+keys/
+
+# ── Local agent state (NEVER commit Hermes runtime data) ──
+# Bridge runs against a live Hermes install. Its DBs, the local
+# outbox, and any dev Hermes home must stay out of the repo.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+outbox.sqlite*
+.hermes-dev/
+.hermes/
+
+# ── OS / editor ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
