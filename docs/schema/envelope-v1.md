@@ -57,10 +57,22 @@ platforms extend it — so `surface` is a free-form string and is never
 enum-validated. The two producers use related-but-different vocabularies and
 are not reconciled.
 
+**`runtime.gateway_start_failed`** is emitted by the reconciler (`source`
+`reconciler`, `capture_method` `derive:reconciler`, `partial` true) because
+Hermes only fires the `gateway:startup` hook on success — a failed start is
+invisible to live capture, so the reconciler reads the durable
+`gateway_state.json` and `gateway-starts.log` read-only. Plaintext payload:
+`reason_class` (`token_conflict` \| `policy_open` \| `config_invalid` \|
+`absent` \| `unknown`), and, by case, `gateway_state`, `platform`,
+`error_code`, `conflicting_pid`, `last_start_at`. The raw `exit_reason` /
+`error_message` is sensitive and lives only in encrypted content. Liveness is
+never keyed off `updated_at` — a healthy idle gateway never advances it.
+
 ## Event-type surface
 
 **P0-poc** — captured and observed in the Phase 0 POC:
-`runtime.gateway_started`, `session.created`, `session.ended`,
+`runtime.gateway_started`, `runtime.gateway_start_failed`,
+`session.created`, `session.ended`,
 `invocation.started`, `invocation.completed`, `model.usage_recorded`,
 `tool.call_completed`, `subagent.child_spawned`, `subagent.completed`,
 `delegation.dispatched`, `cron.ticker_heartbeat`, `cron.run_claimed`,

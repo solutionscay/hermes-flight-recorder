@@ -92,6 +92,7 @@ def reconcile(
     _detect_coverage_gaps(outbox, events, home, counts, when)
     _detect_missing_terminals(outbox, events, home, counts, when, cfg)
     _detect_missed_cron(outbox, home, counts, when, cfg)
+    _detect_gateway_start_failed(outbox, home, counts, when, cfg)
     return dict(counts)
 
 
@@ -624,6 +625,145 @@ def _dow(d: datetime.datetime) -> int:
     return (d.weekday() + 1) % 7
 
 
+# --- gateway start failure ----------------------------------------------
+def _detect_gateway_start_failed(outbox, home, counts, when, cfg) -> None:
+    """A gateway that failed to start, hit a token conflict, or vanished.
+
+    Hermes fires the ``gateway:startup`` hook only on success, so a failed
+    start emits no hook event — it is invisible to live capture (the same
+    silent-failure class as ``cron.run_missed``). Hermes does write the
+    failure durably, so the reconciler reads it read-only:
+
+    - **Case A — startup_failed.** ``gateway_state.json`` has
+      ``gateway_state='startup_failed'`` with an ``exit_reason``.
+    - **Case B — token_conflict.** A duplicate bot token keeps the gateway
+      degraded/running but marks the platform with an ``error_code`` ending
+      ``_lock`` (e.g. ``discord-bot-token_lock``) / an "already in use (PID N)"
+      message. Names the platform and the conflicting PID.
+    - **Case C — absent.** ``gateway-starts.log`` shows the gateway started
+      before, but its runtime status file is gone. Conservative: only when no
+      ``gateway_state.json`` exists at all, so a clean ``gateway stop`` (which
+      leaves ``gateway_state='stopped'``) is never flagged.
+
+    Never keys liveness off ``updated_at`` — a healthy idle gateway never
+    advances it. Every finding is ``partial``; each dedup key is anchored on a
+    durable event time (never the reconcile-run ``when``), so a second pass
+    over the same state appends nothing. The raw ``exit_reason`` /
+    ``error_message`` is sensitive and goes only into encrypted content.
+    """
+    state_path = home / "gateway_state.json"
+    if state_path.exists():
+        data = _load_json(state_path)
+        state = data.get("gateway_state")
+        updated_at = to_epoch(data.get("updated_at")) or 0.0
+
+        if state == "startup_failed":
+            reason = data.get("exit_reason") or ""
+            _emit(
+                outbox, counts,
+                event_type="runtime.gateway_start_failed",
+                occurred_at=updated_at or when,
+                correlation_id="gateway",
+                partial=True,
+                payload={"reason_class": _classify_gateway_reason(reason), "gateway_state": state},
+                content=reason or None,
+                dedup_key=f"reconcile:gateway_start_failed:startup_failed:{int(updated_at)}",
+            )
+
+        platforms = data.get("platforms")
+        if isinstance(platforms, dict):
+            for pname, pinfo in platforms.items():
+                if not isinstance(pinfo, dict):
+                    continue
+                code = pinfo.get("error_code") or ""
+                msg = pinfo.get("error_message") or ""
+                if not (code.endswith("_lock") or "already in use" in msg):
+                    continue
+                pid = _parse_pid(msg)
+                p_updated = to_epoch(pinfo.get("updated_at")) or updated_at or when
+                _emit(
+                    outbox, counts,
+                    event_type="runtime.gateway_start_failed",
+                    occurred_at=p_updated,
+                    correlation_id=f"gateway:{pname}",
+                    partial=True,
+                    payload={
+                        "reason_class": "token_conflict",
+                        "gateway_state": state,
+                        "platform": pname,
+                        "error_code": code or None,
+                        "conflicting_pid": pid,
+                    },
+                    content=msg or None,
+                    dedup_key=(
+                        f"reconcile:gateway_start_failed:token_conflict:"
+                        f"{pname}:{pid if pid is not None else 'unknown'}"
+                    ),
+                )
+        return
+
+    # Case C: started before (history) but the status file is gone.
+    last_start = _last_start_epoch(home / "gateway-starts.log")
+    if last_start is not None:
+        _emit(
+            outbox, counts,
+            event_type="runtime.gateway_start_failed",
+            occurred_at=last_start,
+            correlation_id="gateway",
+            partial=True,
+            payload={"reason_class": "absent", "last_start_at": last_start},
+            dedup_key=f"reconcile:gateway_start_failed:absent:{int(last_start)}",
+        )
+
+
+def _classify_gateway_reason(text: str) -> str:
+    """Map a gateway exit_reason to a plaintext reason class. Best-effort."""
+    low = (text or "").lower()
+    if "already in use" in low or "_lock" in low or "conflict" in low:
+        return "token_conflict"
+    if "policy" in low:
+        return "policy_open"
+    if "config" in low or "invalid" in low or "not found" in low:
+        return "config_invalid"
+    return "unknown"
+
+
+def _parse_pid(text: str) -> int | None:
+    import re
+
+    match = re.search(r"PID (\d+)", text or "")
+    return int(match.group(1)) if match else None
+
+
+def _last_start_epoch(path: Path) -> float | None:
+    """The last epoch in gateway-starts.log (a newline list of floats)."""
+    if not path.exists():
+        return None
+    last: float | None = None
+    try:
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                last = float(stripped)
+            except ValueError:
+                continue
+    except OSError:
+        return None
+    return last
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    import json
+
+    try:
+        obj = json.loads(path.read_text())
+    except (ValueError, OSError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
 # --- ticker liveness ----------------------------------------------------
 def _ticker_is_stale(outbox, cron_dir, counts, when, cfg) -> bool:
     hb = _read_float(cron_dir / "ticker_heartbeat")
@@ -743,6 +883,7 @@ def _emit(
     invocation_id: str | None = None,
     profile: str = "default",
     partial: bool = True,
+    content: str | None = None,
 ) -> None:
     rec = build_record(
         event_type=event_type,
@@ -758,6 +899,6 @@ def _emit(
         profile=profile,
         partial=partial,
     )
-    outbox.append(rec, dedup_key=dedup_key)
+    outbox.append(rec, content=content, dedup_key=dedup_key)
     if outbox.last_append_created:
         counts[event_type] += 1
