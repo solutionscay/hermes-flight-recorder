@@ -31,6 +31,8 @@ This is the vision. The build is at **Phase 0**, and it is local-only. There is 
 
 The log reconstructs sessions, tool calls, subagent trees, model and cost usage, and cron runs. It captures live gateway events through an in-gateway hook, which spools them for Bridge to encrypt and sequence — so the encryption key never enters Hermes. It encrypts sensitive content on the host before it writes, and it keeps a per-installation sequence so lost events are detectable. Bridge's only write into the Hermes home is the capture hook it installs under `hooks/`; it never writes Hermes's own data.
 
+Run the end-to-end demo — `python scripts/poc_exit_gate.py -v` — to see capture, reconcile, and observe prove that a dropped event and a missed cron are *detected*, across a Bridge restart. See [docs/poc-demo.md](docs/poc-demo.md).
+
 Not built yet: any cloud sync. See the [Roadmap](#roadmap).
 
 ## The problem
