@@ -26,12 +26,22 @@ def new_outbox(bridge_home: Path) -> Outbox:
 
 
 def write_spool(bridge_home: Path, events: list[tuple[str, dict, float]]) -> None:
-    """Append (event_type, context, captured_at) tuples as JSONL."""
+    """Write (event_type, context, captured_at) tuples as the whole spool file."""
     lines = [
         json.dumps({"event_type": et, "context": ctx, "captured_at": ts})
         for et, ctx, ts in events
     ]
     (bridge_home / SPOOL_FILENAME).write_text("\n".join(lines) + "\n")
+
+
+def append_spool(bridge_home: Path, events: list[tuple[str, dict, float]]) -> None:
+    """Append tuples to an existing spool file, as the real spooler does."""
+    lines = [
+        json.dumps({"event_type": et, "context": ctx, "captured_at": ts})
+        for et, ctx, ts in events
+    ]
+    with open(bridge_home / SPOOL_FILENAME, "a") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 def drain_to_records(bridge_home: Path) -> list[dict]:
@@ -90,6 +100,53 @@ def test_agent_start_end_are_partial_with_encrypted_content(tmp_path: Path) -> N
         # into the payload.
         assert "content_ciphertext" in rec and rec["content_hash"].startswith("sha256:")
         assert "message" not in rec["payload"] and "response" not in rec["payload"]
+
+
+def test_agent_start_and_end_share_one_invocation_id(tmp_path: Path) -> None:
+    """Issue #23: a completed turn must pair, or the reconciler false-flags it."""
+    write_spool(
+        tmp_path,
+        [
+            ("agent:start", {"session_id": "s1", "message": "the prompt"}, 6.0),
+            ("agent:end", {"session_id": "s1", "response": "the answer"}, 7.0),
+        ],
+    )
+    recs = by_type(drain_to_records(tmp_path))
+    assert recs["invocation.started"]["invocation_id"] == recs["invocation.completed"]["invocation_id"]
+
+
+def test_agent_start_and_end_pair_across_separate_drains(tmp_path: Path) -> None:
+    """A start drained in one `run` and an end drained in a later one still pair."""
+    write_spool(tmp_path, [("agent:start", {"session_id": "s1", "message": "the prompt"}, 6.0)])
+    ob = new_outbox(tmp_path)
+    drain(ob)
+    started = next(ob.iter_events())
+
+    append_spool(tmp_path, [("agent:end", {"session_id": "s1", "response": "the answer"}, 7.0)])
+    drain(ob)
+    records = list(ob.iter_events())
+    ob.close()
+
+    ended = by_type(records)["invocation.completed"]
+    assert ended["invocation_id"] == started["invocation_id"]
+
+
+def test_agent_start_without_end_gets_a_fresh_id_next_time(tmp_path: Path) -> None:
+    """A dropped end must not silently pair with an unrelated later start."""
+    write_spool(tmp_path, [("agent:start", {"session_id": "s1", "message": "first"}, 6.0)])
+    ob = new_outbox(tmp_path)
+    drain(ob)
+    first_start = next(ob.iter_events())
+
+    # No agent:end for the first turn; a second turn starts fresh.
+    append_spool(tmp_path, [("agent:start", {"session_id": "s1", "message": "second"}, 8.0)])
+    drain(ob)
+    records = list(ob.iter_events())
+    ob.close()
+
+    starts = [r for r in records if r["payload"]["event_type"] == "invocation.started"]
+    assert len(starts) == 2
+    assert starts[1]["invocation_id"] != first_start["invocation_id"]
 
 
 def test_agent_content_is_actually_the_text(tmp_path: Path) -> None:
