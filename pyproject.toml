@@ -20,6 +20,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.urls]
 Homepage = "https://github.com/solutionscay/hermes-dbass"
 Issues = "https://github.com/solutionscay/hermes-dbass/issues"

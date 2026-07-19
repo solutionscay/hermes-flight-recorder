@@ -1,0 +1,41 @@
+{
+  "schema_version": "1",
+  "event_id": "8f2c1e90-3b7a-4c02-9d14-2a6f0b8e51aa",
+  "producer_sequence": 148372,
+  "occurred_at": 1752861993.417,
+  "recorded_at": 1752861994.902,
+  "installation_id": "b3f1c2a4-9e77-4d2b-8a1c-2f6e0d9b4a55",
+  "tenant_id": "default",
+  "profile": "default",
+  "runtime": {
+    "kind": "desktop",
+    "gateway_id": "gw-nas01",
+    "engine": "standard",
+    "hermes_version": "0.18.2",
+    "release_date": "2026.7.7.2",
+    "install_method": "git",
+    "state_schema_version": 22
+  },
+  "session_id": "20260718_175551_6397ee",
+  "session_key": null,
+  "parent_session_id": null,
+  "invocation_id": "20260718_175551_6397ee:turn:3",
+  "correlation_id": "20260718_175551_6397ee",
+  "causation_id": "b1d4e7c2-90aa-4f31-8c55-7e2100af9931",
+  "source": "state.db:messages",
+  "capture_method": "poll:state.db:messages",
+  "payload": {
+    "event_type": "tool.call_completed",
+    "tool_call_id": "call_a1b2c3",
+    "tool_name": "write_file",
+    "status": "ok",
+    "effect_disposition": "effect",
+    "token_count": 214,
+    "message_row_id": 5127
+  },
+  "content_ciphertext": "kR3m9v0pYb1tQarZ4x8n2w==",
+  "content_nonce": "9f4c2ade7b16c0a1d3e5f708",
+  "content_hash": "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+  "key_version": "aesgcm256:2026-07",
+  "partial": false
+}
