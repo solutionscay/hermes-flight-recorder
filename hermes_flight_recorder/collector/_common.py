@@ -35,6 +35,25 @@ def to_epoch(value: Any) -> float | None:
     return datetime.datetime.fromisoformat(value).timestamp()
 
 
+def gateway_runtime_stamp(
+    channels: Any = None, gateway_id: str | None = None
+) -> dict[str, Any]:
+    """A runtime stamp for a gateway lifecycle event.
+
+    Enriches the minimal stamp with the gateway's connected ``channels`` (a
+    plaintext list of Hermes Platform names such as ``telegram`` / ``discord``
+    — never a bot token) and a stable ``gateway_id``. There is no
+    gateway-level ``transport`` in Hermes, so none is recorded; the channel
+    list is the transport surface. Shared by ``runtime.gateway_started`` and,
+    when they are wired, ``gateway_stopped`` / ``gateway_start_failed``.
+    """
+    stamp: dict[str, Any] = {"kind": "gateway", "engine": "standard"}
+    stamp["channels"] = list(channels) if channels else []
+    if gateway_id is not None:
+        stamp["gateway_id"] = gateway_id
+    return stamp
+
+
 def runtime_stamp(kind: str, home_mode: str | None = None) -> dict[str, Any]:
     """A minimal runtime inventory stamp. Best-effort in the POC.
 
