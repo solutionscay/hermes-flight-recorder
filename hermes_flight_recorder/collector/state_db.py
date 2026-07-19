@@ -90,6 +90,11 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
                 profile=profile,
                 payload={
                     "kind": kind,
+                    # The originating surface: the verbatim sessions.source
+                    # (cli | desktop | cron | subagent | a gateway platform
+                    # name like telegram/discord ...). Open-ended by design —
+                    # plugin platforms extend it — so it is not enum-validated.
+                    "surface": kind,
                     "model": r["model"],
                     "message_count": r["message_count"],
                     "tool_call_count": r["tool_call_count"],
