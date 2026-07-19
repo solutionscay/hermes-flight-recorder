@@ -449,7 +449,10 @@ def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead) ->
         runs = _once_missed(execs, run_at, when, cfg.once_match_slack)
     elif kind == "cron":
         expr = sched.get("expression") or sched.get("cron") or sched.get("expr")
-        runs = _cron_missed(expr, execs, created, when, cfg)
+        # Match wall-clock fields in the job's own UTC offset (carried by its
+        # ISO timestamps), so the diff is identical on any host timezone.
+        job_tz = _tz_of(job.get("created_at")) or _tz_of(job.get("next_run_at"))
+        runs = _cron_missed(expr, execs, created, when, cfg, tz=job_tz)
     else:
         return
 
@@ -524,7 +527,7 @@ def _once_missed(execs, run_at, now, slack):
     return [(run_at, 1, False)]
 
 
-def _cron_missed(expr, execs, created, now, cfg):
+def _cron_missed(expr, execs, created, now, cfg, tz=None):
     fields = _parse_cron(expr)
     if fields is None:
         return []
@@ -532,7 +535,7 @@ def _cron_missed(expr, execs, created, now, cfg):
     if anchor is None:
         return []
     lower = max(anchor, now - cfg.cron_lookback)
-    expected = _cron_instants(fields, lower, now)
+    expected = _cron_instants(fields, lower, now, tz)
     slack = cfg.cron_match_slack
     runs: list[tuple[float, int, bool]] = []
     run_first: float | None = None
@@ -590,14 +593,18 @@ def _parse_cron_field(field: str, lo: int, hi: int) -> set[int]:
     return values
 
 
-def _cron_instants(fields, lower: float, now: float) -> list[float]:
+def _cron_instants(fields, lower: float, now: float, tz=None) -> list[float]:
+    # Resolve each candidate epoch to wall-clock fields in a fixed zone (the
+    # job's own offset, or UTC as a deterministic fallback) — never the host
+    # process's ambient timezone, so the expansion is environment-independent.
+    zone = tz or datetime.timezone.utc
     minute, hour, dom, month, dow = fields
     dom_restricted = len(dom) < 31
     dow_restricted = len(dow) < 7
     out: list[float] = []
     t = math.ceil(lower / 60.0) * 60.0
     while t <= now:
-        d = datetime.datetime.fromtimestamp(t)
+        d = datetime.datetime.fromtimestamp(t, zone)
         # Standard cron day matching: when both day-of-month and
         # day-of-week are restricted, a match on either satisfies the day;
         # otherwise both restrictions apply (a "*" is not a restriction).
@@ -697,6 +704,16 @@ def _read_float(path: Path) -> float | None:
 
 def _near(value: float, sorted_epochs: Iterable[float], slack: float) -> bool:
     return any(abs(e - value) <= slack for e in sorted_epochs)
+
+
+def _tz_of(value: Any) -> datetime.tzinfo | None:
+    """The tzinfo embedded in a Hermes ISO timestamp, or None if absent."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value).tzinfo
+    except ValueError:
+        return None
 
 
 def _open_ro(path: Path) -> sqlite3.Connection:
