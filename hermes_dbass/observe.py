@@ -156,16 +156,25 @@ def render_tree(records: Iterable[dict[str, Any]], *, session: str | None = None
     idx = _Index(list(records))
     roots = idx.roots(session)
     lines: list[str] = []
+    # One shared seen-set across all roots: each session has a single parent,
+    # so it belongs to one subtree, and the guard makes a malformed
+    # parent_session_id cycle terminate instead of recursing forever.
+    seen: set[str] = set()
     for i, sid in enumerate(roots):
         if i:
             lines.append("")
-        _render_session(sid, idx, 0, lines, is_root=True)
+        _render_session(sid, idx, 0, lines, is_root=True, seen=seen)
     if not lines:
         lines.append("(no sessions captured)")
     return lines
 
 
-def _render_session(sid: str, idx: "_Index", depth: int, lines: list[str], *, is_root: bool) -> None:
+def _render_session(
+    sid: str, idx: "_Index", depth: int, lines: list[str], *, is_root: bool, seen: set[str]
+) -> None:
+    if sid in seen:
+        return  # a cycle or a re-parented node already rendered
+    seen.add(sid)
     node = idx.sessions.get(sid, {})
     pad = "  " * depth
     kind = node.get("kind", "session")
@@ -193,7 +202,7 @@ def _render_session(sid: str, idx: "_Index", depth: int, lines: list[str], *, is
         )
 
     for child in idx.children.get(sid, []):
-        _render_session(child, idx, depth + 1, lines, is_root=False)
+        _render_session(child, idx, depth + 1, lines, is_root=False, seen=seen)
 
 
 class _Index:
@@ -287,10 +296,15 @@ class _Index:
             cost += float(p.get("estimated_cost_usd") or 0.0)
         return tin, tout, cost
 
-    def subtree_tokens(self, sid: str) -> tuple[int, int, float]:
+    def subtree_tokens(self, sid: str, _seen: set[str] | None = None) -> tuple[int, int, float]:
+        if _seen is None:
+            _seen = set()
+        if sid in _seen:  # a malformed parent cycle — stop, don't double-count
+            return (0, 0, 0.0)
+        _seen.add(sid)
         tin, tout, cost = self.own_tokens(sid)
         for child in self.children.get(sid, []):
-            cin, cout, ccost = self.subtree_tokens(child)
+            cin, cout, ccost = self.subtree_tokens(child, _seen)
             tin, tout, cost = tin + cin, tout + cout, cost + ccost
         return tin, tout, cost
 
