@@ -27,11 +27,12 @@ requires it; the state adapter and reconciler supply the authoritative form.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
-from .._common import build_record, runtime_stamp
+from .._common import build_record, gateway_runtime_stamp, runtime_stamp
 from . import CURSOR_NAME, SPOOL_FILENAME
 
 
@@ -92,6 +93,21 @@ def _clean(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in payload.items() if v is not None}
 
 
+def _gateway_id(outbox: Any, occurred_at: float, offset: int) -> str:
+    """A stable, token-free per-boot gateway id.
+
+    Hermes' authoritative process identity (pid, /proc start-time) is not
+    carried in the gateway:startup hook context, and reading gateway.pid at
+    drain time is racy for historical spool lines. So derive a deterministic
+    id from stable line inputs: the installation, the event time, and the
+    line offset. Re-draining the same line reproduces the id (idempotent);
+    the offset guards against a same-second restart or a missing timestamp
+    collapsing distinct boots to one id.
+    """
+    seed = f"{outbox.installation_id}:{int(occurred_at)}:{offset}"
+    return "gw-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
 def _pair_invocation_id(outbox: Any, sid: str | None, offset: int, is_start: bool) -> str:
     """Pair an ``agent:start`` with its ``agent:end`` via outbox meta.
 
@@ -139,15 +155,21 @@ def _map_event(
     runtime = runtime_stamp(base)
 
     if event_type == "gateway:startup":
+        channels = ctx.get("platforms")
         return (
             build_record(
                 event_type="runtime.gateway_started",
                 occurred_at=occurred_at,
                 source=source,
                 capture_method=capture_method,
-                runtime=runtime,
+                runtime=gateway_runtime_stamp(
+                    channels=channels,
+                    gateway_id=_gateway_id(outbox, occurred_at, offset),
+                ),
                 correlation_id=f"gateway:{offset}",
-                payload=_clean({"platforms": ctx.get("platforms")}),
+                # Keep payload.platforms for backward compatibility; the
+                # channels also live on the runtime stamp now.
+                payload=_clean({"platforms": channels}),
             ),
             None,
         )
