@@ -268,6 +268,26 @@ class Outbox:
             (f"cursor:{name}", str(value)),
         )
 
+    # --- generic meta -----------------------------------------------------
+    # A producer may persist small bits of cross-drain state directly in the
+    # meta table (e.g. the hook drain's start/end invocation pairing), keyed
+    # by its own arbitrary name.
+    def get_meta(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    def delete_meta(self, key: str) -> None:
+        self._conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
     # --- read -----------------------------------------------------------
     def high_water(self, installation_id: str | None = None) -> int:
         inst = installation_id or self.installation_id

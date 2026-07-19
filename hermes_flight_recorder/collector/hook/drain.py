@@ -16,9 +16,11 @@ lossy by design; a lost or dropped line is caught by the reconciler against
 ``state.db``.
 
 Fields the hook context does not carry are synthesized here, best-effort:
-``invocation_id`` (from the line offset), ``session_id`` on session-end
-(recovered from a ``session_key`` -> ``session_id`` map built from
-session-start within this drain), ``correlation_id``, and defaulted
+``invocation_id`` (minted on ``agent:start`` from the line offset, then
+paired to the matching ``agent:end`` via a per-session id stashed in outbox
+meta — see ``_pair_invocation_id``, issue #23), ``session_id`` on
+session-end (recovered from a ``session_key`` -> ``session_id`` map built
+from session-start within this drain), ``correlation_id``, and defaulted
 ``profile``/``tenant``. Such records are marked ``partial`` where the issue
 requires it; the state adapter and reconciler supply the authoritative form.
 """
@@ -72,7 +74,7 @@ def drain(outbox: Any, bridge_home: str | Path | None = None) -> dict[str, int]:
             obj = json.loads(text)
         except ValueError:
             continue  # skip an undecodable line rather than fail the drain
-        mapped = _map_event(obj, line_offset, session_ids)
+        mapped = _map_event(obj, line_offset, session_ids, outbox)
         if mapped is None:
             continue
         record, content = mapped
@@ -90,8 +92,32 @@ def _clean(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in payload.items() if v is not None}
 
 
+def _pair_invocation_id(outbox: Any, sid: str | None, offset: int, is_start: bool) -> str:
+    """Pair an ``agent:start`` with its ``agent:end`` via outbox meta.
+
+    A new id is minted on start and stashed under a session-scoped meta key;
+    the matching end reuses and clears it, so start and end share one
+    ``invocation_id`` even when they land in separate drains (issue #23).
+    Without a session id, or when no pending start is on record, an id is
+    synthesized fresh from the line offset and stays unpaired — for a truly
+    lost end, that is exactly the reconciler's signal to fire.
+    """
+    if sid is None:
+        return f"unknown:hook:{offset}"
+    key = f"hook-invocation:{sid}"
+    if is_start:
+        invocation_id = f"{sid}:hook:{offset}"
+        outbox.set_meta(key, invocation_id)
+        return invocation_id
+    pending = outbox.get_meta(key)
+    if pending is not None:
+        outbox.delete_meta(key)
+        return pending
+    return f"{sid}:hook:{offset}"
+
+
 def _map_event(
-    obj: dict[str, Any], offset: int, session_ids: dict[str, str]
+    obj: dict[str, Any], offset: int, session_ids: dict[str, str], outbox: Any
 ) -> tuple[dict[str, Any], str | None] | None:
     """Map one raw spool record to (envelope_record, content) or None.
 
@@ -195,10 +221,9 @@ def _map_event(
                 runtime=runtime,
                 correlation_id=sid or f"hook:{offset}",
                 session_id=sid,
-                # No turn id is exposed to hooks; synthesize a stable, unique
-                # id from the line offset. Start/end are not paired here; the
-                # reconciler does that.
-                invocation_id=f"{sid or 'unknown'}:hook:{offset}",
+                # No turn id is exposed to hooks; paired via outbox meta so
+                # start and end share one id (see _pair_invocation_id).
+                invocation_id=_pair_invocation_id(outbox, sid, offset, is_start),
                 partial=True,
                 payload=_clean(payload),
             ),
