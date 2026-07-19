@@ -32,6 +32,7 @@ SCHEMA_VERSION = "1"
 P0_POC_EVENT_TYPES = frozenset(
     {
         "runtime.gateway_started",
+        "runtime.gateway_start_failed",
         "session.created",
         "session.ended",
         "invocation.started",
