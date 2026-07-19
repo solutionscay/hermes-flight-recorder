@@ -20,6 +20,17 @@ Hermes DBaaS is not "remote SQLite." It is not a vector store or a tracing dashb
 - What failed silently? For example, a cron that never started, an invocation that never ended, or a tool loop that makes no progress.
 - Can I check fleet health, but not send my agents' private prompts and outputs to a third party?
 
+## What works today
+
+This is the vision. The build is at **Phase 0**, and it is local-only. There is no cloud, no console, and no account yet. What runs now:
+
+- `hermes-dbass init` — create the local event log (the outbox) and mint a stable installation id.
+- `hermes-dbass run` — poll Hermes's `state.db` and cron store read-only and write each event to the log.
+
+The log reconstructs sessions, tool calls, subagent trees, model and cost usage, and cron runs. It encrypts sensitive content on the host before it writes, and it keeps a per-installation sequence so lost events are detectable. Bridge never writes to Hermes data.
+
+Not built yet: live hook capture, gap and silent-failure detection, the `observe` view, and any cloud sync. See the [Roadmap](#roadmap).
+
 ## The problem
 
 Autonomous agents move from short conversation sessions to persistent background workers. These workers run on laptops, servers, gateways, cron schedules, and ephemeral containers. Their operational state splits across local databases, task boards, memory files, and trajectory logs on every host.
