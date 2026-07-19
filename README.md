@@ -24,7 +24,7 @@ Hermes Flight Recorder is not "remote SQLite." It is not a vector store or a tra
 
 This is the vision. The build is at **Phase 0**, and it is local-only. There is no cloud, no console, and no account yet. What runs now:
 
-- `hermes-flight-recorder init` — create the local event log (the outbox), mint a stable installation id, and install the in-gateway capture hook.
+- `hermes-flight-recorder init` — create the local event log (the outbox), mint a stable installation id, and install the in-gateway capture hook (Hermes loads it on the next gateway restart).
 - `hermes-flight-recorder run` — drain the live hook's spool, then poll Hermes's `state.db` and cron store read-only, writing each event to the log.
 - `hermes-flight-recorder reconcile` — diff the durable stores against the log to find gaps, missing terminals, and missed cron runs, and record each finding.
 - `hermes-flight-recorder observe` — render the log locally as a `--stream`, an execution `--tree` with token and cost rollups, or a `--report` of findings that exits non-zero when any exist. No network.
