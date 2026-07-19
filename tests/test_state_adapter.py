@@ -92,7 +92,7 @@ def make_cron(hermes_home) -> None:
     db.close()
     (cron / "ticker_heartbeat").write_text("1784415389.44")
     (cron / "ticker_last_success").write_text("1784415389.44")
-    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "dbass-probe"}]}))
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "flight-recorder-probe"}]}))
 
 
 def new_outbox(tmp_path):
