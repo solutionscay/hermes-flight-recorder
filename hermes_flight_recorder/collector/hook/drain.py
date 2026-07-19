@@ -168,7 +168,17 @@ def _map_event(
                 session_id=sid,
                 session_key=skey,
                 payload=_clean(
-                    {"platform": ctx.get("platform"), "user_id": ctx.get("user_id")}
+                    {
+                        "platform": ctx.get("platform"),
+                        # The originating surface. The live hook's vocabulary
+                        # is the gateway Platform value (telegram/discord/...);
+                        # the state.db producer uses sessions.source (cli/...).
+                        # Related-but-different; deliberately not reconciled.
+                        # `or None` drops the '' the hook sends for a LOCAL
+                        # session (_clean only strips None, not empty string).
+                        "surface": ctx.get("platform") or None,
+                        "user_id": ctx.get("user_id"),
+                    }
                 ),
             ),
             None,

@@ -47,6 +47,16 @@ adapter, and the reconciler. The validator lives in
 **payload invariant:** `payload.event_type` is present and is one of the
 event types below.
 
+**`payload.surface` (on `session.created` / `subagent.child_spawned`):** the
+originating surface a session entered Hermes through — plaintext operational
+metadata. The `state.db` producer records the verbatim `sessions.source`
+(`cli`, `desktop`, `cron`, `subagent`, or a gateway platform name such as
+`telegram` / `discord`); the live hook records the gateway `platform` value
+and omits it for a local session. The value set is **open-ended** — plugin
+platforms extend it — so `surface` is a free-form string and is never
+enum-validated. The two producers use related-but-different vocabularies and
+are not reconciled.
+
 ## Event-type surface
 
 **P0-poc** — captured and observed in the Phase 0 POC:
