@@ -1,4 +1,4 @@
-"""Self-contained tests for the observe CLI wiring (hermes_dbass.cli.main /
+"""Self-contained tests for the observe CLI wiring (hermes_flight_recorder.cli.main /
 _cmd_observe), exercised through main([...]) with capsys.
 """
 
@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_dbass import observe
-from hermes_dbass.cli import main
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
+from hermes_flight_recorder import observe
+from hermes_flight_recorder.cli import main
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
 
 B = 1784415000.0
 
@@ -45,7 +45,7 @@ def test_observe_not_initialized_exits_2_with_stderr_hint(tmp_path, capsys):
     code = main(["observe", "--bridge-home", bridge])
     captured = capsys.readouterr()
     assert code == 2
-    assert "hermes-dbass init" in captured.err
+    assert "hermes-flight-recorder init" in captured.err
     assert captured.out == ""
 
 

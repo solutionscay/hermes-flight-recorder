@@ -3,7 +3,7 @@
 Self-contained: does not import from any other test module. Mirrors the
 fixture style of tests/test_observe.py (a fixed epoch, a new_outbox(tmp_path)
 helper, and an add(...) helper that builds a producer record via
-hermes_dbass.collector._common.build_record and appends it through a real
+hermes_flight_recorder.collector._common.build_record and appends it through a real
 Outbox so producer_sequence/occurred_at are genuine).
 
 Covers:
@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_dbass import observe
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
+from hermes_flight_recorder import observe
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
 
 B = 1784415000.0
 

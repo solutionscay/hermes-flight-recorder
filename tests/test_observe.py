@@ -7,10 +7,10 @@ real Outbox so they carry producer_sequence and validate as envelopes.
 
 from __future__ import annotations
 
-from hermes_dbass import observe
-from hermes_dbass.cli import main
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
+from hermes_flight_recorder import observe
+from hermes_flight_recorder.cli import main
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
 
 B = 1784415000.0
 

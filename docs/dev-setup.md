@@ -44,7 +44,7 @@ From the repo root:
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-hermes-dbass --version        # verify the console script works
+hermes-flight-recorder --version        # verify the console script works
 ```
 
 Or with uv:
@@ -61,7 +61,7 @@ Bridge reads the Hermes home the same way Hermes does — from
 from step 1 when you run Bridge commands.
 
 Subcommands (`init`, `run`, `reconcile`) arrive across the Phase 0
-steps; until then, `hermes-dbass` only prints help and `--version`.
+steps; until then, `hermes-flight-recorder` only prints help and `--version`.
 
 ## Safety notes
 

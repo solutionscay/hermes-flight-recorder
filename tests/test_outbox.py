@@ -6,8 +6,8 @@ import threading
 
 import pytest
 
-from hermes_dbass.collector.outbox import Outbox, OutboxError
-from hermes_dbass.envelope import EnvelopeValidationError, validate
+from hermes_flight_recorder.collector.outbox import Outbox, OutboxError
+from hermes_flight_recorder.envelope import EnvelopeValidationError, validate
 
 
 def base_record(event_type: str = "session.created") -> dict:

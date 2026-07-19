@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS events (
 def default_bridge_home() -> Path:
     """The Bridge-owned data directory (never under HERMES_HOME)."""
     env = os.environ.get("BRIDGE_HOME")
-    return Path(env).expanduser() if env else Path.home() / ".hermes-dbass"
+    return Path(env).expanduser() if env else Path.home() / ".hermes-flight-recorder"
 
 
 def _hermes_home() -> Path:

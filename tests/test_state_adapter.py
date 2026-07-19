@@ -11,9 +11,9 @@ import json
 import sqlite3
 from collections import Counter
 
-from hermes_dbass.collector import cron_db, state_db
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.envelope import validate
+from hermes_flight_recorder.collector import cron_db, state_db
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.envelope import validate
 
 
 # --- fixtures -----------------------------------------------------------

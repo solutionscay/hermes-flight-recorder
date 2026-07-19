@@ -27,8 +27,8 @@ import json
 import os
 import time
 
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.collector.reconcile import (
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.reconcile import (
     ReconcileConfig,
     _cron_instants,
     _cron_missed,

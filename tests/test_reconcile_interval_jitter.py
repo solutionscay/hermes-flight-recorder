@@ -20,8 +20,8 @@ import datetime
 import json
 import sqlite3
 
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.collector.reconcile import ReconcileConfig, reconcile
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 
 # A fixed epoch anchor and a US-Central-like offset, same convention as the
 # reconciler's own test suite.

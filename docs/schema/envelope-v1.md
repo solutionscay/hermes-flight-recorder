@@ -5,7 +5,7 @@ _Status: frozen. Written in ASD-STE100 Simplified Technical English._
 The envelope is the single append-only event contract. Every part of the
 collector writes and reads this one shape: the hook, the outbox, the state
 adapter, and the reconciler. The validator lives in
-[`hermes_dbass/envelope.py`](../../hermes_dbass/envelope.py).
+[`hermes_flight_recorder/envelope.py`](../../hermes_flight_recorder/envelope.py).
 
 ## Field classes
 
@@ -22,7 +22,7 @@ adapter, and the reconciler. The validator lives in
 | `producer_sequence` | int64 | yes | integrity | A strictly increasing integer per `installation_id`, in emit order. A missing integer between two events for one installation means the collector lost a capture. Never reuse it. Never reset it. |
 | `occurred_at` | number (epoch s) | yes | plaintext | The source event time. Do not use it to order events, because clocks can skew. Keep it for people and analytics only. |
 | `recorded_at` | number (epoch s) | yes | plaintext | The collector wall-clock time it appended the event. Use it with `producer_sequence` to measure capture latency. |
-| `installation_id` | string (uuid v4) | yes | plaintext | A stable id for one Hermes data root. The collector generates it at `hermes-dbass init` and stores it in the outbox. One outbox is one installation. It is the scope for `producer_sequence`. Profiles share it. |
+| `installation_id` | string (uuid v4) | yes | plaintext | A stable id for one Hermes data root. The collector generates it at `hermes-flight-recorder init` and stores it in the outbox. One outbox is one installation. It is the scope for `producer_sequence`. Profiles share it. |
 | `tenant_id` | string | yes | plaintext | The workspace or tenant. If the install has no tenant, use `"default"`. |
 | `profile` | string | yes | plaintext | The Hermes profile name. Normalize NULL or absent to `"default"`. Do not use `"unknown"`. |
 | `runtime` | object | yes | plaintext | An inventory stamp at emit time: `kind`, `gateway_id`, `engine`, `hermes_version`, `release_date`, `install_method`, `state_schema_version`. |
@@ -81,7 +81,7 @@ Do not add one global sequence. It is not needed and it makes a bottleneck.
 
 ## Identity rules
 
-- **installation_id.** Generate a UUID at `hermes-dbass init`. Store it in
+- **installation_id.** Generate a UUID at `hermes-flight-recorder init`. Store it in
   the outbox. One outbox is one installation. Multiple Hermes profiles
   under one home share one `installation_id`; `profile` is a separate
   field. For two runtimes that share one `HERMES_HOME`, give each its own

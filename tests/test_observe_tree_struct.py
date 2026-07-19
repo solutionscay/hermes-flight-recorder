@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import sqlite3
 
-from hermes_dbass import observe
-from hermes_dbass.cli import main  # noqa: F401  (kept per spec's import list; unused directly here)
-from hermes_dbass.collector import cron_db, state_db  # noqa: F401  (cron_db unused; state_db used below)
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
+from hermes_flight_recorder import observe
+from hermes_flight_recorder.cli import main  # noqa: F401  (kept per spec's import list; unused directly here)
+from hermes_flight_recorder.collector import cron_db, state_db  # noqa: F401  (cron_db unused; state_db used below)
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
 
 B = 1784415000.0
 

@@ -23,12 +23,12 @@ import json
 import sqlite3
 from pathlib import Path
 
-from hermes_dbass import observe
-from hermes_dbass.cli import main
-from hermes_dbass.collector import cron_db, state_db
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.collector.reconcile import ReconcileConfig, reconcile
+from hermes_flight_recorder import observe
+from hermes_flight_recorder.cli import main
+from hermes_flight_recorder.collector import cron_db, state_db
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 
 # A fixed epoch anchor (never wall-clock) and a US-Central-like offset for
 # the cron store's ISO timestamps, matching tests/test_reconcile.py.
