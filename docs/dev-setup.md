@@ -60,8 +60,10 @@ Bridge reads the Hermes home the same way Hermes does — from
 `HERMES_HOME`, defaulting to `~/.hermes`. Set it to the dev instance
 from step 1 when you run Bridge commands.
 
-Subcommands (`init`, `run`, `reconcile`) arrive across the Phase 0
-steps; until then, `hermes-flight-recorder` only prints help and `--version`.
+`hermes-flight-recorder init` creates the outbox and installs the live
+capture hook under `$HERMES_HOME/hooks/`; restart the Hermes gateway to
+load it. Then `run` drains the hook spool and polls the durable stores,
+`reconcile` diffs them for gaps, and `observe` renders the log.
 
 ## Safety notes
 
