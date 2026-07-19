@@ -26,10 +26,12 @@ This is the vision. The build is at **Phase 0**, and it is local-only. There is 
 
 - `hermes-dbass init` — create the local event log (the outbox) and mint a stable installation id.
 - `hermes-dbass run` — poll Hermes's `state.db` and cron store read-only and write each event to the log.
+- `hermes-dbass reconcile` — diff the durable stores against the log to find gaps, missing terminals, and missed cron runs, and record each finding.
+- `hermes-dbass observe` — render the log locally as a `--stream`, an execution `--tree` with token and cost rollups, or a `--report` of findings that exits non-zero when any exist. No network.
 
 The log reconstructs sessions, tool calls, subagent trees, model and cost usage, and cron runs. It encrypts sensitive content on the host before it writes, and it keeps a per-installation sequence so lost events are detectable. Bridge never writes to Hermes data.
 
-Not built yet: live hook capture, gap and silent-failure detection, the `observe` view, and any cloud sync. See the [Roadmap](#roadmap).
+Not built yet: live hook capture and any cloud sync. See the [Roadmap](#roadmap).
 
 ## The problem
 
