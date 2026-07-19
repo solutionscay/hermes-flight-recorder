@@ -1,8 +1,9 @@
 """Command-line entry point for the Bridge companion.
 
-Subcommands land across the Phase 0 steps. ``init`` (this step) creates
-the local outbox and mints the installation identity. ``run``,
-``reconcile``, and ``observe`` arrive in later steps.
+Subcommands land across the Phase 0 steps. ``init`` creates the local
+outbox and mints the installation identity. ``run`` polls the durable
+stores into the outbox. ``reconcile`` diffs the durable stores against the
+captured outbox and emits reconcile findings. ``observe`` arrives later.
 """
 
 from __future__ import annotations
@@ -55,6 +56,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    from .collector.outbox import Outbox, OutboxError
+    from .collector.reconcile import reconcile
+
+    outbox = Outbox.open(args.bridge_home)
+    try:
+        try:
+            outbox.installation_id  # fails if not initialized
+        except OutboxError:
+            print("outbox not initialized; run `hermes-dbass init` first", file=sys.stderr)
+            return 2
+
+        counts = reconcile(outbox, args.hermes_home)
+        total = sum(counts.values())
+        print(f"reconciled {total} new finding(s) into {outbox.path}:")
+        for event_type in sorted(counts):
+            print(f"  {event_type}: {counts[event_type]}")
+    finally:
+        outbox.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hermes-dbass",
@@ -91,6 +114,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hermes data root to read (default: $HERMES_HOME or ~/.hermes).",
     )
     p_run.set_defaults(func=_cmd_run)
+
+    p_rec = sub.add_parser(
+        "reconcile",
+        help="Diff the durable stores against the outbox and emit reconcile findings.",
+    )
+    p_rec.add_argument(
+        "--bridge-home",
+        default=None,
+        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-dbass).",
+    )
+    p_rec.add_argument(
+        "--hermes-home",
+        default=None,
+        help="Hermes data root to read (default: $HERMES_HOME or ~/.hermes).",
+    )
+    p_rec.set_defaults(func=_cmd_reconcile)
 
     return parser
 
