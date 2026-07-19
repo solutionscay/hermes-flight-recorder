@@ -17,6 +17,8 @@ from . import __version__
 
 def _cmd_init(args: argparse.Namespace) -> int:
     # Imported lazily so `hermes-flight-recorder --version` needs no heavy deps.
+    from .collector._common import resolve_hermes_home
+    from .collector.hook import install_hook
     from .collector.outbox import Outbox
 
     outbox = Outbox.open(args.bridge_home)
@@ -24,6 +26,14 @@ def _cmd_init(args: argparse.Namespace) -> int:
         installation_id = outbox.initialize()
         print(f"outbox:          {outbox.path}")
         print(f"installation_id: {installation_id}")
+
+        hermes_home = resolve_hermes_home(args.hermes_home)
+        try:
+            hook_dir = install_hook(hermes_home, outbox.path.parent, force=args.force)
+            print(f"hook installed:  {hook_dir}")
+            print("restart the Hermes gateway to load the hook.")
+        except FileExistsError as exc:
+            print(f"hook already installed at {exc} (use --force to reinstall)")
     finally:
         outbox.close()
     return 0
@@ -31,6 +41,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     from .collector import cron_db, state_db
+    from .collector.hook import drain as drain_hook_spool
     from .collector.outbox import Outbox, OutboxError
 
     outbox = Outbox.open(args.bridge_home)
@@ -42,6 +53,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 2
 
         totals: dict[str, int] = {}
+        # Drain the live hook spool first, then poll the durable stores.
+        try:
+            for event_type, n in drain_hook_spool(outbox).items():
+                totals[event_type] = totals.get(event_type, 0) + n
+        except Exception as exc:  # a bad spool must not sink the poll pass
+            print(f"  (hook drain: {exc})", file=sys.stderr)
+
         for label, poll in (("state.db", state_db.poll), ("cron", cron_db.poll)):
             try:
                 for event_type, n in poll(outbox, args.hermes_home).items():
@@ -142,12 +160,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     p_init = sub.add_parser(
-        "init", help="Create the local outbox and mint the installation id."
+        "init",
+        help="Create the local outbox, mint the installation id, and install the hook.",
     )
     p_init.add_argument(
         "--bridge-home",
         default=None,
         help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
+    )
+    p_init.add_argument(
+        "--hermes-home",
+        default=None,
+        help="Hermes data root to install the hook into (default: $HERMES_HOME or ~/.hermes).",
+    )
+    p_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Reinstall the hook even if it is already present.",
     )
     p_init.set_defaults(func=_cmd_init)
 

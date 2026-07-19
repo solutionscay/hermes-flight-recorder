@@ -1,15 +1,14 @@
 """Collector — capture Hermes events, buffer them, and reconcile.
 
-Components land across Phase 0:
+Components:
 
-- ``hook``:      Hermes event hook that feeds the outbox            (Step 3)
 - ``outbox``:    durable local SQLite queue with a monotonic
-                 producer_sequence                                  (Step 4)
+                 producer_sequence
+- ``hook``:      in-gateway spooler plus a Bridge-side drain for live
+                 lifecycle capture
 - ``state_db``:  adapter that reads Hermes ``state.db`` into
-                 canonical events                                   (Step 5)
-- ``reconcile``: diff ``state.db`` against the outbox to detect
-                 dropped events (gaps)                              (Step 6)
-
-Nothing is implemented yet; this package marks the layout so each
-step lands in a predictable place.
+                 canonical events
+- ``cron_db``:   adapter that reads the cron execution store
+- ``reconcile``: diff the durable stores against the outbox to detect
+                 gaps, missing terminals, and missed cron runs
 """

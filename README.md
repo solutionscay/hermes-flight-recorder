@@ -24,14 +24,14 @@ Hermes Flight Recorder is not "remote SQLite." It is not a vector store or a tra
 
 This is the vision. The build is at **Phase 0**, and it is local-only. There is no cloud, no console, and no account yet. What runs now:
 
-- `hermes-flight-recorder init` — create the local event log (the outbox) and mint a stable installation id.
-- `hermes-flight-recorder run` — poll Hermes's `state.db` and cron store read-only and write each event to the log.
+- `hermes-flight-recorder init` — create the local event log (the outbox), mint a stable installation id, and install the in-gateway capture hook.
+- `hermes-flight-recorder run` — drain the live hook's spool, then poll Hermes's `state.db` and cron store read-only, writing each event to the log.
 - `hermes-flight-recorder reconcile` — diff the durable stores against the log to find gaps, missing terminals, and missed cron runs, and record each finding.
 - `hermes-flight-recorder observe` — render the log locally as a `--stream`, an execution `--tree` with token and cost rollups, or a `--report` of findings that exits non-zero when any exist. No network.
 
-The log reconstructs sessions, tool calls, subagent trees, model and cost usage, and cron runs. It encrypts sensitive content on the host before it writes, and it keeps a per-installation sequence so lost events are detectable. Bridge never writes to Hermes data.
+The log reconstructs sessions, tool calls, subagent trees, model and cost usage, and cron runs. It captures live gateway events through an in-gateway hook, which spools them for Bridge to encrypt and sequence — so the encryption key never enters Hermes. It encrypts sensitive content on the host before it writes, and it keeps a per-installation sequence so lost events are detectable. Bridge's only write into the Hermes home is the capture hook it installs under `hooks/`; it never writes Hermes's own data.
 
-Not built yet: live hook capture and any cloud sync. See the [Roadmap](#roadmap).
+Not built yet: any cloud sync. See the [Roadmap](#roadmap).
 
 ## The problem
 
