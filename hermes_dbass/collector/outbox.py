@@ -87,6 +87,12 @@ class Outbox:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_DDL)
         self._content_key: bytes | None = None
+        self._last_created = False
+
+    @property
+    def last_append_created(self) -> bool:
+        """True if the most recent append() inserted a new row (not a dedup hit)."""
+        return self._last_created
 
     # --- construction ---------------------------------------------------
     @classmethod
@@ -201,6 +207,7 @@ class Outbox:
         inst = rec["installation_id"]
 
         conn = self._conn
+        self._last_created = False
         conn.execute("BEGIN IMMEDIATE")
         try:
             if dedup_key is not None:
@@ -237,10 +244,29 @@ class Outbox:
                 (inst, seq),
             )
             conn.execute("COMMIT")
+            self._last_created = True
             return rec
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    # --- poll cursors ---------------------------------------------------
+    # Producers (the state adapter) keep an incremental cursor per source in
+    # the outbox meta, so a re-poll scans only new rows. Dedup on the append
+    # side is the backstop that guarantees no duplicate even if a cursor is
+    # reset.
+    def get_cursor(self, name: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (f"cursor:{name}",)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_cursor(self, name: str, value: str | int) -> None:
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (f"cursor:{name}", str(value)),
+        )
 
     # --- read -----------------------------------------------------------
     def high_water(self, installation_id: str | None = None) -> int:
