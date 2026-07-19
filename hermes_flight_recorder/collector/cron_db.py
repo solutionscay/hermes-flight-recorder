@@ -23,19 +23,26 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from ._common import build_record, resolve_hermes_home, runtime_stamp, to_epoch
+from ._common import (
+    build_record,
+    read_home_mode,
+    resolve_hermes_home,
+    runtime_stamp,
+    to_epoch,
+)
 
 
 def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
     """One read-only poll pass over the cron store. Returns per-type counts."""
     cron_dir = resolve_hermes_home(hermes_home) / "cron"
+    home_mode = read_home_mode(hermes_home)
     counts: dict[str, int] = defaultdict(int)
-    _poll_executions(outbox, cron_dir, counts)
-    _poll_heartbeat(outbox, cron_dir, counts)
+    _poll_executions(outbox, cron_dir, counts, home_mode)
+    _poll_heartbeat(outbox, cron_dir, counts, home_mode)
     return dict(counts)
 
 
-def _poll_executions(outbox, cron_dir: Path, counts) -> None:
+def _poll_executions(outbox, cron_dir: Path, counts, home_mode) -> None:
     db_path = cron_dir / "executions.db"
     if not db_path.exists():
         return
@@ -52,7 +59,7 @@ def _poll_executions(outbox, cron_dir: Path, counts) -> None:
     for r in rows:
         exid, job = r["id"], r["job_id"]
         claimed = to_epoch(r["claimed_at"]) or 0.0
-        rt = runtime_stamp("cron")
+        rt = runtime_stamp("cron", home_mode=home_mode)
 
         outbox.append(
             build_record(
@@ -102,7 +109,7 @@ def _poll_executions(outbox, cron_dir: Path, counts) -> None:
             counts["cron.run_finished"] += 1
 
 
-def _poll_heartbeat(outbox, cron_dir: Path, counts) -> None:
+def _poll_heartbeat(outbox, cron_dir: Path, counts, home_mode) -> None:
     hb_file = cron_dir / "ticker_heartbeat"
     if not hb_file.exists():
         return
@@ -116,7 +123,7 @@ def _poll_heartbeat(outbox, cron_dir: Path, counts) -> None:
             occurred_at=hb,
             source="cron:heartbeat",
             capture_method="poll:cron:heartbeat",
-            runtime=runtime_stamp("cron"),
+            runtime=runtime_stamp("cron", home_mode=home_mode),
             correlation_id="cron:ticker",
             payload={"heartbeat": hb, "last_success": last_success},
         ),

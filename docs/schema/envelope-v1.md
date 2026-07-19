@@ -25,7 +25,7 @@ adapter, and the reconciler. The validator lives in
 | `installation_id` | string (uuid v4) | yes | plaintext | A stable id for one Hermes data root. The collector generates it at `hermes-flight-recorder init` and stores it in the outbox. One outbox is one installation. It is the scope for `producer_sequence`. Profiles share it. |
 | `tenant_id` | string | yes | plaintext | The workspace or tenant. If the install has no tenant, use `"default"`. |
 | `profile` | string | yes | plaintext | The Hermes profile name. Normalize NULL or absent to `"default"`. Do not use `"unknown"`. |
-| `runtime` | object | yes | plaintext | An inventory stamp at emit time: `kind`, `gateway_id`, `engine`, `hermes_version`, `release_date`, `install_method`, `state_schema_version`. |
+| `runtime` | object | yes | plaintext | An inventory stamp at emit time: `kind`, `gateway_id`, `engine`, `home_mode`, `hermes_version`, `release_date`, `install_method`, `state_schema_version`. `home_mode` is the Hermes `terminal.home_mode` policy (`auto` \| `real` \| `profile`, default `auto`) that decides where tools run and which git identity they use; it is an enum, never the resolved home path (that is encrypted content). Present on Hermes-runtime poll events (`state.db`, cron); absent on reconciler-derived findings. |
 | `session_id` | string | no | plaintext | The `state.db` `sessions.id`. It joins a live hook payload back to the durable row. |
 | `session_key` | string | no | plaintext | The deterministic conversation-lane key. It groups session incarnations into one lane. |
 | `parent_session_id` | string | no | plaintext | The lineage edge for the execution tree. Root sessions have NULL. |
@@ -126,6 +126,7 @@ The validator round-trips this exact record. See
     "kind": "desktop",
     "gateway_id": "gw-nas01",
     "engine": "standard",
+    "home_mode": "auto",
     "hermes_version": "0.18.2",
     "release_date": "2026.7.7.2",
     "install_method": "git",
