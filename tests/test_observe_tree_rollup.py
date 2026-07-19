@@ -1,4 +1,4 @@
-"""Tests for the tree-view token/cost rollup math in hermes_dbass.observe.
+"""Tests for the tree-view token/cost rollup math in hermes_flight_recorder.observe.
 
 Focus: `_Index.own_tokens` and `_Index.subtree_tokens` — the precedence of
 session.ended over model.usage_recorded, the summing fallback across
@@ -10,10 +10,10 @@ tests/test_observe.py's style, and never imports from other test modules.
 
 from __future__ import annotations
 
-from hermes_dbass import observe
-from hermes_dbass.cli import main
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
+from hermes_flight_recorder import observe
+from hermes_flight_recorder.cli import main
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
 
 B = 1784415000.0
 

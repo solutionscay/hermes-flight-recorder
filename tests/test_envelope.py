@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_dbass.envelope import (
+from hermes_flight_recorder.envelope import (
     ALL_EVENT_TYPES,
     P0_POC_EVENT_TYPES,
     RESERVED_EVENT_TYPES,
@@ -170,9 +170,9 @@ def test_unknown_top_level_field_rejected():
 def test_envelope_imports_no_collector_or_state():
     """Importing the envelope must not drag in collector/outbox/state."""
     code = (
-        "import sys, hermes_dbass.envelope; "
+        "import sys, hermes_flight_recorder.envelope; "
         "bad = [m for m in sys.modules "
-        "if m.startswith('hermes_dbass.') and m != 'hermes_dbass.envelope']; "
+        "if m.startswith('hermes_flight_recorder.') and m != 'hermes_flight_recorder.envelope']; "
         "assert not bad, bad"
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)

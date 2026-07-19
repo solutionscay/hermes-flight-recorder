@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import datetime
 
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.collector.reconcile import ReconcileConfig, reconcile
-from hermes_dbass.envelope import validate
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
+from hermes_flight_recorder.envelope import validate
 
 # A fixed epoch anchor and a fixed tz offset, like the real cron store.
 B = 1784415000.0

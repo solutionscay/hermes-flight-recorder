@@ -17,12 +17,12 @@ import hashlib
 import json
 import sqlite3
 
-from hermes_dbass import observe
-from hermes_dbass.cli import main  # noqa: F401  (imported per task spec; CLI not re-tested here)
-from hermes_dbass.collector import cron_db, state_db  # noqa: F401  (state_db imported per task spec)
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
+from hermes_flight_recorder import observe
+from hermes_flight_recorder.cli import main  # noqa: F401  (imported per task spec; CLI not re-tested here)
+from hermes_flight_recorder.collector import cron_db, state_db  # noqa: F401  (state_db imported per task spec)
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
 
 B = 1784415000.0
 

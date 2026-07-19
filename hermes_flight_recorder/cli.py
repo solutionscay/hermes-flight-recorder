@@ -16,7 +16,7 @@ from . import __version__
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
-    # Imported lazily so `hermes-dbass --version` needs no heavy deps.
+    # Imported lazily so `hermes-flight-recorder --version` needs no heavy deps.
     from .collector.outbox import Outbox
 
     outbox = Outbox.open(args.bridge_home)
@@ -38,7 +38,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         try:
             outbox.installation_id  # fails if not initialized
         except OutboxError:
-            print("outbox not initialized; run `hermes-dbass init` first", file=sys.stderr)
+            print("outbox not initialized; run `hermes-flight-recorder init` first", file=sys.stderr)
             return 2
 
         totals: dict[str, int] = {}
@@ -66,7 +66,7 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
         try:
             outbox.installation_id  # fails if not initialized
         except OutboxError:
-            print("outbox not initialized; run `hermes-dbass init` first", file=sys.stderr)
+            print("outbox not initialized; run `hermes-flight-recorder init` first", file=sys.stderr)
             return 2
 
         counts = reconcile(outbox, args.hermes_home)
@@ -96,7 +96,7 @@ def _cmd_observe(args: argparse.Namespace) -> int:
         try:
             outbox.installation_id  # fails if not initialized
         except OutboxError:
-            print("outbox not initialized; run `hermes-dbass init` first", file=sys.stderr)
+            print("outbox not initialized; run `hermes-flight-recorder init` first", file=sys.stderr)
             return 2
 
         records = observe.load(outbox, session=args.session, since=since)
@@ -131,13 +131,13 @@ def _cmd_observe(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="hermes-dbass",
-        description="Bridge — the local-first companion for Hermes DBaaS.",
+        prog="hermes-flight-recorder",
+        description="Bridge — the local-first companion for Hermes Flight Recorder.",
     )
     parser.add_argument(
         "--version",
         action="version",
-        version=f"hermes-dbass {__version__}",
+        version=f"hermes-flight-recorder {__version__}",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -147,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument(
         "--bridge-home",
         default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-dbass).",
+        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
     )
     p_init.set_defaults(func=_cmd_init)
 
@@ -157,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--bridge-home",
         default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-dbass).",
+        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
     )
     p_run.add_argument(
         "--hermes-home",
@@ -173,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument(
         "--bridge-home",
         default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-dbass).",
+        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
     )
     p_rec.add_argument(
         "--hermes-home",
@@ -189,7 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_obs.add_argument(
         "--bridge-home",
         default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-dbass).",
+        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
     )
     p_obs.add_argument("--stream", action="store_true", help="Event stream in producer_sequence order.")
     p_obs.add_argument("--tree", action="store_true", help="Execution tree with token/cost rollups.")

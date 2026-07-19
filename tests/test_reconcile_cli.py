@@ -1,6 +1,6 @@
 """Tests for the ``reconcile`` CLI subcommand (issue #6 exit criterion).
 
-Drives ``hermes_dbass.cli.main(["reconcile", ...])`` end to end through
+Drives ``hermes_flight_recorder.cli.main(["reconcile", ...])`` end to end through
 ``capsys`` rather than calling the reconciler function directly, so these
 assert on the CLI's own contract: the not-initialized exit code and stderr
 hint, the "reconciled N new finding(s)" summary line, the per-event-type
@@ -26,10 +26,10 @@ import sqlite3
 import time
 from pathlib import Path
 
-from hermes_dbass import cli
-from hermes_dbass.collector._common import build_record
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
+from hermes_flight_recorder import cli
+from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
 
 # A fixed epoch anchor, mirrored from tests/test_reconcile.py's style, used
 # as the default `occurred_at` for events whose timestamp value is

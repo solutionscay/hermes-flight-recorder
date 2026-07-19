@@ -1,4 +1,4 @@
-"""Bridge — the local-first companion for Hermes DBaaS.
+"""Bridge — the local-first companion for Hermes Flight Recorder.
 
 Bridge runs alongside a Hermes agent. It captures semantic execution
 events, encrypts sensitive content on the host, buffers events in a

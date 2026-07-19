@@ -1,4 +1,4 @@
-# Hermes DBaaS
+# Hermes Flight Recorder
 
 **The local-first control plane for [Hermes](https://hermes-agent.nousresearch.com) agents.**
 
@@ -10,9 +10,9 @@ Your agents stay fast and local. Their state becomes durable and synchronized. Y
 
 ## What it is
 
-Hermes DBaaS captures semantic execution events from a Hermes installation that runs on your host. It encrypts and synchronizes agent state. It coordinates distributed task workers. It gives you a durable execution ledger for all your runtimes. Local reads and writes stay local. The cloud gives durability, coordination, and visibility.
+Hermes Flight Recorder captures semantic execution events from a Hermes installation that runs on your host. It encrypts and synchronizes agent state. It coordinates distributed task workers. It gives you a durable execution ledger for all your runtimes. Local reads and writes stay local. The cloud gives durability, coordination, and visibility.
 
-Hermes DBaaS is not "remote SQLite." It is not a vector store or a tracing dashboard. It is a control plane. It answers the questions that operators have about autonomous agents:
+Hermes Flight Recorder is not "remote SQLite." It is not a vector store or a tracing dashboard. It is a control plane. It answers the questions that operators have about autonomous agents:
 
 - What ran, in what order, and with what cost and result?
 - Which subagent did the work, and where did the lineage branch or fail?
@@ -24,10 +24,10 @@ Hermes DBaaS is not "remote SQLite." It is not a vector store or a tracing dashb
 
 This is the vision. The build is at **Phase 0**, and it is local-only. There is no cloud, no console, and no account yet. What runs now:
 
-- `hermes-dbass init` — create the local event log (the outbox) and mint a stable installation id.
-- `hermes-dbass run` — poll Hermes's `state.db` and cron store read-only and write each event to the log.
-- `hermes-dbass reconcile` — diff the durable stores against the log to find gaps, missing terminals, and missed cron runs, and record each finding.
-- `hermes-dbass observe` — render the log locally as a `--stream`, an execution `--tree` with token and cost rollups, or a `--report` of findings that exits non-zero when any exist. No network.
+- `hermes-flight-recorder init` — create the local event log (the outbox) and mint a stable installation id.
+- `hermes-flight-recorder run` — poll Hermes's `state.db` and cron store read-only and write each event to the log.
+- `hermes-flight-recorder reconcile` — diff the durable stores against the log to find gaps, missing terminals, and missed cron runs, and record each finding.
+- `hermes-flight-recorder observe` — render the log locally as a `--stream`, an execution `--tree` with token and cost rollups, or a `--report` of findings that exits non-zero when any exist. No network.
 
 The log reconstructs sessions, tool calls, subagent trees, model and cost usage, and cron runs. It encrypts sensitive content on the host before it writes, and it keeps a per-installation sequence so lost events are detectable. Bridge never writes to Hermes data.
 
@@ -101,7 +101,7 @@ Bridge encrypts content end-to-end with client-held keys. The service keeps some
 
 ## Relationship to Hermes
 
-Hermes DBaaS is independent infrastructure for the Hermes ecosystem. Nous Research and the Hermes project do not own, endorse, or supply it.
+Hermes Flight Recorder is independent infrastructure for the Hermes ecosystem. Nous Research and the Hermes project do not own, endorse, or supply it.
 
 ## License
 
@@ -109,4 +109,4 @@ We license the Bridge companion, the Hermes hook, and the event schema and SDK i
 
 ---
 
-<sub>The name means database as a service. It also means Drum and Bass as a Service. Think of loops, timing, signal, sync, and replay. But the infrastructure is the point.</sub>
+<sub>The name means the flight recorder for your agents — the black box that survives the crash. Think of capture, sequence, sync, and replay. But the infrastructure is the point.</sub>

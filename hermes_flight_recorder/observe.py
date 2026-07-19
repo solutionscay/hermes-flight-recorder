@@ -20,7 +20,7 @@ Three views:
 
 The render functions take a plain list of envelope records, so they are
 testable without an outbox. ``load()`` is the thin adapter that pulls and
-filters records from an :class:`~hermes_dbass.collector.outbox.Outbox`.
+filters records from an :class:`~hermes_flight_recorder.collector.outbox.Outbox`.
 """
 
 from __future__ import annotations

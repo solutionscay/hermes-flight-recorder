@@ -11,9 +11,9 @@ import json
 import sqlite3
 from collections import Counter
 
-from hermes_dbass.collector import cron_db, state_db
-from hermes_dbass.collector.outbox import Outbox
-from hermes_dbass.envelope import validate
+from hermes_flight_recorder.collector import cron_db, state_db
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.envelope import validate
 
 
 # --- fixtures -----------------------------------------------------------
@@ -92,7 +92,7 @@ def make_cron(hermes_home) -> None:
     db.close()
     (cron / "ticker_heartbeat").write_text("1784415389.44")
     (cron / "ticker_last_success").write_text("1784415389.44")
-    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "dbass-probe"}]}))
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "flight-recorder-probe"}]}))
 
 
 def new_outbox(tmp_path):
