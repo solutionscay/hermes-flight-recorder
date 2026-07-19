@@ -27,7 +27,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from ._common import build_record, resolve_hermes_home, root_session, runtime_stamp
+from ._common import (
+    build_record,
+    read_home_mode,
+    resolve_hermes_home,
+    root_session,
+    runtime_stamp,
+)
 
 _SESSION_COLS = (
     "id, source, parent_session_id, model, message_count, tool_call_count, "
@@ -42,6 +48,9 @@ def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
     if not db_path.exists():
         raise FileNotFoundError(f"state.db not found at {db_path}")
 
+    # Resolve the terminal home-mode policy once per poll, not per record.
+    home_mode = read_home_mode(hermes_home)
+
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -50,16 +59,16 @@ def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
         profile_of = {r["id"]: (r["profile_name"] or "default") for r in sessions}
 
         counts: dict[str, int] = defaultdict(int)
-        _poll_sessions(outbox, sessions, parent_map, counts)
-        _poll_messages(outbox, conn, parent_map, profile_of, counts)
-        _poll_model_usage(outbox, conn, parent_map, profile_of, counts)
-        _poll_delegations(outbox, conn, parent_map, profile_of, counts)
+        _poll_sessions(outbox, sessions, parent_map, counts, home_mode)
+        _poll_messages(outbox, conn, parent_map, profile_of, counts, home_mode)
+        _poll_model_usage(outbox, conn, parent_map, profile_of, counts, home_mode)
+        _poll_delegations(outbox, conn, parent_map, profile_of, counts, home_mode)
         return dict(counts)
     finally:
         conn.close()
 
 
-def _poll_sessions(outbox, sessions, parent_map, counts) -> None:
+def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
     for r in sessions:
         sid = r["id"]
         is_sub = r["source"] == "subagent"
@@ -74,7 +83,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts) -> None:
                 occurred_at=r["started_at"],
                 source="state.db:sessions",
                 capture_method="poll:state.db:sessions",
-                runtime=runtime_stamp(kind),
+                runtime=runtime_stamp(kind, home_mode=home_mode),
                 correlation_id=corr,
                 session_id=sid,
                 parent_session_id=r["parent_session_id"],
@@ -105,7 +114,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts) -> None:
                 occurred_at=r["ended_at"],
                 source="state.db:sessions",
                 capture_method="poll:state.db:sessions",
-                runtime=runtime_stamp(kind),
+                runtime=runtime_stamp(kind, home_mode=home_mode),
                 correlation_id=corr,
                 session_id=sid,
                 parent_session_id=r["parent_session_id"],
@@ -127,7 +136,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts) -> None:
             counts[ended] += 1
 
 
-def _poll_messages(outbox, conn, parent_map, profile_of, counts) -> None:
+def _poll_messages(outbox, conn, parent_map, profile_of, counts, home_mode) -> None:
     cursor = int(outbox.get_cursor("state.db:messages") or 0)
     rows = conn.execute(
         "SELECT id, session_id, tool_name, tool_call_id, effect_disposition, "
@@ -143,7 +152,7 @@ def _poll_messages(outbox, conn, parent_map, profile_of, counts) -> None:
                 occurred_at=r["timestamp"] or 0.0,
                 source="state.db:messages",
                 capture_method="poll:state.db:messages",
-                runtime=runtime_stamp("tool"),
+                runtime=runtime_stamp("tool", home_mode=home_mode),
                 correlation_id=corr,
                 session_id=sid,
                 profile=profile_of.get(sid, "default"),
@@ -165,7 +174,7 @@ def _poll_messages(outbox, conn, parent_map, profile_of, counts) -> None:
     outbox.set_cursor("state.db:messages", max_id)
 
 
-def _poll_model_usage(outbox, conn, parent_map, profile_of, counts) -> None:
+def _poll_model_usage(outbox, conn, parent_map, profile_of, counts, home_mode) -> None:
     rows = conn.execute(
         "SELECT session_id, model, task, api_call_count, input_tokens, output_tokens, "
         "cache_read_tokens, reasoning_tokens, estimated_cost_usd, cost_status, last_seen "
@@ -180,7 +189,7 @@ def _poll_model_usage(outbox, conn, parent_map, profile_of, counts) -> None:
                 occurred_at=r["last_seen"] or 0.0,
                 source="state.db:session_model_usage",
                 capture_method="poll:state.db:session_model_usage",
-                runtime=runtime_stamp("model"),
+                runtime=runtime_stamp("model", home_mode=home_mode),
                 correlation_id=corr,
                 session_id=sid,
                 profile=profile_of.get(sid, "default"),
@@ -205,7 +214,7 @@ def _poll_model_usage(outbox, conn, parent_map, profile_of, counts) -> None:
             counts["model.usage_recorded"] += 1
 
 
-def _poll_delegations(outbox, conn, parent_map, profile_of, counts) -> None:
+def _poll_delegations(outbox, conn, parent_map, profile_of, counts, home_mode) -> None:
     rows = conn.execute(
         "SELECT delegation_id, origin_session, parent_session_id, state, delivery_state, "
         "owner_pid, dispatched_at, event_json, result_json FROM async_delegations"
@@ -220,7 +229,7 @@ def _poll_delegations(outbox, conn, parent_map, profile_of, counts) -> None:
                 occurred_at=r["dispatched_at"] or 0.0,
                 source="state.db:async_delegations",
                 capture_method="poll:state.db:async_delegations",
-                runtime=runtime_stamp("subagent"),
+                runtime=runtime_stamp("subagent", home_mode=home_mode),
                 correlation_id=corr,
                 session_id=parent,
                 parent_session_id=r["parent_session_id"],

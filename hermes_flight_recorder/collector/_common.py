@@ -35,9 +35,76 @@ def to_epoch(value: Any) -> float | None:
     return datetime.datetime.fromisoformat(value).timestamp()
 
 
-def runtime_stamp(kind: str) -> dict[str, Any]:
-    """A minimal runtime inventory stamp. Best-effort in the POC."""
-    return {"kind": kind, "engine": "standard"}
+def runtime_stamp(kind: str, home_mode: str | None = None) -> dict[str, Any]:
+    """A minimal runtime inventory stamp. Best-effort in the POC.
+
+    ``home_mode`` is the Hermes ``terminal.home_mode`` policy (see
+    ``read_home_mode``). It is plaintext operational metadata that explains
+    where tools run and which git identity they use. Omitted when absent, so
+    the field is additive against envelope v1.
+    """
+    stamp: dict[str, Any] = {"kind": kind, "engine": "standard"}
+    if home_mode is not None:
+        stamp["home_mode"] = home_mode
+    return stamp
+
+
+# terminal.home_mode aliases Hermes normalizes to its canonical values.
+# See hermes_constants.get_subprocess_home in the Hermes source.
+_HOME_MODE_ALIASES = {
+    "isolated": "profile",
+    "profile_home": "profile",
+    "profile-home": "profile",
+    "host": "real",
+    "user": "real",
+    "real_home": "real",
+    "real-home": "real",
+}
+_HOME_MODE_CANONICAL = ("auto", "real", "profile")
+
+
+def read_home_mode(hermes_home: str | Path | None = None) -> str:
+    """The Hermes ``terminal.home_mode`` policy, normalized. Best-effort.
+
+    Reads ``config.yaml`` in the Hermes home and returns the canonical value
+    (``auto`` | ``real`` | ``profile``). Returns ``"auto"`` — the Hermes
+    default — when the file, the ``terminal`` block, or the key is absent,
+    blank, unreadable, or an unrecognized value. Never raises. Captures only
+    the enum; never the resolved HOME path (that is sensitive content).
+    """
+    raw = _read_terminal_home_mode(resolve_hermes_home(hermes_home) / "config.yaml")
+    if not raw:
+        return "auto"
+    mode = raw.strip().lower()
+    mode = _HOME_MODE_ALIASES.get(mode, mode)
+    return mode if mode in _HOME_MODE_CANONICAL else "auto"
+
+
+def _read_terminal_home_mode(config_path: Path) -> str | None:
+    """The raw ``terminal.home_mode`` string from ``config.yaml``, or None.
+
+    A tiny standard-library scanner — the project keeps its runtime deps to
+    ``cryptography`` alone, so it does not import a YAML parser. It finds the
+    top-level ``terminal:`` block and reads its ``home_mode:`` child, and it
+    reads nothing else, so adjacent secret blocks (bot tokens) are never
+    touched. Any read or parse trouble yields None.
+    """
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    in_terminal = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if line[:1] not in (" ", "\t"):  # a top-level key at column 0
+            in_terminal = stripped.split(":", 1)[0].strip() == "terminal"
+            continue
+        if in_terminal and stripped.split(":", 1)[0].strip() == "home_mode":
+            value = stripped.partition(":")[2]
+            return value.split("#", 1)[0].strip().strip("'\"") or None
+    return None
 
 
 def root_session(session_id: str | None, parent_map: dict[str, str | None]) -> str | None:
