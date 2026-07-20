@@ -31,6 +31,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .. import __version__
 from .sync import Ack, Batch, SyncResult, serialize_batch, sync
 from .sync_config import SyncConfig
 
@@ -40,6 +41,11 @@ DEFAULT_BASE_DELAY = 0.5
 DEFAULT_MAX_DELAY = 30.0
 
 _JSON_CONTENT_TYPE = "application/json"
+# Identify the client. urllib's default ``Python-urllib/x.y`` agent is refused
+# by some edges (e.g. Cloudflare bot protection answers it with HTTP 403), so a
+# batch would fail auth-classification for a reason that has nothing to do with
+# the credential. A descriptive agent avoids that and is good client hygiene.
+_USER_AGENT = f"hermes-flight-recorder/{__version__}"
 
 
 class TransportError(RuntimeError):
@@ -108,7 +114,11 @@ class HttpsTransport:
             self.ingest_url,
             data=body,
             method="POST",
-            headers={"Content-Type": _JSON_CONTENT_TYPE, **self.headers},
+            headers={
+                "Content-Type": _JSON_CONTENT_TYPE,
+                "User-Agent": _USER_AGENT,
+                **self.headers,
+            },
         )
         try:
             response = self._urlopen(request, timeout=self.timeout)

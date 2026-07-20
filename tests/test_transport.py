@@ -151,6 +151,9 @@ def test_send_posts_json_with_auth_headers_and_returns_ack():
     assert request.get_header("Content-type") == "application/json"
     assert request.get_header("Cf-access-client-id") == "cid"
     assert request.get_header("Cf-access-client-secret") == "csec"
+    # A descriptive User-Agent, not urllib's default (which some edges refuse).
+    ua = request.get_header("User-agent")
+    assert ua and ua.startswith("hermes-flight-recorder/")
     assert json.loads(request.data)["records"][0]["event_id"] == "e1"
 
 
