@@ -11,4 +11,5 @@ Components:
 - ``cron_db``:   adapter that reads the cron execution store
 - ``reconcile``: diff the durable stores against the outbox to detect
                  gaps, missing terminals, and missed cron runs
+- ``sync``:      batch pending outbox events for an acknowledged transport
 """
