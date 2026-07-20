@@ -8,36 +8,36 @@ Your agents stay fast and local. Bridge records what happened, preserves a durab
 
 ## What it is
 
-Hermes Flight Recorder is a local-first observability and control-plane project for people running Hermes across laptops, servers, gateways, and other runtimes.
+Hermes Flight Recorder is a local-first observability and control-plane project for people who run Hermes across laptops, servers, gateways, and other runtimes.
 
-The repository currently contains **Bridge**, a local companion that captures Hermes execution events, encrypts sensitive captured content, assigns a durable per-installation sequence, reconciles the event stream against Hermes's durable databases, and renders the result locally.
+The repository currently contains **Bridge**, a local companion for Hermes. Bridge captures Hermes execution events, encrypts sensitive captured content, and assigns a durable per-installation sequence. It then reconciles the event stream against Hermes's durable databases and renders the result locally.
 
 The longer-term project will sync encrypted events to a durable cloud ledger and coordinate work across multiple Hermes installations. That part is still on the roadmap.
 
-The project is not remote SQLite, a vector store, or another tracing wrapper. It is designed to answer operational questions such as:
+The project is not remote SQLite, a vector store, or another tracing wrapper. It answers operational questions such as:
 
 - What ran, in what order, and at what token cost?
 - Which sessions and subagents were involved?
 - Which durable rows were never captured as live events?
 - Which invocation never ended, which cron run never started, or which gateway failed before its startup hook fired?
-- Can I inspect fleet health without sending private prompts and outputs to a third party in plaintext?
+- Can I inspect fleet health, but not send private prompts and outputs to a third party in plaintext?
 
 ## What works today
 
 Everything in the current implementation runs locally and makes no network requests.
 
-- `hermes-flight-recorder init` creates the Bridge outbox, mints a stable installation ID, and installs a package event hook under the Hermes home.
+- `hermes-flight-recorder init` creates the Bridge outbox, makes a stable installation ID, and installs a package event hook under the Hermes home.
 - `hermes-flight-recorder run` drains the gateway hook spool and polls Hermes's `state.db` and cron execution store read-only.
 - `hermes-flight-recorder reconcile` records sequence gaps, durable rows missing from capture, stale starts without terminals, missed cron runs, stale cron tickers, and gateway startup failures.
 - `hermes-flight-recorder observe` renders the local outbox as an ordered `--stream`, an execution `--tree` with token and cost rollups, or a `--report` that exits non-zero when findings exist.
 
-The append-only SQLite outbox owns the installation ID and monotonic `producer_sequence`. Producers use stable deduplication keys, so polling or draining the same source again does not create duplicate events or consume sequence numbers. Envelope v1 and the ingestion protocol v1 are documented under [`docs/schema/`](docs/schema/).
+The append-only SQLite outbox owns the installation ID and monotonic `producer_sequence`. Producers use stable deduplication keys, so a repeated poll or drain of the same source does not create duplicate events or consume sequence numbers. Envelope v1 and the ingestion protocol v1 are documented under [`docs/schema/`](docs/schema/).
 
-Sensitive content that the current collectors capture, including messages, responses, tool results, delegation details, and raw gateway failure text, is encrypted before it enters the outbox. Operational metadata remains plaintext so Bridge can reconcile and render it.
+Bridge encrypts the sensitive content it captures before that content enters the outbox. This content includes messages, responses, tool results, delegation details, and raw gateway failure text. Operational metadata stays plaintext, so Bridge can reconcile and render it.
 
 ### Current Hermes limitation
 
-Hermes package event hooks (`HOOK.yaml` plus `handler.py`) currently run only in the gateway. Bridge can still recover durable sessions, tool results, model usage, delegation, and cron activity from Hermes databases across other surfaces, but it cannot reconstruct exact in-memory invocation boundaries or authoritative turn IDs after the fact.
+Hermes package event hooks (`HOOK.yaml` plus `handler.py`) currently run only in the gateway. Bridge can still recover durable sessions, tool results, model usage, delegation, and cron activity from Hermes databases across other surfaces. But it cannot reconstruct exact in-memory invocation boundaries or authoritative turn IDs after the fact.
 
 Upstream issue [NousResearch/hermes-agent#67798](https://github.com/NousResearch/hermes-agent/issues/67798) tracks the shared lifecycle-hook contract needed for equivalent live capture from CLI, one-shot, TUI, desktop, cron, and subagent execution paths.
 
@@ -86,7 +86,7 @@ Bridge implements the local half today. The hosted half is planned.
 
 1. **Capture (implemented).** The Hermes gateway hook records live lifecycle events. Read-only adapters reconstruct durable session, tool, model-usage, delegation, and cron events.
 2. **Reconcile (implemented).** Bridge compares captured events with the outbox sequence and Hermes's durable stores. Findings become first-class events in the same log.
-3. **Encrypt (prototype).** Bridge encrypts captured sensitive content locally with AES-256-GCM before writing it to the outbox.
+3. **Encrypt (prototype).** Bridge encrypts captured sensitive content locally with AES-256-GCM before it writes the content to the outbox.
 4. **Buffer (implemented) and sync (planned).** The outbox survives restarts. Phase 1 adds batching, a durable delivery cursor, HTTPS transport, acknowledgements, and offline retry.
 5. **Serve (planned).** The hosted service will maintain the durable event ledger, queryable projections, distributed task coordination, and the fleet console.
 
@@ -113,7 +113,7 @@ The current prototype does not send anything over the network. It stores selecte
 |---|---|
 | Captured messages and responses, tool results, delegation details, raw gateway failure text | Event types, installation and session IDs, timestamps, surfaces, status, model identifiers, token counts, cost, sequence fields, runtime inventory |
 
-The prototype key is generated locally and stored as `content-dev.key` in the Bridge home with mode `0600`. This proves the envelope and local encryption boundary; it is not the final end-to-end key-custody design. Workspace/device keys, rotation, recovery, and production service access guarantees belong to the encrypted-content phase of the roadmap.
+Bridge generates the prototype key locally and stores it as `content-dev.key` in the Bridge home with mode `0600`. This proves the envelope and local encryption boundary; it is not the final end-to-end key-custody design. Workspace and device keys, rotation, recovery, and production service access guarantees belong to the encrypted-content phase of the roadmap.
 
 The planned service must see enough metadata to route, reconcile, coordinate, and bill. The intended guarantee is zero knowledge of encrypted content, not zero knowledge of all metadata.
 
@@ -123,16 +123,16 @@ The planned service must see enough metadata to route, reconcile, coordinate, an
 - **Legibility** — operators can explain important actions, task transitions, and failures.
 - **Privacy by architecture** — sensitive content is encrypted before any future network boundary.
 - **Operational honesty** — guarantees such as at-least-once delivery, detectable loss, and metadata visibility are stated precisely.
-- **Semantic events** — Bridge records agent activity rather than synchronizing arbitrary SQLite pages.
+- **Semantic events** — Bridge records agent activity rather than a synchronization of arbitrary SQLite pages.
 
 ## Roadmap
 
 | Phase | Status | Focus |
 |---|---|---|
 | **0 — Instrumentation contract** | Complete | Loss-detectable local capture, durable sequencing, reconciliation, encrypted content fields, and local observation |
-| **1 — Buffer and sync** | Next | Batching, durable delivery cursor, enrollment/auth, HTTPS transport, retry, sync CLI, and an end-to-end network loss gate |
+| **1 — Buffer and sync** | Next | Batching, durable delivery cursor, enrollment and auth, HTTPS transport, retry, sync CLI, and an end-to-end network loss gate |
 | 2 — Distributed Kanban | Planned | Task claims, leases, fencing tokens, and attempt history across hosts |
-| 3 — Encrypted content sync | Planned | Production workspace/device keys, encrypted messages, tasks and memory, recovery, and key rotation |
+| 3 — Encrypted content sync | Planned | Production workspace and device keys, encrypted messages, tasks and memory, recovery, and key rotation |
 | 4 — Knowledge and MLOps | Planned | Memory and skill provenance, trajectory export, and governed datasets |
 | 5 — Cross-framework | Planned | Adapters beyond Hermes after the Hermes path is proven |
 
@@ -142,7 +142,7 @@ Phase 1 starts with [#32, the sync client skeleton and durable delivery cursor](
 
 Hermes Flight Recorder is independent infrastructure for the Hermes ecosystem. Nous Research and the Hermes project do not own, endorse, or supply it.
 
-Bridge treats Hermes's durable databases as read-only. Its only write into the Hermes home is the package event hook installed under `hooks/`; all outbox data, cursors, spool files, and keys live in the separate Bridge home.
+Bridge treats Hermes's durable databases as read-only. Its only write into the Hermes home is the package event hook installed under `hooks/`. All outbox data, cursors, spool files, and keys live in the separate Bridge home.
 
 ## License
 

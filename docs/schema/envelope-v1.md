@@ -1,6 +1,6 @@
 # Canonical event envelope v1
 
-_Status: frozen. Written in ASD-STE100 Simplified Technical English._
+_Status: frozen._
 
 The envelope is the single append-only event contract. Every part of the
 collector writes and reads this one shape: the hook, the outbox, the state
@@ -25,7 +25,7 @@ adapter, and the reconciler. The validator lives in
 | `installation_id` | string (uuid v4) | yes | plaintext | A stable id for one Hermes data root. The collector generates it at `hermes-flight-recorder init` and stores it in the outbox. One outbox is one installation. It is the scope for `producer_sequence`. Profiles share it. |
 | `tenant_id` | string | yes | plaintext | The workspace or tenant. If the install has no tenant, use `"default"`. |
 | `profile` | string | yes | plaintext | The Hermes profile name. Normalize NULL or absent to `"default"`. Do not use `"unknown"`. |
-| `runtime` | object | yes | plaintext | An inventory stamp at emit time: `kind`, `gateway_id`, `channels`, `engine`, `home_mode`, `hermes_version`, `release_date`, `install_method`, `state_schema_version`. `home_mode` is the Hermes `terminal.home_mode` policy (`auto` \| `real` \| `profile`, default `auto`) that decides where tools run and which git identity they use; it is an enum, never the resolved home path (that is encrypted content). Present on Hermes-runtime poll events (`state.db`, cron); absent on reconciler-derived findings. On gateway lifecycle events (`runtime.gateway_started`), `channels` is a plaintext list of connected Hermes platform names (e.g. `telegram`, `discord` — never a bot token) and `gateway_id` is a stable per-boot id; Hermes has no gateway-level transport, so the channel list is the transport surface. |
+| `runtime` | object | yes | plaintext | An inventory stamp at emit time: `kind`, `gateway_id`, `channels`, `engine`, `home_mode`, `hermes_version`, `release_date`, `install_method`, `state_schema_version`. `home_mode` is the Hermes `terminal.home_mode` policy (`auto` \| `real` \| `profile`, default `auto`) that decides where tools run and which git identity they use; it is an enum, never the resolved home path (that is encrypted content). Present on Hermes-runtime poll events (`state.db`, cron); absent on reconciler-derived findings. On gateway lifecycle events (`runtime.gateway_started`), `channels` is a plaintext list of connected Hermes platform names (for example `telegram` or `discord` — never a bot token) and `gateway_id` is a stable per-boot id; Hermes has no gateway-level transport, so the channel list is the transport surface. |
 | `session_id` | string | no | plaintext | The `state.db` `sessions.id`. It joins a live hook payload back to the durable row. |
 | `session_key` | string | no | plaintext | The deterministic conversation-lane key. It groups session incarnations into one lane. |
 | `parent_session_id` | string | no | plaintext | The lineage edge for the execution tree. Root sessions have NULL. |
@@ -51,7 +51,7 @@ event types below.
 originating surface a session entered Hermes through — plaintext operational
 metadata. The `state.db` producer records the verbatim `sessions.source`
 (`cli`, `desktop`, `cron`, `subagent`, or a gateway platform name such as
-`telegram` / `discord`); the live hook records the gateway `platform` value
+`telegram` or `discord`); the live hook records the gateway `platform` value
 and omits it for a local session. The value set is **open-ended** — plugin
 platforms extend it — so `surface` is a free-form string and is never
 enum-validated. Both producers report the same semantic concept (the ingress

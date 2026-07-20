@@ -17,10 +17,10 @@ python scripts/poc_exit_gate.py -v     # also print each `observe --report`
 It also runs as part of the test suite (`tests/test_exit_gate.py`), so `pytest`
 covers it.
 
-The gate is fully self-contained and deterministic: it builds a throwaway,
-synthetic-but-schema-accurate Hermes home (a `state.db`, a cron store, and a
-live hook spool) under a temp dir, anchored to a fixed clock. It never touches
-a real `~/.hermes` and never reaches the network.
+The gate is fully self-contained and deterministic. It builds a throwaway,
+synthetic-but-schema-accurate Hermes home under a temp dir, anchored to a fixed
+clock. This home contains a `state.db`, a cron store, and a live hook spool. It
+never touches a real `~/.hermes` and never reaches the network.
 
 ## What it proves
 
@@ -46,7 +46,7 @@ Four scenarios, each on its own disposable outbox:
 ## Running it against a real Hermes home
 
 The gate uses a synthetic home for determinism. To watch the same pipeline
-against a real (dev) Hermes install — the manual flow that was validated live
+against a real (dev) Hermes install — we validated this manual flow live
 on 2026-07-19 with a real Discord agent turn:
 
 ```bash
@@ -59,9 +59,9 @@ hermes-flight-recorder observe --tree       # execution tree with token/cost rol
 hermes-flight-recorder observe --report     # findings; exits non-zero if any
 ```
 
-Against a real home, `reconcile` uses the wall clock (there is no `--now`
-flag), so the timeout-based findings (missing terminals, missed cron) depend on
-elapsed time — unlike the fixed-clock gate above.
+Against a real home, `reconcile` uses the wall clock, because there is no
+`--now` flag. The timeout-based findings (missing terminals, missed cron) thus
+depend on elapsed time. This is unlike the fixed-clock gate above.
 
 ## Live capture check (real home, read-only)
 
@@ -78,5 +78,5 @@ python scripts/live_capture_check.py -v        # defaults to $HERMES_HOME / ~/.h
 python scripts/live_capture_check.py --hermes-home ~/.hermes-dev
 ```
 
-Exit `0` if every check passes. Safe to run any time — it never writes to the
-Hermes home.
+Exit `0` if every check passes. It is safe to run at any time. It never writes
+to the Hermes home.
