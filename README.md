@@ -4,7 +4,7 @@
 
 Your agents stay fast and local. Bridge records what happened, preserves a durable sequence, and tells you when the record is incomplete. The cloud is never part of the agent's critical path.
 
-> **Status: Phase 0 complete; Phase 1 is next.** The local recorder works. Cloud sync, the hosted ledger, and the fleet console do not exist yet. This is an early prototype, not production software.
+> **Status: Bridge Phases 0 and 1 complete; Phase 2 is next.** Local capture, reconciliation, encrypted buffering, and HTTPS sync work. The hosted service is a separate early project, and this is not production software.
 
 ## What it is
 
@@ -12,7 +12,7 @@ Hermes Flight Recorder is a local-first observability and control-plane project 
 
 The repository currently contains **Bridge**, a local companion for Hermes. Bridge captures Hermes execution events, encrypts sensitive captured content, and assigns a durable per-installation sequence. It then reconciles the event stream against Hermes's durable databases and renders the result locally.
 
-The longer-term project will sync encrypted events to a durable cloud ledger and coordinate work across multiple Hermes installations. That part is still on the roadmap.
+Bridge can sync those encrypted events to the separate hosted service. The longer-term project will coordinate work across multiple Hermes installations.
 
 The project is not remote SQLite, a vector store, or another tracing wrapper. It answers operational questions such as:
 
@@ -75,14 +75,15 @@ A resent batch is idempotent (the server dedups by `event_id`), and the delivery
 
 `BRIDGE_HOME` defaults to `~/.hermes-flight-recorder`. It must remain outside `HERMES_HOME`. See [docs/dev-setup.md](docs/dev-setup.md) for the development setup and safety notes.
 
-Two executable checks exercise the complete local pipeline:
+Three executable checks exercise the local and network pipelines:
 
 ```bash
 python scripts/poc_exit_gate.py -v
+python scripts/poc_sync_gate.py -v
 python scripts/live_capture_check.py -v
 ```
 
-The deterministic POC injects a dropped event and a missed cron run, then proves both are detected across a Bridge restart. The live check polls a real Hermes home into a throwaway outbox and verifies that the durable Hermes files are unchanged. See [docs/poc-demo.md](docs/poc-demo.md).
+The Phase 0 gate injects a dropped event and a missed cron run, then proves both are detected across a Bridge restart. The Phase 1 gate drops and duplicates HTTP deliveries, takes the service offline, and interrupts sync before an acknowledgement. The live check polls a real Hermes home into a throwaway outbox and verifies that the durable Hermes files are unchanged. See [docs/poc-demo.md](docs/poc-demo.md).
 
 ## The problem
 
@@ -92,16 +93,16 @@ Once agents span more than one machine, it becomes difficult to answer what ran,
 
 ## Architecture
 
-Bridge implements the local half today. The hosted half is planned.
+Bridge implements the local half and the client side of the network boundary. The hosted service lives in a separate repository.
 
 1. **Capture (implemented).** The Hermes gateway hook records live lifecycle events. Read-only adapters reconstruct durable session, tool, model-usage, delegation, and cron events.
 2. **Reconcile (implemented).** Bridge compares captured events with the outbox sequence and Hermes's durable stores. Findings become first-class events in the same log.
 3. **Encrypt (prototype).** Bridge encrypts captured sensitive content locally with AES-256-GCM before it writes the content to the outbox.
-4. **Buffer (implemented) and sync (planned).** The outbox survives restarts. Phase 1 adds batching, a durable delivery cursor, HTTPS transport, acknowledgements, and offline retry.
-5. **Serve (planned).** The hosted service will maintain the durable event ledger, queryable projections, distributed task coordination, and the fleet console.
+4. **Buffer and sync (implemented).** The outbox survives restarts. Sync batches encrypted envelopes, advances a durable delivery cursor only after acknowledgement, and retries safely after an outage.
+5. **Serve (separate project).** `hermes-dbass` owns the hosted ledger, projections, and fleet console. Distributed task coordination is next.
 
 ```text
-   YOUR MACHINE (IMPLEMENTED)                  HOSTED CLOUD (PLANNED)
+   YOUR MACHINE (IMPLEMENTED)                  HOSTED SERVICE (SEPARATE REPO)
    +---------------------------+               +-----------------------------------+
    | Hermes                    |  encrypted    | ingestion -> durable event ledger |
    | state.db / cron / hooks   |  batches      | and queryable projections         |
@@ -117,7 +118,7 @@ Bridge implements the local half today. The hosted half is planned.
 
 ## Data and privacy boundary
 
-The current prototype does not send anything over the network. It stores selected sensitive fields as ciphertext in the local outbox and leaves operational metadata plaintext.
+Capture, reconciliation, and local observation make no network requests. The `sync` command sends envelopes to the configured ingestion service. Selected sensitive fields are ciphertext before they enter the outbox or cross the network; operational metadata remains plaintext.
 
 | Encrypted in the local outbox today | Plaintext operational metadata |
 |---|---|
@@ -140,13 +141,13 @@ The planned service must see enough metadata to route, reconcile, coordinate, an
 | Phase | Status | Focus |
 |---|---|---|
 | **0 — Instrumentation contract** | Complete | Loss-detectable local capture, durable sequencing, reconciliation, encrypted content fields, and local observation |
-| **1 — Buffer and sync** | Next | Batching, durable delivery cursor, enrollment and auth, HTTPS transport, retry, sync CLI, and an end-to-end network loss gate |
-| 2 — Distributed Kanban | Planned | Task claims, leases, fencing tokens, and attempt history across hosts |
+| **1 — Buffer and sync** | Complete | Batching, durable delivery cursor, enrollment and auth, HTTPS transport, retry, sync CLI, and an end-to-end network loss gate |
+| **2 — Distributed Kanban** | Next | Task claims, leases, fencing tokens, and attempt history across hosts |
 | 3 — Encrypted content sync | Planned | Production workspace and device keys, encrypted messages, tasks and memory, recovery, and key rotation |
 | 4 — Knowledge and MLOps | Planned | Memory and skill provenance, trajectory export, and governed datasets |
 | 5 — Cross-framework | Planned | Adapters beyond Hermes after the Hermes path is proven |
 
-Phase 1 starts with [#32, the sync client skeleton and durable delivery cursor](https://github.com/solutionscay/hermes-flight-recorder/issues/32). The wire contract it consumes is frozen in [docs/schema/ingestion-protocol-v1.md](docs/schema/ingestion-protocol-v1.md).
+The [Phase 1 network gate (#35)](https://github.com/solutionscay/hermes-flight-recorder/issues/35) proves that delivery remains complete and gap-free through dropped requests, duplicate delivery, outages, and Bridge restarts. The wire contract is frozen in [docs/schema/ingestion-protocol-v1.md](docs/schema/ingestion-protocol-v1.md). Extracting that contract into a shared SDK remains optional [follow-up #36](https://github.com/solutionscay/hermes-flight-recorder/issues/36).
 
 ## Relationship to Hermes
 
