@@ -1,6 +1,6 @@
 # Ingestion protocol v1
 
-_Status: frozen. Written in ASD-STE100 Simplified Technical English._
+_Status: frozen._
 
 The ingestion protocol is the wire contract between the Bridge companion (the
 client) and the hosted service (the server). The Bridge ships the events it
