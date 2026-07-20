@@ -62,3 +62,21 @@ hermes-flight-recorder observe --report     # findings; exits non-zero if any
 Against a real home, `reconcile` uses the wall clock (there is no `--now`
 flag), so the timeout-based findings (missing terminals, missed cron) depend on
 elapsed time — unlike the fixed-clock gate above.
+
+## Live capture check (real home, read-only)
+
+`scripts/live_capture_check.py` runs the whole pipeline against the real Hermes
+home read-only (asserted byte-for-byte) into a throwaway outbox, and asserts the
+Phase 0 envelope enrichments hold against real data: `runtime.home_mode` on
+every poll event (#16), `payload.surface` on session events (#14), gateway
+`channels` + `gateway_id` (#15), and that gateway start-failure detection raises
+no false positive on a healthy gateway while still firing on a synthetic
+failure (#13).
+
+```bash
+python scripts/live_capture_check.py -v        # defaults to $HERMES_HOME / ~/.hermes
+python scripts/live_capture_check.py --hermes-home ~/.hermes-dev
+```
+
+Exit `0` if every check passes. Safe to run any time — it never writes to the
+Hermes home.
