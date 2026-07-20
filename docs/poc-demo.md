@@ -86,6 +86,34 @@ cursor advances only after a durable ack, so an interrupted or offline sync
 resumes from the last acked record with no gap and no reuse. A second `sync`
 after a full sync ships nothing.
 
+## Phase 1 network exit-gate
+
+The deterministic network gate runs the real outbox, batcher, HTTP transport,
+retry wrapper, acknowledgements, and delivery cursor against a throwaway local
+ingestion server:
+
+```bash
+python scripts/poc_sync_gate.py
+python scripts/poc_sync_gate.py -v
+```
+
+It exercises five scenarios:
+
+| Scenario | Injected fault | Expected result |
+|---|---|---|
+| **Happy path** | none | The server high-water and delivery cursor reach the client high-water. |
+| **Dropped batch** | the connection closes before storage | The client resends the same batch and the final stream has no gap. |
+| **Duplicate delivery** | the server stores a batch, then loses its ack | The client resends it and the server deduplicates every event by `event_id`. |
+| **Offline then online** | one complete sync pass cannot reach the service | The cursor stays in place; the next pass catches up. |
+| **Restart mid-sync** | Bridge stops after storage but before the ack | A reopened outbox resumes at its last acknowledged cursor and safely resends the stored batch. |
+
+Every scenario asserts that the server ledger contains each
+`producer_sequence` exactly once with no gap. It also checks the Access token
+headers and proves that the synthetic plaintext prompt never appears in an
+HTTP request body. The gate binds only to loopback and needs no external
+service or credential. `tests/test_sync_gate.py` runs the same scenarios in
+the normal test suite.
+
 ## Live capture check (real home, read-only)
 
 `scripts/live_capture_check.py` runs the whole pipeline against the real Hermes
