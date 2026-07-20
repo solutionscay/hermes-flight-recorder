@@ -24,12 +24,13 @@ The project is not remote SQLite, a vector store, or another tracing wrapper. It
 
 ## What works today
 
-Everything in the current implementation runs locally and makes no network requests.
+Capture and reconciliation run locally and make no network requests. `sync` is the one verb that reaches the network, and only to ship what capture already recorded.
 
 - `hermes-flight-recorder init` creates the Bridge outbox, makes a stable installation ID, and installs a package event hook under the Hermes home.
 - `hermes-flight-recorder run` drains the gateway hook spool and polls Hermes's `state.db` and cron execution store read-only.
 - `hermes-flight-recorder reconcile` records sequence gaps, durable rows missing from capture, stale starts without terminals, missed cron runs, stale cron tickers, and gateway startup failures.
 - `hermes-flight-recorder observe` renders the local outbox as an ordered `--stream`, an execution `--tree` with token and cost rollups, or a `--report` that exits non-zero when findings exist.
+- `hermes-flight-recorder sync` ships pending outbox events to the ingestion service over HTTPS and advances a durable delivery cursor. One pass by default (a cron can schedule it) or a `--interval SECONDS` loop; it prints a `shipped / acked / pending` summary and exits non-zero when the service is unreachable.
 
 The append-only SQLite outbox owns the installation ID and monotonic `producer_sequence`. Producers use stable deduplication keys, so a repeated poll or drain of the same source does not create duplicate events or consume sequence numbers. Envelope v1 and the ingestion protocol v1 are documented under [`docs/schema/`](docs/schema/).
 
@@ -62,6 +63,15 @@ hermes-flight-recorder reconcile
 hermes-flight-recorder observe --tree
 hermes-flight-recorder observe --report
 ```
+
+To ship the captured events, point `sync` at an ingestion service. The endpoint and the Cloudflare Access service token live in the Bridge home (`sync-config.json`, mode `0600`) or in the environment (`HFR_INGEST_URL`, `HFR_CF_ACCESS_CLIENT_ID`, `HFR_CF_ACCESS_CLIENT_SECRET`) — never in the Hermes home:
+
+```bash
+hermes-flight-recorder sync                 # one pass; exits non-zero if unreachable
+hermes-flight-recorder sync --interval 30   # ship every 30s, tolerating an offline network
+```
+
+A resent batch is idempotent (the server dedups by `event_id`), and the delivery cursor advances only after a durable ack, so an interrupted sync resumes from the last acked record with no gap and no reuse.
 
 `BRIDGE_HOME` defaults to `~/.hermes-flight-recorder`. It must remain outside `HERMES_HOME`. See [docs/dev-setup.md](docs/dev-setup.md) for the development setup and safety notes.
 

@@ -11,8 +11,16 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 from . import __version__
+
+# Exit codes for `sync`, so a cron or a monitor can tell the cases apart.
+_SYNC_OK = 0
+_SYNC_UNREACHABLE = 1  # the network stayed down through every retry
+_SYNC_CONFIG = 2  # the outbox or the sync config is not ready
+_SYNC_AUTH = 3  # the edge rejected the service token
+_SYNC_TERMINAL = 4  # the server rejected the batch as malformed (a client defect)
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -147,6 +155,90 @@ def _cmd_observe(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _sync_summary(outbox, before_cursor: int) -> tuple[int, int, int]:
+    """Return ``(acked_this_pass, delivery_cursor, pending)`` from outbox state.
+
+    The delivery cursor advances only after a durable ack, so its movement is
+    the honest count of what shipped and acked this pass. ``pending`` is the
+    distance the server is still behind the producer high-water. Read from the
+    outbox, not from the pass result, so the summary is truthful even when a
+    multi-batch pass ships some batches and then the network drops.
+    """
+    from .collector.sync import delivery_cursor
+
+    after = delivery_cursor(outbox)
+    producer_high_water = outbox.high_water()
+    return after - before_cursor, after, producer_high_water - after
+
+
+def _sync_once(outbox, transport) -> int:
+    """One sync pass. Print the summary and return a sync exit code."""
+    from .collector.sync import delivery_cursor
+    from .collector.transport import TerminalTransportError, push
+
+    before = delivery_cursor(outbox)
+    try:
+        outcome = push(outbox, transport)
+    except TerminalTransportError as exc:
+        # A client defect. Resending the same body cannot help.
+        print(f"sync stopped: malformed batch (client defect): {exc}", file=sys.stderr)
+        return _SYNC_TERMINAL
+
+    acked, cursor, pending = _sync_summary(outbox, before)
+    print(
+        f"shipped {acked} / acked {acked} / pending {pending}  "
+        f"(delivery cursor {cursor}, producer high-water {cursor + pending})"
+    )
+    if outcome.ok:
+        return _SYNC_OK
+    if outcome.reason == "auth":
+        print("sync failed: the edge rejected the service token", file=sys.stderr)
+        return _SYNC_AUTH
+    print("sync failed: the ingestion service is unreachable", file=sys.stderr)
+    return _SYNC_UNREACHABLE
+
+
+def _cmd_sync(args: argparse.Namespace) -> int:
+    from .collector import sync_config
+    from .collector.outbox import Outbox, OutboxError
+    from .collector.transport import HttpsTransport, RetryingTransport
+
+    outbox = Outbox.open(args.bridge_home)
+    try:
+        try:
+            outbox.installation_id  # fails if not initialized
+        except OutboxError:
+            print("outbox not initialized; run `hermes-flight-recorder init` first", file=sys.stderr)
+            return _SYNC_CONFIG
+
+        try:
+            config = sync_config.load(args.bridge_home)
+        except sync_config.SyncConfigError as exc:
+            print(f"sync not configured: {exc}", file=sys.stderr)
+            return _SYNC_CONFIG
+
+        transport = RetryingTransport(
+            HttpsTransport.from_config(
+                config, require_https=not args.allow_insecure_url
+            )
+        )
+
+        if args.interval is None:
+            return _sync_once(outbox, transport)
+
+        # Interval mode ships forever and tolerates an offline network: the
+        # outbox buffers and the next pass catches up. Ctrl-C stops it cleanly.
+        try:
+            while True:
+                _sync_once(outbox, transport)
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("sync stopped.", file=sys.stderr)
+            return _SYNC_OK
+    finally:
+        outbox.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hermes-flight-recorder",
@@ -230,6 +322,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_obs.add_argument("--session", default=None, help="Filter to one session/operation id.")
     p_obs.add_argument("--since", default=None, help="Keep events at/after an epoch or ISO timestamp.")
     p_obs.set_defaults(func=_cmd_observe)
+
+    p_sync = sub.add_parser(
+        "sync",
+        help="Ship pending outbox events to the ingestion service (one pass by default).",
+    )
+    p_sync.add_argument(
+        "--bridge-home",
+        default=None,
+        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
+    )
+    p_sync.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Ship repeatedly every SECONDS and tolerate an offline network. "
+        "Omit for a single pass (the default), which a cron can schedule.",
+    )
+    p_sync.add_argument(
+        "--allow-insecure-url",
+        action="store_true",
+        help="Permit a plaintext http:// ingest URL (local dev only; HTTPS is the default).",
+    )
+    p_sync.set_defaults(func=_cmd_sync)
 
     return parser
 

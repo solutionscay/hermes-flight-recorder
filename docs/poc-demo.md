@@ -63,6 +63,29 @@ Against a real home, `reconcile` uses the wall clock, because there is no
 `--now` flag. The timeout-based findings (missing terminals, missed cron) thus
 depend on elapsed time. This is unlike the fixed-clock gate above.
 
+## Shipping the capture (Phase 1)
+
+`run` and the verbs above stay local. `sync` is the one step that reaches the
+network: it ships the pending outbox events to the ingestion service and
+advances a durable delivery cursor. Point it at an endpoint first — the URL and
+the Cloudflare Access service token live in the Bridge home (`sync-config.json`,
+mode `0600`) or in the environment, never in the Hermes home:
+
+```bash
+export HFR_INGEST_URL=https://ingest.example.com/ingest
+export HFR_CF_ACCESS_CLIENT_ID=...            # Cloudflare Access service token
+export HFR_CF_ACCESS_CLIENT_SECRET=...
+
+hermes-flight-recorder sync                    # one pass; prints shipped/acked/pending
+hermes-flight-recorder sync --interval 30      # ship every 30s, tolerating an offline network
+```
+
+`sync` exits non-zero when the service is unreachable, so a cron or a monitor
+notices. A resent batch is idempotent (the server dedups by `event_id`) and the
+cursor advances only after a durable ack, so an interrupted or offline sync
+resumes from the last acked record with no gap and no reuse. A second `sync`
+after a full sync ships nothing.
+
 ## Live capture check (real home, read-only)
 
 `scripts/live_capture_check.py` runs the whole pipeline against the real Hermes
