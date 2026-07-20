@@ -128,9 +128,10 @@ def test_contiguous_run_of_missing_integers_emits_one_finding_each(tmp_path):
 
     Unlike the missed-cron detector -- which explicitly collapses a
     contiguous run of misses into one row with a `missed_count` -- the
-    sequence-gap detector has no such collapsing logic: it walks
-    range(lo+1, hi) and emits one reconcile.gap_detected per missing
-    integer. This asserts that CURRENT behavior. A case could be made that
+    sequence-gap detector has no such collapsing logic: it walks the integers
+    between each pair of adjacent surviving sequences and emits one
+    reconcile.gap_detected per missing integer. This asserts current behavior.
+    A case could be made that
     collapsing a contiguous run into a single finding (with something like
     a `missing_count`, mirroring cron's `missed_count`) would be friendlier
     to a downstream consumer than three near-identical rows all bracketed
@@ -161,10 +162,10 @@ def test_contiguous_run_of_missing_integers_emits_one_finding_each(tmp_path):
 def test_dropped_tail_sequence_is_undetectable(tmp_path):
     """Deleting the highest sequence leaves no trailing bracket.
 
-    _detect_sequence_gaps only scans range(lo+1, hi) -- strictly between the
-    lowest and highest surviving sequence numbers. If the dropped capture
-    was the very last one appended, removing it also removes it from being
-    `hi`, so the hole simply vanishes from the scan: a producer stopping at
+    _detect_sequence_gaps only scans between adjacent surviving sequence
+    numbers. If the dropped capture was the very last one appended, removing
+    it also removes the right-hand neighbor, so the hole simply vanishes from
+    the scan: a producer stopping at
     sequence 4 is indistinguishable from a producer that also emitted (and
     then lost) sequence 5. This is a real, inherent limitation of a
     high-water-mark scan, not a bug: without an authoritative record of how

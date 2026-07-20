@@ -79,8 +79,9 @@ def drain(outbox: Any, bridge_home: str | Path | None = None) -> dict[str, int]:
         if mapped is None:
             continue
         record, content = mapped
-        outbox.append(record, content=content, dedup_key=f"hook-spool:{line_offset}")
-        if outbox.last_append_created:
+        if outbox.append_if_new(
+            record, content=content, dedup_key=f"hook-spool:{line_offset}"
+        ):
             event_type = record["payload"]["event_type"]
             counts[event_type] = counts.get(event_type, 0) + 1
 

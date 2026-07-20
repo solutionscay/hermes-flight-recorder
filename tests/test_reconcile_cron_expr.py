@@ -1,7 +1,8 @@
 """Tests for cron-*expression* scheduling in the reconciler (schedule.kind='cron').
 
-Covers the 5-field parser (``_parse_cron`` / ``_parse_cron_field``) and
-instant expansion (``_cron_instants`` / ``_cron_missed``): wildcards vs
+Covers the extracted 5-field parser (``_parse_cron`` / ``_parse_cron_field``)
+and instant expansion (``_cron_instants``), plus the reconciler's
+``_cron_missed`` diff: wildcards vs
 restricted fields, ranges, steps, lists, and the standard cron day rule
 (day-of-month OR day-of-week when both are restricted; AND -- which reduces
 to whichever one is restricted -- otherwise). Also verifies the Sunday=0
@@ -14,7 +15,7 @@ guards a correctness property: ``_cron_instants`` resolves each candidate
 epoch in a FIXED zone -- the job's own UTC offset (carried by its ISO
 timestamps), or UTC as a deterministic fallback -- never the host process's
 ambient timezone. This keeps the cron-expression diff identical across
-otherwise-identical environments, matching reconcile.py's "deterministic
+otherwise-identical environments, matching the reconciler's "deterministic
 diff" premise ("a second run over the same durable state appends nothing
 new").
 """
@@ -28,13 +29,15 @@ import os
 import time
 
 from hermes_flight_recorder.collector.outbox import Outbox
-from hermes_flight_recorder.collector.reconcile import (
-    ReconcileConfig,
+from hermes_flight_recorder.collector.cron_schedule import (
     _cron_instants,
-    _cron_missed,
     _dow,
     _parse_cron,
     _parse_cron_field,
+)
+from hermes_flight_recorder.collector.reconcile import (
+    ReconcileConfig,
+    _cron_missed,
     reconcile,
 )
 
@@ -75,11 +78,9 @@ def utc_hour_minute(epoch: float) -> tuple[int, int]:
 def host_tz(name: str):
     """Force the process's local timezone for the duration of the block.
 
-    ``_cron_instants`` calls ``datetime.fromtimestamp(t)`` with no ``tzinfo``,
-    so it resolves against whatever ``TZ`` the host process has. Pinning it
-    here is what makes the hour/day-sensitive tests deterministic regardless
-    of the CI runner's ambient timezone -- and is also the lever the
-    tz-mismatch test below uses to demonstrate the bug.
+    Pinning the host timezone keeps the hour/day-sensitive test environment
+    explicit and lets the independence test verify that expansion ignores the
+    process's ambient timezone.
     """
     old = os.environ.get("TZ")
     os.environ["TZ"] = name

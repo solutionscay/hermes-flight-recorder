@@ -34,6 +34,7 @@ from typing import Any, Iterator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from ..envelope import SCHEMA_VERSION, parse, serialize, validate
+from ._common import resolve_hermes_home
 
 OUTBOX_SCHEMA_VERSION = "1"
 _KEY_VERSION = "aesgcm256:dev"
@@ -66,11 +67,6 @@ def default_bridge_home() -> Path:
     return Path(env).expanduser() if env else Path.home() / ".hermes-flight-recorder"
 
 
-def _hermes_home() -> Path:
-    env = os.environ.get("HERMES_HOME")
-    return (Path(env).expanduser() if env else Path.home() / ".hermes").resolve()
-
-
 class OutboxError(RuntimeError):
     pass
 
@@ -87,12 +83,6 @@ class Outbox:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_DDL)
         self._content_key: bytes | None = None
-        self._last_created = False
-
-    @property
-    def last_append_created(self) -> bool:
-        """True if the most recent append() inserted a new row (not a dedup hit)."""
-        return self._last_created
 
     # --- construction ---------------------------------------------------
     @classmethod
@@ -100,7 +90,7 @@ class Outbox:
         home = Path(bridge_home).expanduser() if bridge_home else default_bridge_home()
         home = home.resolve()
         path = home / "outbox.sqlite"
-        hermes = _hermes_home()
+        hermes = resolve_hermes_home(None).resolve()
         if path == hermes or _is_relative_to(path, hermes):
             raise OutboxError(
                 f"refusing to place the outbox under HERMES_HOME ({hermes}); "
@@ -197,6 +187,28 @@ class Outbox:
         row is written and no sequence number is consumed; the stored
         record is returned.
         """
+        record, _ = self._append(record, content=content, dedup_key=dedup_key)
+        return record
+
+    def append_if_new(
+        self,
+        record: dict[str, Any],
+        *,
+        content: str | bytes | None = None,
+        dedup_key: str | None = None,
+    ) -> bool:
+        """Append one record and report whether a new row was inserted."""
+        _, created = self._append(record, content=content, dedup_key=dedup_key)
+        return created
+
+    def _append(
+        self,
+        record: dict[str, Any],
+        *,
+        content: str | bytes | None,
+        dedup_key: str | None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Implement both append APIs and return the stored record and outcome."""
         rec = dict(record)
         if content is not None:
             rec.update(self._encrypt_content(content))
@@ -207,7 +219,6 @@ class Outbox:
         inst = rec["installation_id"]
 
         conn = self._conn
-        self._last_created = False
         conn.execute("BEGIN IMMEDIATE")
         try:
             if dedup_key is not None:
@@ -216,7 +227,7 @@ class Outbox:
                 ).fetchone()
                 if existing is not None:
                     conn.execute("COMMIT")
-                    return parse(existing[0])
+                    return parse(existing[0]), False
 
             row = conn.execute(
                 "SELECT high_water FROM seq WHERE installation_id=?", (inst,)
@@ -244,8 +255,7 @@ class Outbox:
                 (inst, seq),
             )
             conn.execute("COMMIT")
-            self._last_created = True
-            return rec
+            return rec, True
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -256,17 +266,10 @@ class Outbox:
     # side is the backstop that guarantees no duplicate even if a cursor is
     # reset.
     def get_cursor(self, name: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key=?", (f"cursor:{name}",)
-        ).fetchone()
-        return row[0] if row else None
+        return self.get_meta(f"cursor:{name}")
 
     def set_cursor(self, name: str, value: str | int) -> None:
-        self._conn.execute(
-            "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (f"cursor:{name}", str(value)),
-        )
+        self.set_meta(f"cursor:{name}", str(value))
 
     # --- generic meta -----------------------------------------------------
     # A producer may persist small bits of cross-drain state directly in the

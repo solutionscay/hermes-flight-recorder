@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -47,11 +46,13 @@ from typing import Any, Iterable
 from ._common import (
     build_record,
     open_sqlite_read_only,
+    read_float,
     resolve_hermes_home,
     root_session,
     runtime_stamp,
     to_epoch,
 )
+from .cron_schedule import expected_instants
 
 _SOURCE = "reconciler"
 _CAPTURE = "derive:reconciler"
@@ -98,8 +99,12 @@ def reconcile(
     counts: dict[str, int] = defaultdict(int)
 
     _detect_sequence_gaps(outbox, events, installation_id, counts, when)
-    _detect_coverage_gaps(outbox, events, home, counts, when)
-    _detect_missing_terminals(outbox, events, home, counts, when, cfg)
+    session_rows, parent_map = _detect_coverage_gaps(
+        outbox, events, home, counts, when
+    )
+    _detect_missing_terminals(
+        outbox, events, home, counts, when, cfg, session_rows, parent_map
+    )
     _detect_missed_cron(outbox, home, counts, when, cfg)
     _detect_gateway_start_failed(outbox, home, counts, when, cfg)
     return dict(counts)
@@ -108,47 +113,44 @@ def reconcile(
 # --- sequence gaps ------------------------------------------------------
 def _detect_sequence_gaps(outbox, events, installation_id, counts, when) -> None:
     seqs = sorted(e["producer_sequence"] for e in events)
-    if not seqs:
-        return
-    present = set(seqs)
-    lo, hi = seqs[0], seqs[-1]
-    for missing in range(lo + 1, hi):
-        if missing in present:
-            continue
-        # Bracket the hole with its surviving neighbours for context.
-        prev_seq = max((s for s in present if s < missing), default=None)
-        next_seq = min((s for s in present if s > missing), default=None)
-        _emit(
-            outbox,
-            counts,
-            event_type="reconcile.gap_detected",
-            occurred_at=when,
-            correlation_id=installation_id,
-            partial=False,  # a lost sequence is a fact, not an inference
-            payload={
-                "gap_kind": "sequence",
-                "missing_sequence": missing,
-                "prev_sequence": prev_seq,
-                "next_sequence": next_seq,
-            },
-            dedup_key=f"reconcile:seq:{installation_id}:{missing}",
-        )
+    for prev_seq, next_seq in zip(seqs, seqs[1:]):
+        for missing in range(prev_seq + 1, next_seq):
+            _emit(
+                outbox,
+                counts,
+                event_type="reconcile.gap_detected",
+                occurred_at=when,
+                correlation_id=installation_id,
+                partial=False,  # a lost sequence is a fact, not an inference
+                payload={
+                    "gap_kind": "sequence",
+                    "missing_sequence": missing,
+                    "prev_sequence": prev_seq,
+                    "next_sequence": next_seq,
+                },
+                dedup_key=f"reconcile:seq:{installation_id}:{missing}",
+            )
 
 
 # --- coverage gaps ------------------------------------------------------
-def _detect_coverage_gaps(outbox, events, home, counts, when) -> None:
+def _detect_coverage_gaps(outbox, events, home, counts, when):
     """A durable row with no captured event proves a dropped capture."""
     captured = _captured_subjects(events)
+    session_rows = []
+    parent_map = {}
 
     state_path = home / "state.db"
     if state_path.exists():
         conn = open_sqlite_read_only(state_path)
         try:
-            parent_map = {
-                r["id"]: r["parent_session_id"]
-                for r in conn.execute("SELECT id, parent_session_id FROM sessions")
-            }
-            _coverage_sessions(outbox, conn, parent_map, captured, counts, when)
+            session_rows = conn.execute(
+                "SELECT id, source, parent_session_id, started_at, ended_at, "
+                "expiry_finalized, profile_name FROM sessions"
+            ).fetchall()
+            parent_map = {r["id"]: r["parent_session_id"] for r in session_rows}
+            _coverage_sessions(
+                outbox, session_rows, parent_map, captured, counts, when
+            )
             _coverage_tool_messages(outbox, conn, parent_map, captured, counts, when)
             _coverage_model_usage(outbox, conn, parent_map, captured, counts, when)
         finally:
@@ -169,10 +171,11 @@ def _detect_coverage_gaps(outbox, events, home, counts, when) -> None:
                 subject_type="execution", subject_id=r["id"],
                 source_table="cron:executions.db", correlation_id=r["job_id"],
             )
+    return session_rows, parent_map
 
 
-def _coverage_sessions(outbox, conn, parent_map, captured, counts, when) -> None:
-    for r in conn.execute("SELECT id, parent_session_id FROM sessions"):
+def _coverage_sessions(outbox, rows, parent_map, captured, counts, when) -> None:
+    for r in rows:
         sid = r["id"]
         if sid in captured["sessions"]:
             continue
@@ -271,31 +274,20 @@ def _emit_coverage(
 
 
 # --- missing terminals --------------------------------------------------
-def _detect_missing_terminals(outbox, events, home, counts, when, cfg) -> None:
-    _terminals_sessions(outbox, home, counts, when, cfg)
+def _detect_missing_terminals(
+    outbox, events, home, counts, when, cfg, session_rows, parent_map
+) -> None:
+    _terminals_sessions(outbox, session_rows, parent_map, counts, when, cfg)
     _terminals_cron_runs(outbox, home, counts, when, cfg)
     _terminals_invocations(outbox, events, counts, when, cfg)
 
 
-def _terminals_sessions(outbox, home, counts, when, cfg) -> None:
+def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
     """A durable session/subagent row with ended_at NULL past its window.
 
     The durable row is authoritative: a live session keeps ended_at=NULL and
     is not a crash, so judge it only after the lifetime window.
     """
-    state_path = home / "state.db"
-    if not state_path.exists():
-        return
-    conn = open_sqlite_read_only(state_path)
-    try:
-        rows = conn.execute(
-            "SELECT id, source, parent_session_id, started_at, ended_at, "
-            "expiry_finalized, profile_name FROM sessions"
-        ).fetchall()
-        parent_map = {r["id"]: r["parent_session_id"] for r in rows}
-    finally:
-        conn.close()
-
     for r in rows:
         if r["ended_at"] is not None:
             continue
@@ -311,20 +303,19 @@ def _terminals_sessions(outbox, home, counts, when, cfg) -> None:
         expected = "subagent.completed" if is_sub else "session.ended"
         sid = r["id"]
         corr = root_session(sid, parent_map) or sid
-        _emit(
-            outbox, counts,
-            event_type="reconcile.terminal_missing",
+        _emit_terminal_missing(
+            outbox,
+            counts,
             occurred_at=when,
             correlation_id=corr,
+            subject_type=subject_type,
+            subject_id=sid,
+            start_event_type="subagent.child_spawned" if is_sub else "session.created",
+            expected_terminal_event_type=expected,
             session_id=sid,
             parent_session_id=r["parent_session_id"],
             profile=r["profile_name"] or "default",
-            partial=True,
-            payload={
-                "subject_type": subject_type,
-                "subject_id": sid,
-                "start_event_type": "subagent.child_spawned" if is_sub else "session.created",
-                "expected_terminal_event_type": expected,
+            details={
                 "start_occurred_at": started,
                 "age_seconds": age,
             },
@@ -354,18 +345,17 @@ def _terminals_cron_runs(outbox, home, counts, when, cfg) -> None:
         if age <= cfg.cron_run_terminal_timeout:
             continue
         exid = r["id"]
-        _emit(
-            outbox, counts,
-            event_type="reconcile.terminal_missing",
+        _emit_terminal_missing(
+            outbox,
+            counts,
             occurred_at=when,
             correlation_id=r["job_id"],
-            partial=True,
-            payload={
-                "subject_type": "cron_run",
-                "subject_id": exid,
+            subject_type="cron_run",
+            subject_id=exid,
+            start_event_type="cron.run_claimed",
+            expected_terminal_event_type="cron.run_finished",
+            details={
                 "job_id": r["job_id"],
-                "start_event_type": "cron.run_claimed",
-                "expected_terminal_event_type": "cron.run_finished",
                 "status": r["status"],
                 "start_occurred_at": claimed,
                 "age_seconds": age,
@@ -399,26 +389,65 @@ def _terminals_invocations(outbox, events, counts, when, cfg) -> None:
         occurred = e.get("occurred_at")
         if occurred is None or when - occurred <= cfg.invocation_terminal_timeout:
             continue
-        _emit(
-            outbox, counts,
-            event_type="reconcile.terminal_missing",
+        _emit_terminal_missing(
+            outbox,
+            counts,
             occurred_at=when,
             correlation_id=e.get("correlation_id") or inv,
+            subject_type="invocation",
+            subject_id=inv,
+            start_event_type="invocation.started",
+            expected_terminal_event_type="invocation.completed",
             session_id=e.get("session_id"),
             parent_session_id=e.get("parent_session_id"),
             invocation_id=inv,
             profile=e.get("profile") or "default",
-            partial=True,
-            payload={
-                "subject_type": "invocation",
-                "subject_id": inv,
-                "start_event_type": "invocation.started",
-                "expected_terminal_event_type": "invocation.completed",
+            details={
                 "start_occurred_at": occurred,
                 "age_seconds": when - occurred,
             },
             dedup_key=f"reconcile:terminal:invocation:{inv}",
         )
+
+
+def _emit_terminal_missing(
+    outbox,
+    counts,
+    *,
+    occurred_at,
+    correlation_id,
+    subject_type,
+    subject_id,
+    start_event_type,
+    expected_terminal_event_type,
+    dedup_key,
+    details=None,
+    session_id=None,
+    parent_session_id=None,
+    invocation_id=None,
+    profile="default",
+) -> None:
+    payload = {
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "start_event_type": start_event_type,
+        "expected_terminal_event_type": expected_terminal_event_type,
+    }
+    payload.update(details or {})
+    _emit(
+        outbox,
+        counts,
+        event_type="reconcile.terminal_missing",
+        occurred_at=occurred_at,
+        correlation_id=correlation_id,
+        session_id=session_id,
+        parent_session_id=parent_session_id,
+        invocation_id=invocation_id,
+        profile=profile,
+        partial=True,
+        payload=payload,
+        dedup_key=dedup_key,
+    )
 
 
 # --- missed cron --------------------------------------------------------
@@ -538,14 +567,11 @@ def _once_missed(execs, run_at, now, slack):
 
 
 def _cron_missed(expr, execs, created, now, cfg, tz=None):
-    fields = _parse_cron(expr)
-    if fields is None:
-        return []
     anchor = execs[0] if execs else created
     if anchor is None:
         return []
     lower = max(anchor, now - cfg.cron_lookback)
-    expected = _cron_instants(fields, lower, now, tz)
+    expected = expected_instants(expr, lower, now, tz)
     slack = cfg.cron_match_slack
     runs: list[tuple[float, int, bool]] = []
     run_first: float | None = None
@@ -564,74 +590,6 @@ def _cron_missed(expr, execs, created, now, cfg, tz=None):
         is_tail = expected[-1] >= now - 60.0
         runs.append((run_first, run_count, is_tail))
     return runs
-
-
-# --- cron expression parsing --------------------------------------------
-def _parse_cron(expr: str | None):
-    """Parse a standard 5-field cron expression into per-field int sets."""
-    if not isinstance(expr, str):
-        return None
-    parts = expr.split()
-    if len(parts) != 5:
-        return None
-    bounds = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6))
-    try:
-        return tuple(_parse_cron_field(p, lo, hi) for p, (lo, hi) in zip(parts, bounds))
-    except ValueError:
-        return None
-
-
-def _parse_cron_field(field: str, lo: int, hi: int) -> set[int]:
-    values: set[int] = set()
-    for token in field.split(","):
-        step = 1
-        if "/" in token:
-            token, step_s = token.split("/", 1)
-            step = int(step_s)
-            if step <= 0:
-                raise ValueError("step must be positive")
-        if token in ("*", ""):
-            start, end = lo, hi
-        elif "-" in token:
-            a, b = token.split("-", 1)
-            start, end = int(a), int(b)
-        else:
-            start = end = int(token)
-        if start < lo or end > hi or start > end:
-            raise ValueError("field out of range")
-        values.update(range(start, end + 1, step))
-    return values
-
-
-def _cron_instants(fields, lower: float, now: float, tz=None) -> list[float]:
-    # Resolve each candidate epoch to wall-clock fields in a fixed zone (the
-    # job's own offset, or UTC as a deterministic fallback) — never the host
-    # process's ambient timezone, so the expansion is environment-independent.
-    zone = tz or datetime.timezone.utc
-    minute, hour, dom, month, dow = fields
-    dom_restricted = len(dom) < 31
-    dow_restricted = len(dow) < 7
-    out: list[float] = []
-    t = math.ceil(lower / 60.0) * 60.0
-    while t <= now:
-        d = datetime.datetime.fromtimestamp(t, zone)
-        # Standard cron day matching: when both day-of-month and
-        # day-of-week are restricted, a match on either satisfies the day;
-        # otherwise both restrictions apply (a "*" is not a restriction).
-        dom_hit, dow_hit = d.day in dom, _dow(d) in dow
-        if dom_restricted and dow_restricted:
-            day_ok = dom_hit or dow_hit
-        else:
-            day_ok = (dom_hit or not dom_restricted) and (dow_hit or not dow_restricted)
-        if d.minute in minute and d.hour in hour and d.month in month and day_ok:
-            out.append(float(int(t)))
-        t += 60.0
-    return out
-
-
-def _dow(d: datetime.datetime) -> int:
-    """Cron day-of-week: Sunday is 0 (Python's Monday-0 shifted)."""
-    return (d.weekday() + 1) % 7
 
 
 # --- gateway start failure ----------------------------------------------
@@ -771,23 +729,22 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 # --- ticker liveness ----------------------------------------------------
 def _ticker_is_stale(outbox, cron_dir, counts, when, cfg) -> bool:
-    hb = _read_float(cron_dir / "ticker_heartbeat")
+    hb = read_float(cron_dir / "ticker_heartbeat")
     if hb is None:
         return False
     staleness = when - hb
     if staleness <= cfg.ticker_stale_after:
         return False
-    _emit(
-        outbox, counts,
-        event_type="reconcile.terminal_missing",
+    _emit_terminal_missing(
+        outbox,
+        counts,
         occurred_at=when,
         correlation_id="cron:ticker",
-        partial=True,
-        payload={
-            "subject_type": "cron_ticker",
-            "subject_id": "cron:ticker",
-            "start_event_type": "cron.ticker_heartbeat",
-            "expected_terminal_event_type": "cron.ticker_heartbeat",
+        subject_type="cron_ticker",
+        subject_id="cron:ticker",
+        start_event_type="cron.ticker_heartbeat",
+        expected_terminal_event_type="cron.ticker_heartbeat",
+        details={
             "heartbeat": hb,
             "staleness_seconds": staleness,
         },
@@ -829,16 +786,6 @@ def _execution_epochs_by_job(cron_dir: Path) -> dict[str, list[float]]:
 def _load_jobs(path: Path) -> list[dict[str, Any]]:
     jobs = _load_json(path).get("jobs")
     return [j for j in jobs if isinstance(j, dict)] if isinstance(jobs, list) else []
-
-
-def _read_float(path: Path) -> float | None:
-    if not path.exists():
-        return None
-    text = path.read_text().strip()
-    try:
-        return float(text) if text else None
-    except ValueError:
-        return None
 
 
 def _near(value: float, sorted_epochs: Iterable[float], slack: float) -> bool:
@@ -892,6 +839,5 @@ def _emit(
         profile=profile,
         partial=partial,
     )
-    outbox.append(rec, content=content, dedup_key=dedup_key)
-    if outbox.last_append_created:
-        counts[event_type] += 1
+    if outbox.append_if_new(rec, content=content, dedup_key=dedup_key):
+        counts[rec["payload"]["event_type"]] += 1

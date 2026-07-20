@@ -22,13 +22,13 @@ The adapter never writes to ``state.db``.
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from ._common import (
     build_record,
+    open_sqlite_read_only,
     read_home_mode,
     resolve_hermes_home,
     root_session,
@@ -51,8 +51,7 @@ def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
     # Resolve the terminal home-mode policy once per poll, not per record.
     home_mode = read_home_mode(hermes_home)
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = open_sqlite_read_only(db_path)
     try:
         sessions = conn.execute(f"SELECT {_SESSION_COLS} FROM sessions").fetchall()
         parent_map = {r["id"]: r["parent_session_id"] for r in sessions}
@@ -77,33 +76,30 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
         corr = root_session(sid, parent_map) or sid
 
         created = "subagent.child_spawned" if is_sub else "session.created"
-        outbox.append(
-            build_record(
-                event_type=created,
-                occurred_at=r["started_at"],
-                source="state.db:sessions",
-                capture_method="poll:state.db:sessions",
-                runtime=runtime_stamp(kind, home_mode=home_mode),
-                correlation_id=corr,
-                session_id=sid,
-                parent_session_id=r["parent_session_id"],
-                profile=profile,
-                payload={
-                    "kind": kind,
-                    # The originating surface: the verbatim sessions.source
-                    # (cli | desktop | cron | subagent | a gateway platform
-                    # name like telegram/discord ...). Open-ended by design —
-                    # plugin platforms extend it — so it is not enum-validated.
-                    "surface": kind,
-                    "model": r["model"],
-                    "message_count": r["message_count"],
-                    "tool_call_count": r["tool_call_count"],
-                },
-            ),
-            dedup_key=f"state.db:{created}:{sid}",
+        record = build_record(
+            event_type=created,
+            occurred_at=r["started_at"],
+            source="state.db:sessions",
+            capture_method="poll:state.db:sessions",
+            runtime=runtime_stamp(kind, home_mode=home_mode),
+            correlation_id=corr,
+            session_id=sid,
+            parent_session_id=r["parent_session_id"],
+            profile=profile,
+            payload={
+                "kind": kind,
+                # The originating surface: the verbatim sessions.source
+                # (cli | desktop | cron | subagent | a gateway platform
+                # name like telegram/discord ...). Open-ended by design —
+                # plugin platforms extend it — so it is not enum-validated.
+                "surface": kind,
+                "model": r["model"],
+                "message_count": r["message_count"],
+                "tool_call_count": r["tool_call_count"],
+            },
         )
-        if outbox.last_append_created:
-            counts[created] += 1
+        if outbox.append_if_new(record, dedup_key=f"state.db:{created}:{sid}"):
+            counts[record["payload"]["event_type"]] += 1
 
         # A NULL ended_at is a live session, not a crash. Emit no terminal;
         # the reconciler decides terminal-missing after a lifetime window.
@@ -113,32 +109,29 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
         ended = "subagent.completed" if is_sub else "session.ended"
         # end_reason is not stable until expiry_finalized flips from 0.
         partial = r["expiry_finalized"] == 0
-        outbox.append(
-            build_record(
-                event_type=ended,
-                occurred_at=r["ended_at"],
-                source="state.db:sessions",
-                capture_method="poll:state.db:sessions",
-                runtime=runtime_stamp(kind, home_mode=home_mode),
-                correlation_id=corr,
-                session_id=sid,
-                parent_session_id=r["parent_session_id"],
-                profile=profile,
-                partial=partial,
-                payload={
-                    "kind": kind,
-                    "end_reason": r["end_reason"],
-                    "message_count": r["message_count"],
-                    "tool_call_count": r["tool_call_count"],
-                    "input_tokens": r["input_tokens"],
-                    "output_tokens": r["output_tokens"],
-                    "estimated_cost_usd": r["estimated_cost_usd"],
-                },
-            ),
-            dedup_key=f"state.db:{ended}:{sid}",
+        record = build_record(
+            event_type=ended,
+            occurred_at=r["ended_at"],
+            source="state.db:sessions",
+            capture_method="poll:state.db:sessions",
+            runtime=runtime_stamp(kind, home_mode=home_mode),
+            correlation_id=corr,
+            session_id=sid,
+            parent_session_id=r["parent_session_id"],
+            profile=profile,
+            partial=partial,
+            payload={
+                "kind": kind,
+                "end_reason": r["end_reason"],
+                "message_count": r["message_count"],
+                "tool_call_count": r["tool_call_count"],
+                "input_tokens": r["input_tokens"],
+                "output_tokens": r["output_tokens"],
+                "estimated_cost_usd": r["estimated_cost_usd"],
+            },
         )
-        if outbox.last_append_created:
-            counts[ended] += 1
+        if outbox.append_if_new(record, dedup_key=f"state.db:{ended}:{sid}"):
+            counts[record["payload"]["event_type"]] += 1
 
 
 def _poll_messages(outbox, conn, parent_map, profile_of, counts, home_mode) -> None:
@@ -151,29 +144,29 @@ def _poll_messages(outbox, conn, parent_map, profile_of, counts, home_mode) -> N
     for r in rows:
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
-        outbox.append(
-            build_record(
-                event_type="tool.call_completed",
-                occurred_at=r["timestamp"] or 0.0,
-                source="state.db:messages",
-                capture_method="poll:state.db:messages",
-                runtime=runtime_stamp("tool", home_mode=home_mode),
-                correlation_id=corr,
-                session_id=sid,
-                profile=profile_of.get(sid, "default"),
-                payload={
-                    "tool_name": r["tool_name"],
-                    "tool_call_id": r["tool_call_id"],
-                    "effect_disposition": r["effect_disposition"],
-                    "status": _derive_tool_status(r["content"]),
-                    "message_row_id": r["id"],
-                },
-            ),
+        record = build_record(
+            event_type="tool.call_completed",
+            occurred_at=r["timestamp"] or 0.0,
+            source="state.db:messages",
+            capture_method="poll:state.db:messages",
+            runtime=runtime_stamp("tool", home_mode=home_mode),
+            correlation_id=corr,
+            session_id=sid,
+            profile=profile_of.get(sid, "default"),
+            payload={
+                "tool_name": r["tool_name"],
+                "tool_call_id": r["tool_call_id"],
+                "effect_disposition": r["effect_disposition"],
+                "status": _derive_tool_status(r["content"]),
+                "message_row_id": r["id"],
+            },
+        )
+        if outbox.append_if_new(
+            record,
             content=r["content"],
             dedup_key=f"state.db:tool:{r['id']}",
-        )
-        if outbox.last_append_created:
-            counts["tool.call_completed"] += 1
+        ):
+            counts[record["payload"]["event_type"]] += 1
 
     max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
     outbox.set_cursor("state.db:messages", max_id)
@@ -188,35 +181,34 @@ def _poll_model_usage(outbox, conn, parent_map, profile_of, counts, home_mode) -
     for r in rows:
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
-        outbox.append(
-            build_record(
-                event_type="model.usage_recorded",
-                occurred_at=r["last_seen"] or 0.0,
-                source="state.db:session_model_usage",
-                capture_method="poll:state.db:session_model_usage",
-                runtime=runtime_stamp("model", home_mode=home_mode),
-                correlation_id=corr,
-                session_id=sid,
-                profile=profile_of.get(sid, "default"),
-                payload={
-                    k: r[k]
-                    for k in (
-                        "model",
-                        "task",
-                        "api_call_count",
-                        "input_tokens",
-                        "output_tokens",
-                        "cache_read_tokens",
-                        "reasoning_tokens",
-                        "estimated_cost_usd",
-                        "cost_status",
-                    )
-                },
-            ),
-            dedup_key=f"state.db:usage:{sid}:{r['model']}:{r['task']}",
+        record = build_record(
+            event_type="model.usage_recorded",
+            occurred_at=r["last_seen"] or 0.0,
+            source="state.db:session_model_usage",
+            capture_method="poll:state.db:session_model_usage",
+            runtime=runtime_stamp("model", home_mode=home_mode),
+            correlation_id=corr,
+            session_id=sid,
+            profile=profile_of.get(sid, "default"),
+            payload={
+                k: r[k]
+                for k in (
+                    "model",
+                    "task",
+                    "api_call_count",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "reasoning_tokens",
+                    "estimated_cost_usd",
+                    "cost_status",
+                )
+            },
         )
-        if outbox.last_append_created:
-            counts["model.usage_recorded"] += 1
+        if outbox.append_if_new(
+            record, dedup_key=f"state.db:usage:{sid}:{r['model']}:{r['task']}"
+        ):
+            counts[record["payload"]["event_type"]] += 1
 
 
 def _poll_delegations(outbox, conn, parent_map, profile_of, counts, home_mode) -> None:
@@ -228,30 +220,30 @@ def _poll_delegations(outbox, conn, parent_map, profile_of, counts, home_mode) -
         parent = r["parent_session_id"] or r["origin_session"]
         corr = root_session(parent, parent_map) or parent
         event = _safe_json(r["event_json"])  # is_batch lives here, not as a column
-        outbox.append(
-            build_record(
-                event_type="delegation.dispatched",
-                occurred_at=r["dispatched_at"] or 0.0,
-                source="state.db:async_delegations",
-                capture_method="poll:state.db:async_delegations",
-                runtime=runtime_stamp("subagent", home_mode=home_mode),
-                correlation_id=corr,
-                session_id=parent,
-                parent_session_id=r["parent_session_id"],
-                profile=profile_of.get(parent, "default"),
-                payload={
-                    "delegation_id": r["delegation_id"],
-                    "state": r["state"],
-                    "delivery_state": r["delivery_state"],
-                    "is_batch": bool(event.get("is_batch")),
-                    "owner_pid": r["owner_pid"],
-                },
-            ),
+        record = build_record(
+            event_type="delegation.dispatched",
+            occurred_at=r["dispatched_at"] or 0.0,
+            source="state.db:async_delegations",
+            capture_method="poll:state.db:async_delegations",
+            runtime=runtime_stamp("subagent", home_mode=home_mode),
+            correlation_id=corr,
+            session_id=parent,
+            parent_session_id=r["parent_session_id"],
+            profile=profile_of.get(parent, "default"),
+            payload={
+                "delegation_id": r["delegation_id"],
+                "state": r["state"],
+                "delivery_state": r["delivery_state"],
+                "is_batch": bool(event.get("is_batch")),
+                "owner_pid": r["owner_pid"],
+            },
+        )
+        if outbox.append_if_new(
+            record,
             content=_delegation_content(event, r["result_json"]),
             dedup_key=f"state.db:deleg:{r['delegation_id']}",
-        )
-        if outbox.last_append_created:
-            counts["delegation.dispatched"] += 1
+        ):
+            counts[record["payload"]["event_type"]] += 1
 
 
 def _derive_tool_status(content: str | None) -> str:

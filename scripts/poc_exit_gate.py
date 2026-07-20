@@ -159,7 +159,6 @@ def run_pipeline(ob: Outbox, hermes_home: Path) -> None:
 
 
 def report_code(ob: Outbox) -> tuple[list[str], int]:
-    _, code = None, 0
     lines, code = observe.render_report(observe.load(ob))
     return lines, code
 

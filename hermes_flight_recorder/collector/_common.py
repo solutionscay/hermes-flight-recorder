@@ -76,6 +76,17 @@ def open_sqlite_read_only(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def read_float(path: Path) -> float | None:
+    """Read a float from a small text file, or return None when absent/invalid."""
+    if not path.exists():
+        return None
+    text = path.read_text().strip()
+    try:
+        return float(text) if text else None
+    except ValueError:
+        return None
+
+
 # terminal.home_mode aliases Hermes normalizes to its canonical values.
 # See hermes_constants.get_subprocess_home in the Hermes source.
 _HOME_MODE_ALIASES = {

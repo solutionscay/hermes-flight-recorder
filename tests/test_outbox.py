@@ -118,6 +118,17 @@ def test_dedup_key_appends_once(tmp_path):
     ob.close()
 
 
+def test_append_if_new_reports_insert_and_dedup_hit(tmp_path):
+    ob = open_outbox(tmp_path)
+
+    assert ob.append_if_new(base_record(), dedup_key="msg:outcome") is True
+    assert ob.append_if_new(base_record(), dedup_key="msg:outcome") is False
+
+    assert ob.count() == 1
+    assert ob.high_water() == 1
+    ob.close()
+
+
 # --- ordering -----------------------------------------------------------
 def test_iter_events_in_sequence_order(tmp_path):
     ob = open_outbox(tmp_path)
@@ -177,4 +188,39 @@ def test_concurrent_appends_no_gap_no_reuse(tmp_path):
     seqs = sorted(r["producer_sequence"] for r in ob.iter_events())
     total = threads_n * per_thread
     assert seqs == list(range(1, total + 1))  # exactly 1..N, no gap, no dup
+    ob.close()
+
+
+def test_concurrent_append_if_new_has_one_winner(tmp_path):
+    open_outbox(tmp_path).close()
+    threads_n = 4
+    outcomes: list[bool] = []
+    errors: list[Exception] = []
+    start = threading.Barrier(threads_n)
+
+    def worker():
+        try:
+            ob = Outbox.open(tmp_path)
+            try:
+                start.wait()
+                outcomes.append(
+                    ob.append_if_new(base_record(), dedup_key="msg:concurrent")
+                )
+            finally:
+                ob.close()
+        except Exception as exc:  # pragma: no cover - surfaced via assert
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(threads_n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, errors
+    assert outcomes.count(True) == 1
+    assert outcomes.count(False) == threads_n - 1
+    ob = Outbox.open(tmp_path)
+    assert ob.count() == 1
+    assert ob.high_water() == 1
     ob.close()
