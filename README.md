@@ -1,5 +1,8 @@
 # Hermes Flight Recorder
 
+![Status: Work in Progress](https://img.shields.io/badge/status-work_in_progress-orange)
+![Not Production Ready](https://img.shields.io/badge/stability-not_production_ready-red)
+
 **The local-first execution recorder and control-plane project for [Hermes](https://hermes-agent.nousresearch.com) agents.**
 
 Your agents stay fast and local. Bridge records what happened, preserves a durable sequence, and tells you when the record is incomplete. The cloud is never part of the agent's critical path.
