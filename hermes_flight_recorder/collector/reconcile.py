@@ -36,20 +36,30 @@ never writes to any Hermes store.
 from __future__ import annotations
 
 import datetime
-import json
 import re
+import time
+from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
+from ..envelope import SESSION_LIFECYCLE, SESSION_START_TYPES
 from ._common import (
+    append_and_count,
     build_record,
+    executions_db_path,
+    gateway_starts_log_path,
+    gateway_state_path,
+    jobs_path,
+    load_json_dict,
     open_sqlite_read_only,
     read_float,
     resolve_hermes_home,
     root_session,
     runtime_stamp,
+    state_db_path,
+    ticker_heartbeat_path,
     to_epoch,
 )
 from .cron_schedule import expected_instants
@@ -89,24 +99,26 @@ def reconcile(
 ) -> dict[str, int]:
     """One reconcile pass. Returns per-event-type counts of new findings."""
     cfg = config or ReconcileConfig()
-    when = float(now) if now is not None else _wall_clock()
+    when = float(now) if now is not None else time.time()
     home = resolve_hermes_home(hermes_home)
     installation_id = outbox.installation_id
 
     # Snapshot the captured stream once, before any emission, so findings
     # appended this pass never perturb detection within the same pass.
     events = list(outbox.iter_events(installation_id))
+    # Snapshot the cron executions once too; three detectors read them.
+    exec_rows = _load_execution_rows(home)
     counts: dict[str, int] = defaultdict(int)
 
     _detect_sequence_gaps(outbox, events, installation_id, counts, when)
     session_rows, parent_map = _detect_coverage_gaps(
-        outbox, events, home, counts, when
+        outbox, events, home, exec_rows, counts, when
     )
     _detect_missing_terminals(
-        outbox, events, home, counts, when, cfg, session_rows, parent_map
+        outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map
     )
-    _detect_missed_cron(outbox, home, counts, when, cfg)
-    _detect_gateway_start_failed(outbox, home, counts, when, cfg)
+    _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg)
+    _detect_gateway_start_failed(outbox, home, counts, when)
     return dict(counts)
 
 
@@ -133,19 +145,19 @@ def _detect_sequence_gaps(outbox, events, installation_id, counts, when) -> None
 
 
 # --- coverage gaps ------------------------------------------------------
-def _detect_coverage_gaps(outbox, events, home, counts, when):
+def _detect_coverage_gaps(outbox, events, home, exec_rows, counts, when):
     """A durable row with no captured event proves a dropped capture."""
     captured = _captured_subjects(events)
     session_rows = []
     parent_map = {}
 
-    state_path = home / "state.db"
+    state_path = state_db_path(home)
     if state_path.exists():
         conn = open_sqlite_read_only(state_path)
         try:
             session_rows = conn.execute(
                 "SELECT id, source, parent_session_id, started_at, ended_at, "
-                "expiry_finalized, profile_name FROM sessions"
+                "profile_name FROM sessions"
             ).fetchall()
             parent_map = {r["id"]: r["parent_session_id"] for r in session_rows}
             _coverage_sessions(
@@ -156,21 +168,14 @@ def _detect_coverage_gaps(outbox, events, home, counts, when):
         finally:
             conn.close()
 
-    exec_path = home / "cron" / "executions.db"
-    if exec_path.exists():
-        conn = open_sqlite_read_only(exec_path)
-        try:
-            rows = conn.execute("SELECT id, job_id FROM executions").fetchall()
-        finally:
-            conn.close()
-        for r in rows:
-            if r["id"] in captured["executions"]:
-                continue
-            _emit_coverage(
-                outbox, counts, when,
-                subject_type="execution", subject_id=r["id"],
-                source_table="cron:executions.db", correlation_id=r["job_id"],
-            )
+    for r in exec_rows:
+        if r["id"] in captured["executions"]:
+            continue
+        _emit_coverage(
+            outbox, counts, when,
+            subject_type="execution", subject_id=r["id"],
+            source_table="cron:executions.db", correlation_id=r["job_id"],
+        )
     return session_rows, parent_map
 
 
@@ -230,7 +235,7 @@ def _captured_subjects(events) -> dict[str, set]:
     for e in events:
         pl = e.get("payload", {})
         et = pl.get("event_type")
-        if et in ("session.created", "subagent.child_spawned"):
+        if et in SESSION_START_TYPES:
             if e.get("session_id") is not None:
                 sessions.add(e["session_id"])
         elif et == "tool.call_completed":
@@ -275,10 +280,10 @@ def _emit_coverage(
 
 # --- missing terminals --------------------------------------------------
 def _detect_missing_terminals(
-    outbox, events, home, counts, when, cfg, session_rows, parent_map
+    outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map
 ) -> None:
     _terminals_sessions(outbox, session_rows, parent_map, counts, when, cfg)
-    _terminals_cron_runs(outbox, home, counts, when, cfg)
+    _terminals_cron_runs(outbox, exec_rows, counts, when, cfg)
     _terminals_invocations(outbox, events, counts, when, cfg)
 
 
@@ -300,7 +305,7 @@ def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
         if age <= timeout:
             continue  # still within its lifetime — provisional, not missing
         subject_type = "subagent" if is_sub else "session"
-        expected = "subagent.completed" if is_sub else "session.ended"
+        start_type, expected = SESSION_LIFECYCLE[subject_type]
         sid = r["id"]
         corr = root_session(sid, parent_map) or sid
         _emit_terminal_missing(
@@ -310,7 +315,7 @@ def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
             correlation_id=corr,
             subject_type=subject_type,
             subject_id=sid,
-            start_event_type="subagent.child_spawned" if is_sub else "session.created",
+            start_event_type=start_type,
             expected_terminal_event_type=expected,
             session_id=sid,
             parent_session_id=r["parent_session_id"],
@@ -323,22 +328,12 @@ def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
         )
 
 
-def _terminals_cron_runs(outbox, home, counts, when, cfg) -> None:
+def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg) -> None:
     """A durable execution with finished_at NULL past its window."""
-    exec_path = home / "cron" / "executions.db"
-    if not exec_path.exists():
-        return
-    conn = open_sqlite_read_only(exec_path)
-    try:
-        rows = conn.execute(
-            "SELECT id, job_id, status, claimed_at, finished_at FROM executions"
-        ).fetchall()
-    finally:
-        conn.close()
-    for r in rows:
+    for r in exec_rows:
         if r["finished_at"] is not None:
             continue
-        claimed = to_epoch(r["claimed_at"])
+        claimed = r["claimed_epoch"]
         if claimed is None:
             continue
         age = when - claimed
@@ -451,20 +446,19 @@ def _emit_terminal_missing(
 
 
 # --- missed cron --------------------------------------------------------
-def _detect_missed_cron(outbox, home, counts, when, cfg) -> None:
-    cron_dir = home / "cron"
-    jobs_path = cron_dir / "jobs.json"
-    if not jobs_path.exists():
-        return
-    jobs = _load_jobs(jobs_path)
+def _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg) -> None:
+    jobs = _load_jobs(jobs_path(home))
     if not jobs:
         return
 
     # A stale heartbeat means the whole scheduler is dead: one installation
     # signal, and suppress the per-job trailing catch-up it would explain.
-    ticker_dead = _ticker_is_stale(outbox, cron_dir, counts, when, cfg)
+    ticker_dead = _ticker_is_stale(outbox, home, counts, when, cfg)
 
-    exec_by_job = _execution_epochs_by_job(cron_dir)
+    exec_by_job: dict[str, list[float]] = defaultdict(list)
+    for r in exec_rows:
+        if r["claimed_epoch"] is not None:
+            exec_by_job[r["job_id"]].append(r["claimed_epoch"])
     for job in jobs:
         _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead)
 
@@ -593,7 +587,7 @@ def _cron_missed(expr, execs, created, now, cfg, tz=None):
 
 
 # --- gateway start failure ----------------------------------------------
-def _detect_gateway_start_failed(outbox, home, counts, when, cfg) -> None:
+def _detect_gateway_start_failed(outbox, home, counts, when) -> None:
     """A gateway that failed to start, hit a token conflict, or vanished.
 
     Hermes fires the ``gateway:startup`` hook only on success, so a failed
@@ -618,9 +612,9 @@ def _detect_gateway_start_failed(outbox, home, counts, when, cfg) -> None:
     over the same state appends nothing. The raw ``exit_reason`` /
     ``error_message`` is sensitive and goes only into encrypted content.
     """
-    state_path = home / "gateway_state.json"
+    state_path = gateway_state_path(home)
     if state_path.exists():
-        data = _load_json(state_path)
+        data = load_json_dict(state_path)
         state = data.get("gateway_state")
         updated_at = to_epoch(data.get("updated_at")) or 0.0
 
@@ -670,7 +664,7 @@ def _detect_gateway_start_failed(outbox, home, counts, when, cfg) -> None:
         return
 
     # Case C: started before (history) but the status file is gone.
-    last_start = _last_start_epoch(home / "gateway-starts.log")
+    last_start = _last_start_epoch(gateway_starts_log_path(home))
     if last_start is not None:
         _emit(
             outbox, counts,
@@ -719,17 +713,9 @@ def _last_start_epoch(path: Path) -> float | None:
     return last
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    try:
-        obj = json.loads(path.read_text())
-    except (ValueError, OSError):
-        return {}
-    return obj if isinstance(obj, dict) else {}
-
-
 # --- ticker liveness ----------------------------------------------------
-def _ticker_is_stale(outbox, cron_dir, counts, when, cfg) -> bool:
-    hb = read_float(cron_dir / "ticker_heartbeat")
+def _ticker_is_stale(outbox, home, counts, when, cfg) -> bool:
+    hb = read_float(ticker_heartbeat_path(home))
     if hb is None:
         return False
     staleness = when - hb
@@ -766,30 +752,42 @@ def _job_is_active(job: dict[str, Any]) -> bool:
     return True
 
 
-def _execution_epochs_by_job(cron_dir: Path) -> dict[str, list[float]]:
-    exec_path = cron_dir / "executions.db"
+def _load_execution_rows(home: Path) -> list[dict[str, Any]]:
+    """One snapshot of executions.db, with ``claimed_at`` pre-converted.
+
+    Coverage, missing-terminal, and missed-cron detection all consume this,
+    so the store is opened and scanned once per reconcile pass.
+    """
+    exec_path = executions_db_path(home)
     if not exec_path.exists():
-        return {}
+        return []
     conn = open_sqlite_read_only(exec_path)
     try:
-        rows = conn.execute("SELECT job_id, claimed_at FROM executions").fetchall()
+        rows = conn.execute(
+            "SELECT id, job_id, status, claimed_at, finished_at FROM executions"
+        ).fetchall()
     finally:
         conn.close()
-    by_job: dict[str, list[float]] = defaultdict(list)
-    for r in rows:
-        epoch = to_epoch(r["claimed_at"])
-        if epoch is not None:
-            by_job[r["job_id"]].append(epoch)
-    return by_job
+    return [
+        {
+            "id": r["id"],
+            "job_id": r["job_id"],
+            "status": r["status"],
+            "claimed_epoch": to_epoch(r["claimed_at"]),
+            "finished_at": r["finished_at"],
+        }
+        for r in rows
+    ]
 
 
 def _load_jobs(path: Path) -> list[dict[str, Any]]:
-    jobs = _load_json(path).get("jobs")
+    jobs = load_json_dict(path).get("jobs")
     return [j for j in jobs if isinstance(j, dict)] if isinstance(jobs, list) else []
 
 
-def _near(value: float, sorted_epochs: Iterable[float], slack: float) -> bool:
-    return any(abs(e - value) <= slack for e in sorted_epochs)
+def _near(value: float, sorted_epochs: list[float], slack: float) -> bool:
+    i = bisect_left(sorted_epochs, value - slack)
+    return i < len(sorted_epochs) and sorted_epochs[i] <= value + slack
 
 
 def _tz_of(value: Any) -> datetime.tzinfo | None:
@@ -800,12 +798,6 @@ def _tz_of(value: Any) -> datetime.tzinfo | None:
         return datetime.datetime.fromisoformat(value).tzinfo
     except ValueError:
         return None
-
-
-def _wall_clock() -> float:
-    import time
-
-    return time.time()
 
 
 # --- emit ---------------------------------------------------------------
@@ -839,5 +831,4 @@ def _emit(
         profile=profile,
         partial=partial,
     )
-    if outbox.append_if_new(rec, content=content, dedup_key=dedup_key):
-        counts[rec["payload"]["event_type"]] += 1
+    append_and_count(outbox, counts, rec, content=content, dedup_key=dedup_key)

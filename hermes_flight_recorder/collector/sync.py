@@ -135,6 +135,8 @@ def build_batches(
         raise ValueError("max_bytes must be at least 1")
 
     current: list[dict[str, Any]] = []
+    current_bytes = 0  # len(serialize_batch(_batch(current))), tracked incrementally
+    envelope_bytes = len(serialize_batch(_batch([])))
     installation_id: str | None = None
     previous_sequence: int | None = None
 
@@ -151,21 +153,24 @@ def build_batches(
             raise SyncError("records must be ordered by producer_sequence")
         previous_sequence = sequence
 
-        single = _batch([record])
-        if len(serialize_batch(single)) > max_bytes:
+        # Serialize each record once. Batch size is the fixed envelope plus
+        # each record plus one comma between records, so the limit check
+        # never re-serializes the accumulated batch.
+        single_bytes = len(serialize_batch(_batch([record])))
+        if single_bytes > max_bytes:
             raise SyncError(
                 f"record at producer_sequence {sequence} exceeds the "
                 f"{max_bytes}-byte batch limit"
             )
 
-        candidate = _batch([*current, record])
-        if current and (
-            len(current) >= max_records or len(serialize_batch(candidate)) > max_bytes
-        ):
+        grown_bytes = current_bytes + (single_bytes - envelope_bytes) + 1
+        if current and (len(current) >= max_records or grown_bytes > max_bytes):
             yield _batch(current)
             current = [record]
+            current_bytes = single_bytes
         else:
             current.append(record)
+            current_bytes = single_bytes if len(current) == 1 else grown_bytes
 
     if current:
         yield _batch(current)
@@ -188,11 +193,9 @@ def sync(
     start_cursor = delivery_cursor(outbox)
     installation_id = outbox.installation_id
     producer_high_water = outbox.high_water(installation_id)
-    pending = (
-        record
-        for record in outbox.iter_events(installation_id)
-        if record["producer_sequence"] > start_cursor
-    )
+    # The cursor filter runs in SQL, so a steady-state pass never loads or
+    # parses the already-acked history.
+    pending = outbox.iter_events(installation_id, after_sequence=start_cursor)
 
     batches_sent = 0
     records_sent = 0

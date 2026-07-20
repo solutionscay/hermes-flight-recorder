@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import socket
 import sys
-import tempfile
 import threading
 from collections import deque
 from contextlib import contextmanager
@@ -32,8 +31,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
 
+# The CI wrappers spec-load this file, so put the sibling _gate module on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import run_gate
+from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.outbox import Outbox
-from hermes_flight_recorder.collector.sync import DELIVERY_CURSOR_NAME, sync
+from hermes_flight_recorder.collector.sync import delivery_cursor, sync
 from hermes_flight_recorder.collector.transport import (
     HttpsTransport,
     RetryableTransportError,
@@ -176,21 +180,17 @@ def _new_outbox(home: Path, count: int = 5) -> Outbox:
     outbox.initialize()
     for index in range(1, count + 1):
         outbox.append(
-            {
-                "occurred_at": 1_800_000_000.0 + index,
-                "tenant_id": "local",
-                "profile": "sync-gate",
-                "runtime": {"kind": "test"},
-                "correlation_id": "sync-gate-run",
-                "source": "poc_sync_gate",
-                "capture_method": "synthetic:sync-gate",
-                "payload": {
-                    "event_type": "tool.call_completed",
-                    "status": "ok",
-                    "tool_call_id": f"gate-{index}",
-                },
-                "partial": False,
-            },
+            build_record(
+                event_type="tool.call_completed",
+                occurred_at=1_800_000_000.0 + index,
+                source="poc_sync_gate",
+                capture_method="synthetic:sync-gate",
+                runtime={"kind": "test"},
+                correlation_id="sync-gate-run",
+                payload={"status": "ok", "tool_call_id": f"gate-{index}"},
+                tenant_id="local",
+                profile="sync-gate",
+            ),
             content=f"{PRIVATE_CONTENT}-{index}",
         )
     return outbox
@@ -217,10 +217,6 @@ def _transport(
     )
 
 
-def _cursor(outbox: Outbox) -> int:
-    return int(outbox.get_cursor(DELIVERY_CURSOR_NAME) or 0)
-
-
 def _complete_stream_failures(
     name: str,
     outbox: Outbox,
@@ -237,9 +233,9 @@ def _complete_stream_failures(
         failures.append(
             f"{name}: server high-water {server.high_water} != client {high_water}"
         )
-    if _cursor(outbox) != high_water:
+    if delivery_cursor(outbox) != high_water:
         failures.append(
-            f"{name}: delivery cursor {_cursor(outbox)} != client {high_water}"
+            f"{name}: delivery cursor {delivery_cursor(outbox)} != client {high_water}"
         )
     if len(server.ledger) != high_water:
         failures.append(
@@ -259,7 +255,7 @@ def _complete_stream_failures(
     if VERBOSE:
         print(
             f"      requests={len(server.bodies)} rows={len(server.ledger)} "
-            f"server_high_water={server.high_water} cursor={_cursor(outbox)}"
+            f"server_high_water={server.high_water} cursor={delivery_cursor(outbox)}"
         )
     return failures
 
@@ -321,7 +317,7 @@ def scenario_offline_then_online(tmp: Path) -> list[str]:
             failures: list[str] = []
             if offline.ok or offline.reason != "offline":
                 failures.append("offline: failed pass did not report offline")
-            if _cursor(outbox) != 0 or server.ledger:
+            if delivery_cursor(outbox) != 0 or server.ledger:
                 failures.append("offline: failed pass stored data or moved the cursor")
 
             online = push(outbox, _transport(server, max_attempts=1))
@@ -344,9 +340,9 @@ def scenario_restart_mid_sync(tmp: Path) -> list[str]:
             except RetryableTransportError:
                 failures = []
 
-            if _cursor(outbox) != 2:
+            if delivery_cursor(outbox) != 2:
                 failures.append(
-                    f"restart: pre-restart cursor {_cursor(outbox)} != 2"
+                    f"restart: pre-restart cursor {delivery_cursor(outbox)} != 2"
                 )
             if server.sequences() != [1, 2, 3, 4]:
                 failures.append(
@@ -379,23 +375,12 @@ SCENARIOS = [
 
 
 def main() -> int:
-    print("Phase 1 network sync exit-gate (issue #35)")
-    print("=" * 48)
-    all_failures: list[str] = []
-    for name, scenario in SCENARIOS:
-        with tempfile.TemporaryDirectory() as directory:
-            failures = scenario(Path(directory))
-        status = "PASS" if not failures else "FAIL"
-        print(f"  [{status}] {name}")
-        for failure in failures:
-            print(f"         - {failure}")
-        all_failures += failures
-    print("=" * 48)
-    if all_failures:
-        print(f"GATE FAILED - {len(all_failures)} assertion(s) failed")
-        return 1
-    print("GATE PASSED - network delivery is complete, gap-free, and idempotent")
-    return 0
+    return run_gate(
+        ["Phase 1 network sync exit-gate (issue #35)"],
+        SCENARIOS,
+        passed="GATE PASSED - network delivery is complete, gap-free, and idempotent",
+        failed="GATE FAILED",
+    )
 
 
 if __name__ == "__main__":

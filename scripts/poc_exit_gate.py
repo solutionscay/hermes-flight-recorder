@@ -26,12 +26,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The CI wrappers spec-load this file, so put the sibling _gate module on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import run_gate
 from hermes_flight_recorder import observe
-from hermes_flight_recorder.collector import cron_db, state_db
+from hermes_flight_recorder.collector import run_pass
 from hermes_flight_recorder.collector.hook import SPOOL_FILENAME, drain as drain_hook
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
@@ -150,12 +153,13 @@ def seed_spool(bridge: Path) -> None:
 
 
 # --- pipeline helpers -----------------------------------------------------
-def run_pipeline(ob: Outbox, hermes_home: Path) -> None:
-    """What `hermes-flight-recorder run` does: drain the hook spool, then poll
-    the durable stores into the same outbox."""
-    drain_hook(ob)
-    state_db.poll(ob, hermes_home)
-    cron_db.poll(ob, hermes_home)
+def build_home(tmp: Path, *, missed: bool = False) -> tuple[Path, Path]:
+    """The synthetic (bridge, hermes) homes every scenario starts from."""
+    bridge, hermes = tmp / "b", tmp / "h"
+    build_state_db(hermes)
+    build_cron_store(hermes, missed=missed)
+    seed_spool(bridge)
+    return bridge, hermes
 
 
 def report_code(ob: Outbox) -> tuple[list[str], int]:
@@ -195,14 +199,11 @@ def drop_event(ob_path: Path, event_type: str) -> int:
 # --- scenarios ------------------------------------------------------------
 def scenario_happy(tmp: Path) -> list[str]:
     fails: list[str] = []
-    bridge, hermes = tmp / "b", tmp / "h"
-    build_state_db(hermes)
-    build_cron_store(hermes)
-    seed_spool(bridge)
+    bridge, hermes = build_home(tmp)
 
     ob = Outbox.open(bridge)
     ob.initialize()
-    run_pipeline(ob, hermes)
+    run_pass(ob, hermes)
     findings = reconcile(ob, hermes, now=NOW, config=CFG)
     show(ob, "happy")
     _, code = report_code(ob)
@@ -219,14 +220,11 @@ def scenario_happy(tmp: Path) -> list[str]:
 
 def scenario_dropped_capture(tmp: Path) -> list[str]:
     fails: list[str] = []
-    bridge, hermes = tmp / "b", tmp / "h"
-    build_state_db(hermes)
-    build_cron_store(hermes)
-    seed_spool(bridge)
+    bridge, hermes = build_home(tmp)
 
     ob = Outbox.open(bridge)
     ob.initialize()
-    run_pipeline(ob, hermes)
+    run_pass(ob, hermes)
     ob.close()
 
     # Lose one live event (the hook's invocation.completed): a middle sequence.
@@ -250,14 +248,11 @@ def scenario_dropped_capture(tmp: Path) -> list[str]:
 
 def scenario_missed_cron(tmp: Path) -> list[str]:
     fails: list[str] = []
-    bridge, hermes = tmp / "b", tmp / "h"
-    build_state_db(hermes)
-    build_cron_store(hermes, missed=True)
-    seed_spool(bridge)
+    bridge, hermes = build_home(tmp, missed=True)
 
     ob = Outbox.open(bridge)
     ob.initialize()
-    run_pipeline(ob, hermes)
+    run_pass(ob, hermes)
     findings = reconcile(ob, hermes, now=NOW, config=CFG)
     show(ob, "missed-cron")
     _, code = report_code(ob)
@@ -275,14 +270,11 @@ def scenario_missed_cron(tmp: Path) -> list[str]:
 
 def scenario_restart(tmp: Path) -> list[str]:
     fails: list[str] = []
-    bridge, hermes = tmp / "b", tmp / "h"
-    build_state_db(hermes)
-    build_cron_store(hermes)
-    seed_spool(bridge)
+    bridge, hermes = build_home(tmp)
 
     ob = Outbox.open(bridge)
     ob.initialize()
-    run_pipeline(ob, hermes)
+    run_pass(ob, hermes)
     hw, n, inst = ob.high_water(), ob.count(), ob.installation_id
     ob.close()  # simulate the Bridge process stopping
 
@@ -318,23 +310,12 @@ SCENARIOS = [
 
 
 def main() -> int:
-    print("Phase 0 POC exit-gate (issue #8)")
-    print("=" * 48)
-    all_fails: list[str] = []
-    for name, fn in SCENARIOS:
-        with tempfile.TemporaryDirectory() as d:
-            fails = fn(Path(d))
-        status = "PASS" if not fails else "FAIL"
-        print(f"  [{status}] {name}")
-        for f in fails:
-            print(f"         - {f}")
-        all_fails += fails
-    print("=" * 48)
-    if all_fails:
-        print(f"GATE FAILED — {len(all_fails)} assertion(s) failed")
-        return 1
-    print("GATE PASSED — capture is loss-detectable across restarts and cron misses")
-    return 0
+    return run_gate(
+        ["Phase 0 POC exit-gate (issue #8)"],
+        SCENARIOS,
+        passed="GATE PASSED — capture is loss-detectable across restarts and cron misses",
+        failed="GATE FAILED",
+    )
 
 
 if __name__ == "__main__":

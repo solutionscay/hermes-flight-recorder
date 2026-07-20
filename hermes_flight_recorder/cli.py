@@ -23,6 +23,21 @@ _SYNC_AUTH = 3  # the edge rejected the service token
 _SYNC_TERMINAL = 4  # the server rejected the batch as malformed (a client defect)
 
 
+def _check_initialized(outbox) -> bool:
+    """True when the outbox has an identity; else print the init hint."""
+    from .collector.outbox import OutboxError
+
+    try:
+        outbox.installation_id
+    except OutboxError:
+        print(
+            "outbox not initialized; run `hermes-flight-recorder init` first",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     # Imported lazily so `hermes-flight-recorder --version` needs no heavy deps.
     from .collector._common import resolve_hermes_home
@@ -48,33 +63,21 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    from .collector import cron_db, state_db
-    from .collector.hook import drain as drain_hook_spool
-    from .collector.outbox import Outbox, OutboxError
+    from .collector import run_pass
+    from .collector.outbox import Outbox
 
     outbox = Outbox.open(args.bridge_home)
     try:
-        try:
-            outbox.installation_id  # fails if not initialized
-        except OutboxError:
-            print("outbox not initialized; run `hermes-flight-recorder init` first", file=sys.stderr)
+        if not _check_initialized(outbox):
             return 2
 
-        totals: dict[str, int] = {}
-        # Drain the live hook spool first, then poll the durable stores.
-        try:
-            for event_type, n in drain_hook_spool(outbox).items():
-                totals[event_type] = totals.get(event_type, 0) + n
-        except Exception as exc:  # a bad spool must not sink the poll pass
-            print(f"  (hook drain: {exc})", file=sys.stderr)
-
-        for label, poll in (("state.db", state_db.poll), ("cron", cron_db.poll)):
-            try:
-                for event_type, n in poll(outbox, args.hermes_home).items():
-                    totals[event_type] = totals.get(event_type, 0) + n
-            except FileNotFoundError as exc:
-                print(f"  ({label}: {exc})", file=sys.stderr)
-
+        totals = run_pass(
+            outbox,
+            args.hermes_home,
+            on_source_error=lambda label, exc: print(
+                f"  ({label}: {exc})", file=sys.stderr
+            ),
+        )
         print(f"polled {sum(totals.values())} events into {outbox.path}:")
         for event_type in sorted(totals):
             print(f"  {event_type}: {totals[event_type]}")
@@ -84,15 +87,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_reconcile(args: argparse.Namespace) -> int:
-    from .collector.outbox import Outbox, OutboxError
+    from .collector.outbox import Outbox
     from .collector.reconcile import reconcile
 
     outbox = Outbox.open(args.bridge_home)
     try:
-        try:
-            outbox.installation_id  # fails if not initialized
-        except OutboxError:
-            print("outbox not initialized; run `hermes-flight-recorder init` first", file=sys.stderr)
+        if not _check_initialized(outbox):
             return 2
 
         counts = reconcile(outbox, args.hermes_home)
@@ -107,7 +107,7 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
 
 def _cmd_observe(args: argparse.Namespace) -> int:
     from . import observe
-    from .collector.outbox import Outbox, OutboxError
+    from .collector.outbox import Outbox
 
     since: float | None = None
     if args.since is not None:
@@ -119,10 +119,7 @@ def _cmd_observe(args: argparse.Namespace) -> int:
 
     outbox = Outbox.open(args.bridge_home)
     try:
-        try:
-            outbox.installation_id  # fails if not initialized
-        except OutboxError:
-            print("outbox not initialized; run `hermes-flight-recorder init` first", file=sys.stderr)
+        if not _check_initialized(outbox):
             return 2
 
         records = observe.load(outbox, session=args.session, since=since)
@@ -200,15 +197,12 @@ def _sync_once(outbox, transport) -> int:
 
 def _cmd_sync(args: argparse.Namespace) -> int:
     from .collector import sync_config
-    from .collector.outbox import Outbox, OutboxError
+    from .collector.outbox import Outbox
     from .collector.transport import HttpsTransport, RetryingTransport
 
     outbox = Outbox.open(args.bridge_home)
     try:
-        try:
-            outbox.installation_id  # fails if not initialized
-        except OutboxError:
-            print("outbox not initialized; run `hermes-flight-recorder init` first", file=sys.stderr)
+        if not _check_initialized(outbox):
             return _SYNC_CONFIG
 
         try:
@@ -239,6 +233,23 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         outbox.close()
 
 
+def _home_options(*, hermes: bool = False) -> argparse.ArgumentParser:
+    """A parent parser carrying the data-directory options every subcommand shares."""
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument(
+        "--bridge-home",
+        default=None,
+        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
+    )
+    if hermes:
+        parent.add_argument(
+            "--hermes-home",
+            default=None,
+            help="Hermes data root (default: $HERMES_HOME or ~/.hermes).",
+        )
+    return parent
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hermes-flight-recorder",
@@ -254,16 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init = sub.add_parser(
         "init",
         help="Create the local outbox, mint the installation id, and install the hook.",
-    )
-    p_init.add_argument(
-        "--bridge-home",
-        default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
-    )
-    p_init.add_argument(
-        "--hermes-home",
-        default=None,
-        help="Hermes data root to install the hook into (default: $HERMES_HOME or ~/.hermes).",
+        parents=[_home_options(hermes=True)],
     )
     p_init.add_argument(
         "--force",
@@ -273,44 +275,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.set_defaults(func=_cmd_init)
 
     p_run = sub.add_parser(
-        "run", help="Poll state.db and the cron store into the outbox (one pass)."
-    )
-    p_run.add_argument(
-        "--bridge-home",
-        default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
-    )
-    p_run.add_argument(
-        "--hermes-home",
-        default=None,
-        help="Hermes data root to read (default: $HERMES_HOME or ~/.hermes).",
+        "run",
+        help="Poll state.db and the cron store into the outbox (one pass).",
+        parents=[_home_options(hermes=True)],
     )
     p_run.set_defaults(func=_cmd_run)
 
     p_rec = sub.add_parser(
         "reconcile",
         help="Diff the durable stores against the outbox and emit reconcile findings.",
-    )
-    p_rec.add_argument(
-        "--bridge-home",
-        default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
-    )
-    p_rec.add_argument(
-        "--hermes-home",
-        default=None,
-        help="Hermes data root to read (default: $HERMES_HOME or ~/.hermes).",
+        parents=[_home_options(hermes=True)],
     )
     p_rec.set_defaults(func=_cmd_reconcile)
 
     p_obs = sub.add_parser(
         "observe",
         help="Render the captured outbox locally: stream, tree, report (no network).",
-    )
-    p_obs.add_argument(
-        "--bridge-home",
-        default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
+        parents=[_home_options()],
     )
     p_obs.add_argument("--stream", action="store_true", help="Event stream in producer_sequence order.")
     p_obs.add_argument("--tree", action="store_true", help="Execution tree with token/cost rollups.")
@@ -326,11 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync = sub.add_parser(
         "sync",
         help="Ship pending outbox events to the ingestion service (one pass by default).",
-    )
-    p_sync.add_argument(
-        "--bridge-home",
-        default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
+        parents=[_home_options()],
     )
     p_sync.add_argument(
         "--interval",

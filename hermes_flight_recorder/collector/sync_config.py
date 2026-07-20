@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .outbox import default_bridge_home
+from ._common import default_bridge_home
 
 CONFIG_FILENAME = "sync-config.json"
 

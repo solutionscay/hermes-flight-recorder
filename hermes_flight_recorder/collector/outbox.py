@@ -34,7 +34,9 @@ from typing import Any, Iterator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from ..envelope import SCHEMA_VERSION, parse, serialize, validate
-from ._common import resolve_hermes_home
+from ._common import default_bridge_home, resolve_hermes_home
+
+__all__ = ["OUTBOX_SCHEMA_VERSION", "Outbox", "OutboxError", "default_bridge_home"]
 
 OUTBOX_SCHEMA_VERSION = "1"
 _KEY_VERSION = "aesgcm256:dev"
@@ -61,12 +63,6 @@ CREATE TABLE IF NOT EXISTS events (
 """
 
 
-def default_bridge_home() -> Path:
-    """The Bridge-owned data directory (never under HERMES_HOME)."""
-    env = os.environ.get("BRIDGE_HOME")
-    return Path(env).expanduser() if env else Path.home() / ".hermes-flight-recorder"
-
-
 class OutboxError(RuntimeError):
     pass
 
@@ -83,6 +79,8 @@ class Outbox:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_DDL)
         self._content_key: bytes | None = None
+        self._aead: AESGCM | None = None
+        self._installation_id: str | None = None
 
     # --- construction ---------------------------------------------------
     @classmethod
@@ -91,7 +89,7 @@ class Outbox:
         home = home.resolve()
         path = home / "outbox.sqlite"
         hermes = resolve_hermes_home(None).resolve()
-        if path == hermes or _is_relative_to(path, hermes):
+        if path.is_relative_to(hermes):
             raise OutboxError(
                 f"refusing to place the outbox under HERMES_HOME ({hermes}); "
                 f"set BRIDGE_HOME to a directory outside the Hermes home"
@@ -119,12 +117,16 @@ class Outbox:
     # --- identity -------------------------------------------------------
     @property
     def installation_id(self) -> str:
-        row = self._conn.execute(
-            "SELECT value FROM meta WHERE key='installation_id'"
-        ).fetchone()
-        if row is None:
-            raise OutboxError("outbox is not initialized; call initialize() first")
-        return row[0]
+        # Write-once at initialize(), so cache after the first read: the
+        # append hot path asks for it once per record.
+        if self._installation_id is None:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='installation_id'"
+            ).fetchone()
+            if row is None:
+                raise OutboxError("outbox is not initialized; call initialize() first")
+            self._installation_id = row[0]
+        return self._installation_id
 
     # --- content key ----------------------------------------------------
     @property
@@ -143,11 +145,16 @@ class Outbox:
             self._content_key = key
         return self._content_key
 
+    def _cipher(self) -> AESGCM:
+        # One AESGCM instance (one key schedule) per outbox, not per record.
+        if self._aead is None:
+            self._aead = AESGCM(self._ensure_content_key())
+        return self._aead
+
     def _encrypt_content(self, content: str | bytes) -> dict[str, str]:
         raw = content.encode("utf-8") if isinstance(content, str) else content
-        key = self._ensure_content_key()
         nonce = os.urandom(12)
-        ciphertext = AESGCM(key).encrypt(nonce, raw, None)
+        ciphertext = self._cipher().encrypt(nonce, raw, None)
         return {
             "content_ciphertext": base64.b64encode(ciphertext).decode("ascii"),
             "content_nonce": base64.b64encode(nonce).decode("ascii"),
@@ -165,8 +172,7 @@ class Outbox:
         nonce = record.get("content_nonce")
         if ct is None or nonce is None:
             raise OutboxError("record has no encrypted content")
-        key = self._ensure_content_key()
-        return AESGCM(key).decrypt(
+        return self._cipher().decrypt(
             base64.b64decode(nonce), base64.b64decode(ct), None
         )
 
@@ -187,7 +193,9 @@ class Outbox:
         row is written and no sequence number is consumed; the stored
         record is returned.
         """
-        record, _ = self._append(record, content=content, dedup_key=dedup_key)
+        record, _ = self._append(
+            record, content=content, dedup_key=dedup_key, return_stored=True
+        )
         return record
 
     def append_if_new(
@@ -198,7 +206,9 @@ class Outbox:
         dedup_key: str | None = None,
     ) -> bool:
         """Append one record and report whether a new row was inserted."""
-        _, created = self._append(record, content=content, dedup_key=dedup_key)
+        _, created = self._append(
+            record, content=content, dedup_key=dedup_key, return_stored=False
+        )
         return created
 
     def _append(
@@ -207,6 +217,7 @@ class Outbox:
         *,
         content: str | bytes | None,
         dedup_key: str | None,
+        return_stored: bool,
     ) -> tuple[dict[str, Any], bool]:
         """Implement both append APIs and return the stored record and outcome."""
         rec = dict(record)
@@ -222,12 +233,16 @@ class Outbox:
         conn.execute("BEGIN IMMEDIATE")
         try:
             if dedup_key is not None:
+                # append() promises the stored record on a dedup hit;
+                # append_if_new() only needs the hit/miss, so skip fetching
+                # and parsing the stored envelope on that (steady-state) path.
+                column = "envelope_json" if return_stored else "1"
                 existing = conn.execute(
-                    "SELECT envelope_json FROM events WHERE dedup_key=?", (dedup_key,)
+                    f"SELECT {column} FROM events WHERE dedup_key=?", (dedup_key,)
                 ).fetchone()
                 if existing is not None:
                     conn.execute("COMMIT")
-                    return parse(existing[0]), False
+                    return (parse(existing[0]) if return_stored else rec), False
 
             row = conn.execute(
                 "SELECT high_water FROM seq WHERE installation_id=?", (inst,)
@@ -302,18 +317,30 @@ class Outbox:
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
-    def iter_events(self, installation_id: str | None = None) -> Iterator[dict[str, Any]]:
-        """Yield records in (installation_id, producer_sequence) order."""
+    def iter_events(
+        self,
+        installation_id: str | None = None,
+        *,
+        after_sequence: int = 0,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield records in (installation_id, producer_sequence) order.
+
+        ``after_sequence`` skips records at or below a cursor in SQL (a range
+        scan on the unique index), so a caller resuming from a cursor never
+        pays to load and parse the already-handled history.
+        """
         if installation_id is None:
             cur = self._conn.execute(
-                "SELECT envelope_json FROM events "
-                "ORDER BY installation_id, producer_sequence"
+                "SELECT envelope_json FROM events WHERE producer_sequence>? "
+                "ORDER BY installation_id, producer_sequence",
+                (after_sequence,),
             )
         else:
             cur = self._conn.execute(
-                "SELECT envelope_json FROM events WHERE installation_id=? "
+                "SELECT envelope_json FROM events "
+                "WHERE installation_id=? AND producer_sequence>? "
                 "ORDER BY producer_sequence",
-                (installation_id,),
+                (installation_id, after_sequence),
             )
         for (blob,) in cur:
             yield parse(blob)
@@ -326,11 +353,3 @@ class Outbox:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
-
-
-def _is_relative_to(path: Path, other: Path) -> bool:
-    try:
-        path.relative_to(other)
-        return True
-    except ValueError:
-        return False

@@ -13,10 +13,10 @@ Three views:
 - **tree** — the execution tree built from ``correlation_id`` and
   ``parent_session_id``: each root session, its tool-call leaves, and its
   subagent children nested underneath, with token and cost rollups.
-- **report** — the reconciler findings (``reconcile.gap_detected``,
-  ``reconcile.terminal_missing``, ``cron.run_missed``). Returns a non-zero
-  exit code when any finding exists, zero when clean, so a script can gate
-  on it.
+- **report** — the reconciler findings (every type in
+  :data:`hermes_flight_recorder.envelope.RECONCILE_FINDING_TYPES`). Returns a
+  non-zero exit code when any finding exists, zero when clean, so a script
+  can gate on it.
 
 The render functions take a plain list of envelope records, so they are
 testable without an outbox. ``load()`` is the thin adapter that pulls and
@@ -28,6 +28,12 @@ from __future__ import annotations
 import datetime
 from typing import Any, Iterable
 
+from .envelope import (
+    RECONCILE_FINDING_TYPES as FINDING_TYPES,
+    SESSION_START_TYPES,
+    SESSION_TERMINAL_TYPES,
+)
+
 __all__ = [
     "load",
     "render_stream",
@@ -36,12 +42,6 @@ __all__ = [
     "parse_since",
     "FINDING_TYPES",
 ]
-
-FINDING_TYPES = (
-    "reconcile.gap_detected",
-    "reconcile.terminal_missing",
-    "cron.run_missed",
-)
 
 
 # --- loading & filtering ------------------------------------------------
@@ -120,6 +120,7 @@ _SUMMARY_FIELDS: dict[str, tuple[str, ...]] = {
     "cron.ticker_heartbeat": ("heartbeat", "last_success"),
     "reconcile.gap_detected": ("gap_kind", "subject_type", "subject_id", "missing_sequence"),
     "reconcile.terminal_missing": ("subject_type", "subject_id", "expected_terminal_event_type"),
+    "runtime.gateway_start_failed": ("reason_class", "gateway_state", "platform"),
 }
 
 
@@ -209,23 +210,21 @@ class _Index:
     """Group records into sessions, tools, usage, and lineage edges."""
 
     def __init__(self, records: list[dict[str, Any]]):
-        self.records = records
         self.sessions: dict[str, dict[str, Any]] = {}
         self.children: dict[str, list[str]] = {}
         self.tools: dict[str, list[dict[str, Any]]] = {}
         self.usage: dict[str, list[dict[str, Any]]] = {}
         self.invocations: dict[str, list[dict[str, Any]]] = {}
         self._invocation_seen: dict[str, dict[str, Any]] = {}
-        self._parent: dict[str, str | None] = {}
-        self._build()
+        self._build(records)
 
-    def _build(self) -> None:
-        for r in self.records:
+    def _build(self, records: list[dict[str, Any]]) -> None:
+        for r in records:
             et = r.get("payload", {}).get("event_type")
             sid = r.get("session_id")
-            if et in ("session.created", "subagent.child_spawned"):
+            if et in SESSION_START_TYPES:
                 self._ensure_session(sid, r)
-            elif et in ("session.ended", "subagent.completed"):
+            elif et in SESSION_TERMINAL_TYPES:
                 node = self._ensure_session(sid, r)
                 node["status"] = r["payload"].get("end_reason") or "ended"
                 node["ended"] = r
@@ -245,12 +244,10 @@ class _Index:
             kind = r.get("payload", {}).get("kind") or "session"
             node = {"session_id": sid, "kind": kind, "status": "open", "parent": parent}
             self.sessions[sid] = node
-            self._parent[sid] = parent
             if parent is not None:
                 self.children.setdefault(parent, []).append(sid)
         elif parent is not None and node.get("parent") is None:
             node["parent"] = parent
-            self._parent[sid] = parent
             self.children.setdefault(parent, []).append(sid)
         return node
 
@@ -345,6 +342,9 @@ def _finding_detail(record: dict[str, Any]) -> str:
         return f"{p.get('subject_type')} {p.get('subject_id')} has no {p.get('expected_terminal_event_type')}{age_s}"
     if et == "cron.run_missed":
         return f"job {p.get('job_id')} missed {p.get('missed_count')} fire(s) from {_iso(p.get('expected_fire_at'))}"
+    if et == "runtime.gateway_start_failed":
+        target = p.get("platform") or "gateway"
+        return f"{target} failed to start: {p.get('reason_class')}"
     return str(p)
 
 

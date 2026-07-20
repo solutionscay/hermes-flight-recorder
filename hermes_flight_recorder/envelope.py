@@ -19,6 +19,10 @@ __all__ = [
     "P0_POC_EVENT_TYPES",
     "RESERVED_EVENT_TYPES",
     "ALL_EVENT_TYPES",
+    "SESSION_LIFECYCLE",
+    "SESSION_START_TYPES",
+    "SESSION_TERMINAL_TYPES",
+    "RECONCILE_FINDING_TYPES",
     "EnvelopeValidationError",
     "validate",
     "serialize",
@@ -80,6 +84,26 @@ RESERVED_EVENT_TYPES = frozenset(
 )
 
 ALL_EVENT_TYPES = P0_POC_EVENT_TYPES | RESERVED_EVENT_TYPES
+
+# The start/terminal event pair for each session kind. The state adapter
+# emits these, the reconciler pairs them, and observe groups by them — all
+# from this one mapping.
+SESSION_LIFECYCLE: dict[str, tuple[str, str]] = {
+    "session": ("session.created", "session.ended"),
+    "subagent": ("subagent.child_spawned", "subagent.completed"),
+}
+SESSION_START_TYPES = frozenset(start for start, _ in SESSION_LIFECYCLE.values())
+SESSION_TERMINAL_TYPES = frozenset(end for _, end in SESSION_LIFECYCLE.values())
+
+# Every event type the reconciler emits as a finding. ``observe --report``
+# lists exactly these and exits non-zero when any exist; a new detector adds
+# its type here, not in observe.
+RECONCILE_FINDING_TYPES = (
+    "reconcile.gap_detected",
+    "reconcile.terminal_missing",
+    "cron.run_missed",
+    "runtime.gateway_start_failed",
+)
 
 
 class EnvelopeValidationError(ValueError):

@@ -23,28 +23,32 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
+    append_and_count,
     build_record,
+    executions_db_path,
     open_sqlite_read_only,
     read_float,
     read_home_mode,
     resolve_hermes_home,
     runtime_stamp,
+    ticker_heartbeat_path,
+    ticker_last_success_path,
     to_epoch,
 )
 
 
 def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
     """One read-only poll pass over the cron store. Returns per-type counts."""
-    cron_dir = resolve_hermes_home(hermes_home) / "cron"
+    home = resolve_hermes_home(hermes_home)
     home_mode = read_home_mode(hermes_home)
     counts: dict[str, int] = defaultdict(int)
-    _poll_executions(outbox, cron_dir, counts, home_mode)
-    _poll_heartbeat(outbox, cron_dir, counts, home_mode)
+    _poll_executions(outbox, home, counts, home_mode)
+    _poll_heartbeat(outbox, home, counts, home_mode)
     return dict(counts)
 
 
-def _poll_executions(outbox, cron_dir: Path, counts, home_mode) -> None:
-    db_path = cron_dir / "executions.db"
+def _poll_executions(outbox, home: Path, counts, home_mode) -> None:
+    db_path = executions_db_path(home)
     if not db_path.exists():
         return
     conn = open_sqlite_read_only(db_path)
@@ -76,8 +80,7 @@ def _poll_executions(outbox, cron_dir: Path, counts, home_mode) -> None:
                 "status": r["status"],
             },
         )
-        if outbox.append_if_new(record, dedup_key=f"cron:claimed:{exid}"):
-            counts[record["payload"]["event_type"]] += 1
+        append_and_count(outbox, counts, record, dedup_key=f"cron:claimed:{exid}")
 
         if r["finished_at"] is None:
             continue
@@ -98,22 +101,20 @@ def _poll_executions(outbox, cron_dir: Path, counts, home_mode) -> None:
                 "finished_at": r["finished_at"],
             },
         )
-        if outbox.append_if_new(
+        append_and_count(
+            outbox,
+            counts,
             record,
             content=r["error"] if r["error"] else None,
             dedup_key=f"cron:finished:{exid}",
-        ):
-            counts[record["payload"]["event_type"]] += 1
+        )
 
 
-def _poll_heartbeat(outbox, cron_dir: Path, counts, home_mode) -> None:
-    hb_file = cron_dir / "ticker_heartbeat"
-    if not hb_file.exists():
-        return
-    hb = read_float(hb_file)
+def _poll_heartbeat(outbox, home: Path, counts, home_mode) -> None:
+    hb = read_float(ticker_heartbeat_path(home))
     if hb is None:
         return
-    last_success = read_float(cron_dir / "ticker_last_success")
+    last_success = read_float(ticker_last_success_path(home))
     record = build_record(
         event_type="cron.ticker_heartbeat",
         occurred_at=hb,
@@ -123,5 +124,4 @@ def _poll_heartbeat(outbox, cron_dir: Path, counts, home_mode) -> None:
         correlation_id="cron:ticker",
         payload={"heartbeat": hb, "last_success": last_success},
     )
-    if outbox.append_if_new(record, dedup_key=f"cron:heartbeat:{hb}"):
-        counts[record["payload"]["event_type"]] += 1
+    append_and_count(outbox, counts, record, dedup_key=f"cron:heartbeat:{hb}")

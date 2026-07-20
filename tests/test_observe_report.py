@@ -233,6 +233,8 @@ def test_exit_code_is_one_for_every_finding_type(tmp_path, event_type):
         "reconcile.terminal_missing": {"subject_type": "session", "subject_id": "S",
                                         "expected_terminal_event_type": "session.ended"},
         "cron.run_missed": {"job_id": "j1", "expected_fire_at": B, "missed_count": 1},
+        "runtime.gateway_start_failed": {"reason_class": "token_conflict",
+                                          "gateway_state": "degraded", "platform": "discord"},
     }
     add(ob, event_type, correlation_id="x", payload=payloads[event_type], partial=True)
 

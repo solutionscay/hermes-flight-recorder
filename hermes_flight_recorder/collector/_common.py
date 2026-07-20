@@ -8,6 +8,8 @@ and normalize Hermes timestamps.
 from __future__ import annotations
 
 import datetime
+import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -15,12 +17,48 @@ from typing import Any
 
 def resolve_hermes_home(hermes_home: str | Path | None) -> Path:
     """The Hermes data root: explicit arg, then $HERMES_HOME, then ~/.hermes."""
-    import os
-
     if hermes_home:
         return Path(hermes_home).expanduser()
     env = os.environ.get("HERMES_HOME")
     return Path(env).expanduser() if env else Path.home() / ".hermes"
+
+
+def default_bridge_home() -> Path:
+    """The Bridge-owned data directory (never under HERMES_HOME)."""
+    env = os.environ.get("BRIDGE_HOME")
+    return Path(env).expanduser() if env else Path.home() / ".hermes-flight-recorder"
+
+
+# --- Hermes durable-store layout ----------------------------------------
+# The on-disk layout of a Hermes home is external knowledge this package
+# does not control. Every path literal lives here, so a Hermes layout
+# change is a one-file edit.
+def state_db_path(home: Path) -> Path:
+    return home / "state.db"
+
+
+def executions_db_path(home: Path) -> Path:
+    return home / "cron" / "executions.db"
+
+
+def jobs_path(home: Path) -> Path:
+    return home / "cron" / "jobs.json"
+
+
+def ticker_heartbeat_path(home: Path) -> Path:
+    return home / "cron" / "ticker_heartbeat"
+
+
+def ticker_last_success_path(home: Path) -> Path:
+    return home / "cron" / "ticker_last_success"
+
+
+def gateway_state_path(home: Path) -> Path:
+    return home / "gateway_state.json"
+
+
+def gateway_starts_log_path(home: Path) -> Path:
+    return home / "gateway-starts.log"
 
 
 def to_epoch(value: Any) -> float | None:
@@ -67,6 +105,41 @@ def runtime_stamp(kind: str, home_mode: str | None = None) -> dict[str, Any]:
     if home_mode is not None:
         stamp["home_mode"] = home_mode
     return stamp
+
+
+def safe_json_dict(text: str | None) -> dict[str, Any]:
+    """Parse JSON text into a dict, or return {} on any trouble."""
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def load_json_dict(path: Path) -> dict[str, Any]:
+    """Read and parse a JSON file into a dict, or return {} on any trouble."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    return safe_json_dict(text)
+
+
+def append_and_count(
+    outbox: Any,
+    counts: dict[str, int],
+    record: dict[str, Any],
+    *,
+    content: str | bytes | None = None,
+    dedup_key: str,
+) -> None:
+    """Append via dedup and count the event type only when a new row landed.
+
+    ``counts`` must tolerate ``+= 1`` on a missing key (a ``defaultdict`` or
+    ``Counter``).
+    """
+    if outbox.append_if_new(record, content=content, dedup_key=dedup_key):
+        counts[record["payload"]["event_type"]] += 1
 
 
 def open_sqlite_read_only(path: Path) -> sqlite3.Connection:

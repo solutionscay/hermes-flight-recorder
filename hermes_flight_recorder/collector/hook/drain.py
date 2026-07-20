@@ -29,10 +29,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .._common import build_record, gateway_runtime_stamp, runtime_stamp
+from .._common import append_and_count, build_record, gateway_runtime_stamp, runtime_stamp
 from . import CURSOR_NAME, SPOOL_FILENAME
 
 
@@ -49,44 +50,43 @@ def drain(outbox: Any, bridge_home: str | Path | None = None) -> dict[str, int]:
         return {}
 
     cursor = int(outbox.get_cursor(CURSOR_NAME) or 0)
-    if spool.stat().st_size < cursor:
+    size = spool.stat().st_size
+    if size < cursor:
         cursor = 0  # spool was truncated or rotated; restart from the top
-
-    with open(spool, "rb") as fh:
-        fh.seek(cursor)
-        blob = fh.read()
-    if not blob:
+    elif size == cursor:
         return {}
 
-    # Everything before the final newline is a complete line. A non-empty
-    # trailing element is a partial write; drop it and re-read it next drain.
-    complete = blob.split(b"\n")[:-1]
-
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = defaultdict(int)
     session_ids: dict[str, str] = {}
     consumed = 0
-    for raw in complete:
-        line_offset = cursor + consumed
-        consumed += len(raw) + 1  # + the newline byte
-        text = raw.decode("utf-8", "replace").strip()
-        if not text:
-            continue
-        try:
-            obj = json.loads(text)
-        except ValueError:
-            continue  # skip an undecodable line rather than fail the drain
-        mapped = _map_event(obj, line_offset, session_ids, outbox)
-        if mapped is None:
-            continue
-        record, content = mapped
-        if outbox.append_if_new(
-            record, content=content, dedup_key=f"hook-spool:{line_offset}"
-        ):
-            event_type = record["payload"]["event_type"]
-            counts[event_type] = counts.get(event_type, 0) + 1
+    # Stream line by line, so a large backlog never sits in memory whole. A
+    # line without a trailing newline (only possible at EOF) is a partial
+    # write; leave it for the next drain.
+    with open(spool, "rb") as fh:
+        fh.seek(cursor)
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break
+            line_offset = cursor + consumed
+            consumed += len(raw)
+            text = raw.decode("utf-8", "replace").strip()
+            if not text:
+                continue
+            try:
+                obj = json.loads(text)
+            except ValueError:
+                continue  # skip an undecodable line rather than fail the drain
+            mapped = _map_event(obj, line_offset, session_ids, outbox)
+            if mapped is None:
+                continue
+            record, content = mapped
+            append_and_count(
+                outbox, counts, record, content=content,
+                dedup_key=f"hook-spool:{line_offset}",
+            )
 
     outbox.set_cursor(CURSOR_NAME, cursor + consumed)
-    return counts
+    return dict(counts)
 
 
 def _clean(payload: dict[str, Any]) -> dict[str, Any]:

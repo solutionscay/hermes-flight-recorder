@@ -26,13 +26,17 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from ..envelope import SESSION_LIFECYCLE
 from ._common import (
+    append_and_count,
     build_record,
     open_sqlite_read_only,
     read_home_mode,
     resolve_hermes_home,
     root_session,
     runtime_stamp,
+    safe_json_dict,
+    state_db_path,
 )
 
 _SESSION_COLS = (
@@ -44,7 +48,7 @@ _SESSION_COLS = (
 
 def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
     """One read-only poll pass over ``state.db``. Returns per-type counts."""
-    db_path = resolve_hermes_home(hermes_home) / "state.db"
+    db_path = state_db_path(resolve_hermes_home(hermes_home))
     if not db_path.exists():
         raise FileNotFoundError(f"state.db not found at {db_path}")
 
@@ -75,7 +79,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
         profile = r["profile_name"] or "default"
         corr = root_session(sid, parent_map) or sid
 
-        created = "subagent.child_spawned" if is_sub else "session.created"
+        created, ended = SESSION_LIFECYCLE["subagent" if is_sub else "session"]
         record = build_record(
             event_type=created,
             occurred_at=r["started_at"],
@@ -98,15 +102,13 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
                 "tool_call_count": r["tool_call_count"],
             },
         )
-        if outbox.append_if_new(record, dedup_key=f"state.db:{created}:{sid}"):
-            counts[record["payload"]["event_type"]] += 1
+        append_and_count(outbox, counts, record, dedup_key=f"state.db:{created}:{sid}")
 
         # A NULL ended_at is a live session, not a crash. Emit no terminal;
         # the reconciler decides terminal-missing after a lifetime window.
         if r["ended_at"] is None:
             continue
 
-        ended = "subagent.completed" if is_sub else "session.ended"
         # end_reason is not stable until expiry_finalized flips from 0.
         partial = r["expiry_finalized"] == 0
         record = build_record(
@@ -130,8 +132,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
                 "estimated_cost_usd": r["estimated_cost_usd"],
             },
         )
-        if outbox.append_if_new(record, dedup_key=f"state.db:{ended}:{sid}"):
-            counts[record["payload"]["event_type"]] += 1
+        append_and_count(outbox, counts, record, dedup_key=f"state.db:{ended}:{sid}")
 
 
 def _poll_messages(outbox, conn, parent_map, profile_of, counts, home_mode) -> None:
@@ -161,12 +162,13 @@ def _poll_messages(outbox, conn, parent_map, profile_of, counts, home_mode) -> N
                 "message_row_id": r["id"],
             },
         )
-        if outbox.append_if_new(
+        append_and_count(
+            outbox,
+            counts,
             record,
             content=r["content"],
             dedup_key=f"state.db:tool:{r['id']}",
-        ):
-            counts[record["payload"]["event_type"]] += 1
+        )
 
     max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
     outbox.set_cursor("state.db:messages", max_id)
@@ -205,10 +207,9 @@ def _poll_model_usage(outbox, conn, parent_map, profile_of, counts, home_mode) -
                 )
             },
         )
-        if outbox.append_if_new(
-            record, dedup_key=f"state.db:usage:{sid}:{r['model']}:{r['task']}"
-        ):
-            counts[record["payload"]["event_type"]] += 1
+        append_and_count(
+            outbox, counts, record, dedup_key=f"state.db:usage:{sid}:{r['model']}:{r['task']}"
+        )
 
 
 def _poll_delegations(outbox, conn, parent_map, profile_of, counts, home_mode) -> None:
@@ -219,7 +220,7 @@ def _poll_delegations(outbox, conn, parent_map, profile_of, counts, home_mode) -
     for r in rows:
         parent = r["parent_session_id"] or r["origin_session"]
         corr = root_session(parent, parent_map) or parent
-        event = _safe_json(r["event_json"])  # is_batch lives here, not as a column
+        event = safe_json_dict(r["event_json"])  # is_batch lives here, not as a column
         record = build_record(
             event_type="delegation.dispatched",
             occurred_at=r["dispatched_at"] or 0.0,
@@ -238,12 +239,13 @@ def _poll_delegations(outbox, conn, parent_map, profile_of, counts, home_mode) -
                 "owner_pid": r["owner_pid"],
             },
         )
-        if outbox.append_if_new(
+        append_and_count(
+            outbox,
+            counts,
             record,
             content=_delegation_content(event, r["result_json"]),
             dedup_key=f"state.db:deleg:{r['delegation_id']}",
-        ):
-            counts[record["payload"]["event_type"]] += 1
+        )
 
 
 def _derive_tool_status(content: str | None) -> str:
@@ -263,19 +265,11 @@ def _derive_tool_status(content: str | None) -> str:
     return str(obj.get("status") or "ok")
 
 
-def _safe_json(text: str | None) -> dict[str, Any]:
-    try:
-        obj = json.loads(text)
-        return obj if isinstance(obj, dict) else {}
-    except (ValueError, TypeError):
-        return {}
-
-
 def _delegation_content(event: dict[str, Any], result_json: str | None) -> str | None:
     parts: dict[str, Any] = {}
     if event.get("goal"):
         parts["goal"] = event["goal"]
-    results = _safe_json(result_json).get("results")
+    results = safe_json_dict(result_json).get("results")
     if isinstance(results, list):
         parts["summaries"] = [x.get("summary") for x in results if isinstance(x, dict)]
     return json.dumps(parts) if parts else None

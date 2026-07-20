@@ -26,15 +26,23 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
+from functools import partial
 from pathlib import Path
 
+# Runnable standalone and spec-loadable: put the sibling _gate module on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import run_gate
 from hermes_flight_recorder import observe
-from hermes_flight_recorder.collector import cron_db, state_db
+from hermes_flight_recorder.collector import run_pass, state_db
 from hermes_flight_recorder.collector._common import (
+    executions_db_path,
+    gateway_state_path,
+    load_json_dict,
     open_sqlite_read_only,
     read_home_mode,
     resolve_hermes_home,
+    state_db_path,
 )
 from hermes_flight_recorder.collector.hook import SPOOL_FILENAME, drain as drain_hook
 from hermes_flight_recorder.collector.outbox import Outbox
@@ -71,9 +79,8 @@ def _collect_events(
     """Run the poll pipeline once and return its outbox and events."""
     ob = _new_outbox(tmp)
     try:
-        if (home / "state.db").exists():
-            state_db.poll(ob, home)
-        cron_db.poll(ob, home)
+        # The real `run` pipeline; a missing durable store is fine here.
+        run_pass(ob, home, on_source_error=lambda label, exc: None)
         if include_reconcile:
             reconcile(ob, home)
         return ob, list(ob.iter_events())
@@ -86,7 +93,7 @@ def _collect_events(
 def check_read_only(home: Path, tmp: Path) -> list[str]:
     """The poll never mutates the Hermes home."""
     fails: list[str] = []
-    targets = [home / "state.db", home / "cron" / "executions.db", home / "config.yaml"]
+    targets = [state_db_path(home), executions_db_path(home), home / "config.yaml"]
     before = {p: p.read_bytes() for p in targets if p.exists()}
     ob, _ = _collect_events(home, tmp)
     ob.close()
@@ -119,10 +126,10 @@ def check_home_mode(home: Path, tmp: Path) -> list[str]:
 def check_surface(home: Path, tmp: Path) -> list[str]:
     """#14 — session events carry a surface matching sessions.source."""
     fails: list[str] = []
-    if not (home / "state.db").exists():
+    if not state_db_path(home).exists():
         _log("surface: no state.db, skipped")
         return fails
-    conn = open_sqlite_read_only(home / "state.db")
+    conn = open_sqlite_read_only(state_db_path(home))
     try:
         source_of = {
             r["id"]: (r["source"] or "unknown")
@@ -159,13 +166,7 @@ def check_surface(home: Path, tmp: Path) -> list[str]:
 def check_gateway_channels(home: Path, tmp: Path) -> list[str]:
     """#15 — a gateway:startup with the host's real platforms enriches the stamp."""
     fails: list[str] = []
-    state_file = home / "gateway_state.json"
-    platforms: list[str] = []
-    if state_file.exists():
-        try:
-            platforms = list((json.loads(state_file.read_text()).get("platforms") or {}).keys())
-        except (ValueError, OSError):
-            platforms = []
+    platforms = list((load_json_dict(gateway_state_path(home)).get("platforms") or {}).keys())
     if not platforms:
         platforms = ["discord"]  # a representative channel, if the host has none live
 
@@ -268,32 +269,20 @@ CHECKS = [
 
 def main() -> int:
     home = _hermes_home()
-    print("Live capture check — Phase 0 enrichments vs a real Hermes home")
-    print(f"Hermes home: {home}")
-    print("=" * 62)
     if not home.exists():
         print(f"FAIL — Hermes home not found at {home}")
         return 1
-
-    all_fails: list[str] = []
-    for name, fn in CHECKS:
-        with tempfile.TemporaryDirectory() as d:
-            try:
-                fails = fn(home, Path(d))
-            except Exception as exc:  # noqa: BLE001 — a crashing check is a failure
-                fails = [f"{name}: raised {type(exc).__name__}: {exc}"]
-        status = "PASS" if not fails else "FAIL"
-        print(f"  [{status}] {name}")
-        for f in fails:
-            print(f"         - {f}")
-        all_fails += fails
-
-    print("=" * 62)
-    if all_fails:
-        print(f"CHECK FAILED — {len(all_fails)} assertion(s) failed")
-        return 1
-    print("CHECK PASSED — all Phase 0 enrichments hold against the live Hermes home")
-    return 0
+    return run_gate(
+        [
+            "Live capture check — Phase 0 enrichments vs a real Hermes home",
+            f"Hermes home: {home}",
+        ],
+        [(name, partial(fn, home)) for name, fn in CHECKS],
+        passed="CHECK PASSED — all Phase 0 enrichments hold against the live Hermes home",
+        failed="CHECK FAILED",
+        width=62,
+        catch=True,
+    )
 
 
 if __name__ == "__main__":

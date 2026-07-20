@@ -98,15 +98,13 @@ class HttpsTransport:
         urlopen: UrlOpen | None = None,
     ) -> "HttpsTransport":
         """Build a transport from a loaded :class:`SyncConfig`."""
-        kwargs: dict[str, Any] = {
-            "ingest_url": config.ingest_url,
-            "headers": config.auth_headers(),
-            "timeout": timeout,
-            "require_https": require_https,
-        }
-        if urlopen is not None:
-            kwargs["_urlopen"] = urlopen
-        return cls(**kwargs)
+        return cls(
+            ingest_url=config.ingest_url,
+            headers=config.auth_headers(),
+            timeout=timeout,
+            require_https=require_https,
+            _urlopen=urlopen or urllib.request.urlopen,
+        )
 
     def send(self, batch: Batch) -> Ack:
         body = serialize_batch(batch)
