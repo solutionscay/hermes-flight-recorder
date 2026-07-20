@@ -31,7 +31,11 @@ from pathlib import Path
 
 from hermes_flight_recorder import observe
 from hermes_flight_recorder.collector import cron_db, state_db
-from hermes_flight_recorder.collector._common import read_home_mode, resolve_hermes_home
+from hermes_flight_recorder.collector._common import (
+    open_sqlite_read_only,
+    read_home_mode,
+    resolve_hermes_home,
+)
 from hermes_flight_recorder.collector.hook import SPOOL_FILENAME, drain as drain_hook
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import reconcile
@@ -58,17 +62,33 @@ def _log(msg: str) -> None:
         print(f"      {msg}")
 
 
+def _collect_events(
+    home: Path,
+    tmp: Path,
+    *,
+    include_reconcile: bool = True,
+) -> tuple[Outbox, list[dict]]:
+    """Run the poll pipeline once and return its outbox and events."""
+    ob = _new_outbox(tmp)
+    try:
+        if (home / "state.db").exists():
+            state_db.poll(ob, home)
+        cron_db.poll(ob, home)
+        if include_reconcile:
+            reconcile(ob, home)
+        return ob, list(ob.iter_events())
+    except Exception:
+        ob.close()
+        raise
+
+
 # --- checks ---------------------------------------------------------------
 def check_read_only(home: Path, tmp: Path) -> list[str]:
     """The poll never mutates the Hermes home."""
     fails: list[str] = []
     targets = [home / "state.db", home / "cron" / "executions.db", home / "config.yaml"]
     before = {p: p.read_bytes() for p in targets if p.exists()}
-    ob = _new_outbox(tmp)
-    if (home / "state.db").exists():
-        state_db.poll(ob, home)
-    cron_db.poll(ob, home)
-    reconcile(ob, home)
+    ob, _ = _collect_events(home, tmp)
     ob.close()
     for p, data in before.items():
         if p.read_bytes() != data:
@@ -81,11 +101,7 @@ def check_home_mode(home: Path, tmp: Path) -> list[str]:
     """#16 — every poll event carries the live home_mode."""
     fails: list[str] = []
     expected = read_home_mode(home)
-    ob = _new_outbox(tmp)
-    if (home / "state.db").exists():
-        state_db.poll(ob, home)
-    cron_db.poll(ob, home)
-    events = list(ob.iter_events())
+    ob, events = _collect_events(home, tmp, include_reconcile=False)
     ob.close()
     if not events:
         fails.append("home_mode: no events polled from the live home")
@@ -106,12 +122,14 @@ def check_surface(home: Path, tmp: Path) -> list[str]:
     if not (home / "state.db").exists():
         _log("surface: no state.db, skipped")
         return fails
-    import sqlite3
-
-    conn = sqlite3.connect(f"file:{home / 'state.db'}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    source_of = {r["id"]: (r["source"] or "unknown") for r in conn.execute("SELECT id, source FROM sessions")}
-    conn.close()
+    conn = open_sqlite_read_only(home / "state.db")
+    try:
+        source_of = {
+            r["id"]: (r["source"] or "unknown")
+            for r in conn.execute("SELECT id, source FROM sessions")
+        }
+    finally:
+        conn.close()
 
     ob = _new_outbox(tmp)
     state_db.poll(ob, home)
@@ -220,13 +238,9 @@ def check_gateway_start_failed(home: Path, tmp: Path) -> list[str]:
 def check_envelope_and_observe(home: Path, tmp: Path) -> list[str]:
     """Every emitted event validates; observe --report runs against the stream."""
     fails: list[str] = []
-    ob = _new_outbox(tmp)
-    if (home / "state.db").exists():
-        state_db.poll(ob, home)
-    cron_db.poll(ob, home)
-    reconcile(ob, home)
+    ob, events = _collect_events(home, tmp)
     n = 0
-    for e in ob.iter_events():
+    for e in events:
         try:
             validate(e)
         except Exception as exc:  # noqa: BLE001 — surface any invalid record
