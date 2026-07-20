@@ -192,10 +192,10 @@ def _map_event(
                 payload=_clean(
                     {
                         "platform": ctx.get("platform"),
-                        # The originating surface. The live hook's vocabulary
-                        # is the gateway Platform value (telegram/discord/...);
-                        # the state.db producer uses sessions.source (cli/...).
-                        # Related-but-different; deliberately not reconciled.
+                        # The originating ingress surface. Hooks observe the
+                        # gateway Platform value; state.db observes the
+                        # session source. Both are open-ended labels for the
+                        # same concept, so neither is enum-normalized.
                         # `or None` drops the '' the hook sends for a LOCAL
                         # session (_clean only strips None, not empty string).
                         "surface": ctx.get("platform") or None,

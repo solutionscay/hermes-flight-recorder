@@ -36,17 +36,26 @@ never writes to any Hermes store.
 from __future__ import annotations
 
 import datetime
+import json
 import math
-import sqlite3
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from ._common import build_record, resolve_hermes_home, root_session, runtime_stamp, to_epoch
+from ._common import (
+    build_record,
+    open_sqlite_read_only,
+    resolve_hermes_home,
+    root_session,
+    runtime_stamp,
+    to_epoch,
+)
 
 _SOURCE = "reconciler"
 _CAPTURE = "derive:reconciler"
+_PID_RE = re.compile(r"PID (\d+)")
 
 
 @dataclass(frozen=True)
@@ -133,7 +142,7 @@ def _detect_coverage_gaps(outbox, events, home, counts, when) -> None:
 
     state_path = home / "state.db"
     if state_path.exists():
-        conn = _open_ro(state_path)
+        conn = open_sqlite_read_only(state_path)
         try:
             parent_map = {
                 r["id"]: r["parent_session_id"]
@@ -147,7 +156,7 @@ def _detect_coverage_gaps(outbox, events, home, counts, when) -> None:
 
     exec_path = home / "cron" / "executions.db"
     if exec_path.exists():
-        conn = _open_ro(exec_path)
+        conn = open_sqlite_read_only(exec_path)
         try:
             rows = conn.execute("SELECT id, job_id FROM executions").fetchall()
         finally:
@@ -277,7 +286,7 @@ def _terminals_sessions(outbox, home, counts, when, cfg) -> None:
     state_path = home / "state.db"
     if not state_path.exists():
         return
-    conn = _open_ro(state_path)
+    conn = open_sqlite_read_only(state_path)
     try:
         rows = conn.execute(
             "SELECT id, source, parent_session_id, started_at, ended_at, "
@@ -328,7 +337,7 @@ def _terminals_cron_runs(outbox, home, counts, when, cfg) -> None:
     exec_path = home / "cron" / "executions.db"
     if not exec_path.exists():
         return
-    conn = _open_ro(exec_path)
+    conn = open_sqlite_read_only(exec_path)
     try:
         rows = conn.execute(
             "SELECT id, job_id, status, claimed_at, finished_at FROM executions"
@@ -729,9 +738,7 @@ def _classify_gateway_reason(text: str) -> str:
 
 
 def _parse_pid(text: str) -> int | None:
-    import re
-
-    match = re.search(r"PID (\d+)", text or "")
+    match = _PID_RE.search(text or "")
     return int(match.group(1)) if match else None
 
 
@@ -755,8 +762,6 @@ def _last_start_epoch(path: Path) -> float | None:
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    import json
-
     try:
         obj = json.loads(path.read_text())
     except (ValueError, OSError):
@@ -808,7 +813,7 @@ def _execution_epochs_by_job(cron_dir: Path) -> dict[str, list[float]]:
     exec_path = cron_dir / "executions.db"
     if not exec_path.exists():
         return {}
-    conn = _open_ro(exec_path)
+    conn = open_sqlite_read_only(exec_path)
     try:
         rows = conn.execute("SELECT job_id, claimed_at FROM executions").fetchall()
     finally:
@@ -822,13 +827,7 @@ def _execution_epochs_by_job(cron_dir: Path) -> dict[str, list[float]]:
 
 
 def _load_jobs(path: Path) -> list[dict[str, Any]]:
-    import json
-
-    try:
-        obj = json.loads(path.read_text())
-    except (ValueError, OSError):
-        return []
-    jobs = obj.get("jobs") if isinstance(obj, dict) else None
+    jobs = _load_json(path).get("jobs")
     return [j for j in jobs if isinstance(j, dict)] if isinstance(jobs, list) else []
 
 
@@ -854,12 +853,6 @@ def _tz_of(value: Any) -> datetime.tzinfo | None:
         return datetime.datetime.fromisoformat(value).tzinfo
     except ValueError:
         return None
-
-
-def _open_ro(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def _wall_clock() -> float:

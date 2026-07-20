@@ -8,6 +8,7 @@ and normalize Hermes timestamps.
 from __future__ import annotations
 
 import datetime
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +48,7 @@ def gateway_runtime_stamp(
     list is the transport surface. Shared by ``runtime.gateway_started`` and,
     when they are wired, ``gateway_stopped`` / ``gateway_start_failed``.
     """
-    stamp: dict[str, Any] = {"kind": "gateway", "engine": "standard"}
+    stamp = runtime_stamp("gateway")
     stamp["channels"] = list(channels) if channels else []
     if gateway_id is not None:
         stamp["gateway_id"] = gateway_id
@@ -66,6 +67,13 @@ def runtime_stamp(kind: str, home_mode: str | None = None) -> dict[str, Any]:
     if home_mode is not None:
         stamp["home_mode"] = home_mode
     return stamp
+
+
+def open_sqlite_read_only(path: Path) -> sqlite3.Connection:
+    """Open a SQLite database read-only and return rows keyed by column."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 # terminal.home_mode aliases Hermes normalizes to its canonical values.

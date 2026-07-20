@@ -97,6 +97,30 @@ def test_hook_session_start_carries_platform_surface(tmp_path: Path):
     assert created["payload"]["surface"] == "telegram"
 
 
+def test_surface_has_shared_ingress_meaning_across_producers(tmp_path: Path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    _sessions_db(
+        hh,
+        [("A", "telegram", None, "m", 1, 0, 0, 0, 0.0, 1000.0, None, None, None, 0)],
+    )
+    ob = new_outbox(tmp_path)
+    state_db.poll(ob, hh)
+    durable = next(
+        e for e in ob.iter_events() if e["payload"]["event_type"] == "session.created"
+    )
+
+    hook_dir = tmp_path / "hook"
+    hook_dir.mkdir()
+    write_spool(
+        hook_dir,
+        [("session:start", {"platform": "telegram", "session_id": "B"}, 100.0)],
+    )
+    live = by_type(drain_to_records(hook_dir))["session.created"]
+
+    assert durable["payload"]["surface"] == live["payload"]["surface"] == "telegram"
+
+
 def test_hook_local_session_drops_empty_surface(tmp_path: Path):
     # The hook sends platform='' for a LOCAL/None session; surface must be
     # absent (not stored as ''), because `or None` lets _clean() drop it.

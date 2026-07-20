@@ -54,8 +54,9 @@ metadata. The `state.db` producer records the verbatim `sessions.source`
 `telegram` / `discord`); the live hook records the gateway `platform` value
 and omits it for a local session. The value set is **open-ended** — plugin
 platforms extend it — so `surface` is a free-form string and is never
-enum-validated. The two producers use related-but-different vocabularies and
-are not reconciled.
+enum-validated. Both producers report the same semantic concept (the ingress
+surface) from the best signal available to them. Consumers must treat the
+values as open labels rather than assume a closed enum or a one-to-one mapping.
 
 **`runtime.gateway_start_failed`** is emitted by the reconciler (`source`
 `reconciler`, `capture_method` `derive:reconciler`, `partial` true) because
