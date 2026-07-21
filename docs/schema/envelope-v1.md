@@ -143,12 +143,14 @@ tokens Hermes writes.
 `HERMES_KANBAN_CLAIM_TTL_SECONDS`). A live worker renews it by heartbeat; a
 one-hour heartbeat backstop reclaims even a live-but-stuck worker. When a lease
 lapses without a terminal, Hermes resets the task to `ready` and closes the run
-`reclaimed` — but if the Bridge is offline across that window, the reset can go
-uncaptured. The reconciler therefore treats a captured `task.claimed` whose
-`claim_expires` has passed, with a stale `last_heartbeat_at` and no captured
-terminal, as a `reconcile.terminal_missing` with `subject_type='task_run'`,
-dedup-keyed on `run_id` + `claim_expires` — a durable event time, never the
-reconcile-run clock.
+`reclaimed`. The reconciler judges this from the authoritative durable
+`task_runs` row — a run still open (`outcome` NULL) whose `claim_expires` has
+lapsed past a grace, with a `last_heartbeat_at` stale beyond the claim window,
+is a worker that died mid-attempt (a live worker renews `claim_expires` by
+heartbeat, so a lapsed lease is the death signal). It emits a
+`reconcile.terminal_missing` with `subject_type='task_run'`, dedup-keyed on
+`board` + `run_id` — the strictly-increasing per-board attempt id, stable across
+lease renewals, never the reconcile-run clock.
 
 ## Event-type surface
 

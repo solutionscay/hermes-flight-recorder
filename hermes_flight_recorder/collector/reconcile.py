@@ -16,11 +16,12 @@ Four detectors, each grounded in the real probe (see issue #6):
   execution) with no matching captured event means the live stream dropped
   it. Emit ``reconcile.gap_detected`` with ``gap_kind='uncaptured_row'``.
 - **Missing-terminal.** A start-node past its lifetime with no terminal.
-  Sessions and cron runs are judged from the authoritative durable row
-  (``ended_at`` / ``finished_at`` still NULL); invocations are judged from
-  the outbox (``invocation.started`` with no ``invocation.completed``),
-  because the ``turn_id`` lives only in memory. Emit
-  ``reconcile.terminal_missing``.
+  Sessions, cron runs, and open Kanban task attempts are judged from the
+  authoritative durable row (``ended_at`` / ``finished_at`` / a lapsed
+  ``claim_expires`` on a run whose ``outcome`` is still NULL); invocations are
+  judged from the outbox (``invocation.started`` with no
+  ``invocation.completed``), because the ``turn_id`` lives only in memory.
+  Emit ``reconcile.terminal_missing``.
 - **Missed-cron.** Reconstruct the expected fire instants from the
   ``jobs.json`` schedule (interval, once, or cron expression) and diff them
   against ``executions.db`` ``claimed_at``. Emit ``cron.run_missed`` with
@@ -52,6 +53,7 @@ from ._common import (
     gateway_starts_log_path,
     gateway_state_path,
     jobs_path,
+    kanban_board_dbs,
     load_json_dict,
     open_sqlite_read_only,
     read_float,
@@ -80,6 +82,13 @@ class ReconcileConfig:
     subagent_terminal_timeout: float = 30 * 60.0
     invocation_terminal_timeout: float = 60 * 60.0
     cron_run_terminal_timeout: float = 15 * 60.0
+    # An open task claim whose lease lapsed by more than this grace, with a
+    # heartbeat older than the staleness window, is judged a dead attempt. The
+    # grace lets Hermes's own reclaim run first (its defer grace is ~120 s); the
+    # staleness window is the Hermes default claim TTL (a live worker renews the
+    # lease within it, so a stale heartbeat means the worker is gone).
+    task_lease_grace: float = 120.0
+    task_heartbeat_stale_after: float = 15 * 60.0
     # A heartbeat older than this means the whole scheduler is dead.
     ticker_stale_after: float = 300.0
     # How far an execution may sit from an expected fire and still count as
@@ -119,6 +128,7 @@ def reconcile(
     )
     _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg)
     _detect_gateway_start_failed(outbox, home, counts, when)
+    _detect_stale_task_leases(outbox, home, counts, when, cfg)
     return dict(counts)
 
 
@@ -443,6 +453,77 @@ def _emit_terminal_missing(
         payload=payload,
         dedup_key=dedup_key,
     )
+
+
+# --- stale task leases --------------------------------------------------
+def _detect_stale_task_leases(outbox, home, counts, when, cfg) -> None:
+    """An open Kanban claim whose lease lapsed with a dead heartbeat.
+
+    The Kanban analog of the stale-ticker signal. A ``task_runs`` row still open
+    (``outcome`` NULL) whose ``claim_expires`` passed — past a grace, with a
+    heartbeat stale beyond the window — is a worker that died mid-attempt: no
+    terminal is coming until Hermes reclaims it. The durable row is
+    authoritative and current (a live worker renews ``claim_expires`` by
+    heartbeat, so a lapsed lease *is* the death signal), exactly as a cron
+    execution is judged from its own ``finished_at``.
+    """
+    for run in _load_open_task_runs(home):
+        expires = run["claim_expires"]
+        if expires is None or when - expires <= cfg.task_lease_grace:
+            continue  # no lease, or still within its (possibly renewed) lease
+        hb = run["last_heartbeat_at"]
+        if hb is not None and when - hb <= cfg.task_heartbeat_stale_after:
+            continue  # a fresh heartbeat — the worker is alive, Hermes will renew
+        board, run_id = run["board"], run["id"]
+        _emit_terminal_missing(
+            outbox,
+            counts,
+            occurred_at=when,
+            correlation_id=run["task_id"],
+            subject_type="task_run",
+            subject_id=str(run_id),
+            start_event_type="task.claimed",
+            expected_terminal_event_type="task.attempt_ended",
+            details={
+                "board": board,
+                "task_id": run["task_id"],
+                "run_id": run_id,
+                "holder": run["claim_lock"],
+                "claim_expires": expires,
+                "last_heartbeat_at": hb,
+                "start_occurred_at": run["started_at"],
+                "age_seconds": when - expires,
+            },
+            dedup_key=f"reconcile:terminal:task_run:{board}:{run_id}",
+        )
+
+
+def _load_open_task_runs(home: Path) -> list[dict[str, Any]]:
+    """Every still-open attempt (``outcome`` NULL) across all boards."""
+    runs: list[dict[str, Any]] = []
+    for board, db_path in kanban_board_dbs(home):
+        conn = open_sqlite_read_only(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT id, task_id, claim_lock, claim_expires, worker_pid, "
+                "last_heartbeat_at, started_at FROM task_runs WHERE outcome IS NULL"
+            ).fetchall()
+        finally:
+            conn.close()
+        for r in rows:
+            runs.append(
+                {
+                    "board": board,
+                    "id": r["id"],
+                    "task_id": r["task_id"],
+                    "claim_lock": r["claim_lock"],
+                    "claim_expires": r["claim_expires"],
+                    "worker_pid": r["worker_pid"],
+                    "last_heartbeat_at": r["last_heartbeat_at"],
+                    "started_at": r["started_at"],
+                }
+            )
+    return runs
 
 
 # --- missed cron --------------------------------------------------------
