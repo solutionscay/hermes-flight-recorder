@@ -11,6 +11,7 @@ Components:
 - ``cron_db``:   adapter that reads the cron execution store
 - ``kanban_db``: adapter that reads the Kanban board stores into
                  ``task.*`` lifecycle events
+- ``gateway_log``: read-only adapter for terminal model-provider failures
 - ``reconcile``: diff the durable stores against the outbox to detect
                  gaps, missing terminals, and missed cron runs
 - ``sync``:      batch pending outbox events for an acknowledged transport
@@ -41,7 +42,7 @@ def run_pass(
     """
     from collections import Counter
 
-    from . import cron_db, kanban_db, state_db
+    from . import cron_db, gateway_log, kanban_db, state_db
     from .hook import drain as drain_hook_spool
 
     totals: Counter[str] = Counter()
@@ -50,6 +51,7 @@ def run_pass(
         ("state.db", lambda: state_db.poll(outbox, hermes_home), FileNotFoundError),
         ("cron", lambda: cron_db.poll(outbox, hermes_home), FileNotFoundError),
         ("kanban", lambda: kanban_db.poll(outbox, hermes_home), FileNotFoundError),
+        ("gateway log", lambda: gateway_log.poll(outbox, hermes_home), FileNotFoundError),
     )
     for label, poll, tolerated in sources:
         try:

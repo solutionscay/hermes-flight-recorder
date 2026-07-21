@@ -29,7 +29,7 @@ adapter, and the reconciler. The validator lives in
 | `session_id` | string | no | plaintext | The `state.db` `sessions.id`. It joins a live hook payload back to the durable row. |
 | `session_key` | string | no | plaintext | The deterministic conversation-lane key. It groups session incarnations into one lane. |
 | `parent_session_id` | string | no | plaintext | The lineage edge for the execution tree. Root sessions have NULL. |
-| `invocation_id` | string | no | plaintext | The `turn_id` for one cycle. It is in memory only in Hermes. It is authoritative on hook events. On poll events the collector synthesizes it and sets `partial`. |
+| `invocation_id` | string | no | plaintext | The `turn_id` for one cycle. Hermes hooks do not expose an authoritative turn id, so the collector pairs hook bookends with a stable synthetic id. Poll events inside the exact same session and hook-derived time window reuse that id and set `payload.invocation_attribution` to `"inferred_from_session_window"`. Events outside a window and child-session events remain unattributed. |
 | `correlation_id` | string | yes | plaintext | The id that ties every event of one operation together. It gives one tree per operation. |
 | `causation_id` | string | no | plaintext | The `event_id` of the direct cause. It gives causal tree edges. Best-effort. |
 | `source` | string | yes | plaintext | The producing store or subsystem, for example `state.db:messages`. |
@@ -57,6 +57,16 @@ platforms extend it — so `surface` is a free-form string and is never
 enum-validated. Both producers report the same semantic concept (the ingress
 surface) from the best signal available to them. Consumers must treat the
 values as open labels rather than assume a closed enum or a one-to-one mapping.
+
+**`model.usage_recorded` projection semantics:** `session_model_usage` is a
+cumulative row, but the event stream records **monotonic deltas**. Each changed
+snapshot emits one event with `payload.usage_semantics` set to
+`"monotonic_delta"`; token, call-count, and cost fields contain the increase
+since the preceding snapshot, while matching `cumulative_*` fields retain the
+absolute source values. An unchanged re-poll emits nothing. If Hermes resets a
+counter, its current absolute value becomes the first delta of the new counter
+epoch and the affected names appear in `counter_reset_fields`. Consumers can
+therefore sum event values without double-counting cumulative snapshots.
 
 **`runtime.gateway_start_failed`** is emitted by the reconciler (`source`
 `reconciler`, `capture_method` `derive:reconciler`, `partial` true) because
