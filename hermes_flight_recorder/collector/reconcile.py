@@ -530,12 +530,8 @@ def _detect_stale_task_leases(outbox, home, counts, when, cfg) -> None:
     execution is judged from its own ``finished_at``.
     """
     for run in _load_open_task_runs(home):
-        expires = run["claim_expires"]
-        if expires is None or when - expires <= cfg.task_lease_grace:
-            continue  # no lease, or still within its (possibly renewed) lease
-        hb = run["last_heartbeat_at"]
-        if hb is not None and when - hb <= cfg.task_heartbeat_stale_after:
-            continue  # a fresh heartbeat — the worker is alive, Hermes will renew
+        if not _lease_is_dead(run, when, cfg):
+            continue
         board, run_id = run["board"], run["id"]
         _emit_terminal_missing(
             outbox,
@@ -551,13 +547,31 @@ def _detect_stale_task_leases(outbox, home, counts, when, cfg) -> None:
                 "task_id": run["task_id"],
                 "run_id": run_id,
                 "holder": run["claim_lock"],
-                "claim_expires": expires,
-                "last_heartbeat_at": hb,
+                "claim_expires": run["claim_expires"],
+                "last_heartbeat_at": run["last_heartbeat_at"],
                 "start_occurred_at": run["started_at"],
-                "age_seconds": when - expires,
+                "age_seconds": when - run["claim_expires"],
             },
             dedup_key=f"reconcile:terminal:task_run:{board}:{run_id}",
         )
+
+
+def _lease_is_dead(run: dict[str, Any], when: float, cfg: ReconcileConfig) -> bool:
+    """Whether an open attempt's lease has lapsed with a dead heartbeat.
+
+    The shared stale-lease predicate: the ``claim_expires`` lapsed past the
+    grace, and the heartbeat is stale beyond the window (or absent). A live
+    worker renews ``claim_expires`` by heartbeat, so both failing means the
+    worker is gone. Public to the live-check gate so it validates this exact
+    boundary rather than a copy of it.
+    """
+    expires = run["claim_expires"]
+    if expires is None or when - expires <= cfg.task_lease_grace:
+        return False  # no lease, or still within its (possibly renewed) lease
+    hb = run["last_heartbeat_at"]
+    if hb is not None and when - hb <= cfg.task_heartbeat_stale_after:
+        return False  # a fresh heartbeat — the worker is alive, Hermes will renew
+    return True
 
 
 def _load_open_task_runs(home: Path) -> list[dict[str, Any]]:
