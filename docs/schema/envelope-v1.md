@@ -89,7 +89,7 @@ the `task_events.kind` together with the closing `task_runs.outcome`:
 | `task.created` | kind `created` (parked in `triage`/`todo`/`ready`/`blocked` at creation) | A card exists and is queued. |
 | `task.claimed` | kind `claimed` (`ready`→`running`; a `task_runs` row opens). `claim_extended` renews the same claim — a lease update, not a new claim. | A worker took the task under a TTL lease. |
 | `task.completed` | kind `completed`, run outcome `completed`, status→`done` | The one success terminal. |
-| `task.blocked` | kinds `blocked`/`dependency_wait`/`scheduled`/`unblocked`; run outcomes `reclaimed`/`stale`/`rate_limited` | Recoverable, non-terminal: awaiting human input, a parent dependency, a schedule, or released to the queue after a lease lapse. Not a failure. |
+| `task.blocked` | kinds `blocked`/`dependency_wait`/`scheduled`; run outcomes `reclaimed`/`stale`/`rate_limited` | Recoverable, non-terminal: awaiting human input, a parent dependency, a schedule, or released to the queue after a lease lapse. Not a failure. The inverse `unblocked` transition is not itself a `task.*` event — the task returns to the queue, and its next `claimed`/terminal event carries the progress. |
 | `task.failed_terminal` | kind `gave_up`/`block_loop_detected`, run outcome `gave_up` | Hermes's circuit breaker gave up after repeated crash/timeout/spawn failures (`consecutive_failures >= failure_limit`). Terminal. |
 
 `review` and `archived` are lifecycle states with no reserved event and are not
