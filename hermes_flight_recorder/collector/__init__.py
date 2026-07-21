@@ -9,6 +9,7 @@ Components:
 - ``state_db``:  adapter that reads Hermes ``state.db`` into
                  canonical events
 - ``cron_db``:   adapter that reads the cron execution store
+- ``gateway_log``: read-only adapter for terminal model-provider failures
 - ``reconcile``: diff the durable stores against the outbox to detect
                  gaps, missing terminals, and missed cron runs
 - ``sync``:      batch pending outbox events for an acknowledged transport
@@ -39,7 +40,7 @@ def run_pass(
     """
     from collections import Counter
 
-    from . import cron_db, state_db
+    from . import cron_db, gateway_log, state_db
     from .hook import drain as drain_hook_spool
 
     totals: Counter[str] = Counter()
@@ -47,6 +48,7 @@ def run_pass(
         ("hook drain", lambda: drain_hook_spool(outbox), Exception),
         ("state.db", lambda: state_db.poll(outbox, hermes_home), FileNotFoundError),
         ("cron", lambda: cron_db.poll(outbox, hermes_home), FileNotFoundError),
+        ("gateway log", lambda: gateway_log.poll(outbox, hermes_home), FileNotFoundError),
     )
     for label, poll, tolerated in sources:
         try:
