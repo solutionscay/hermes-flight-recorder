@@ -22,6 +22,8 @@ __all__ = [
     "SESSION_LIFECYCLE",
     "SESSION_START_TYPES",
     "SESSION_TERMINAL_TYPES",
+    "TASK_EVENT_TYPES",
+    "TASK_TERMINAL_TYPES",
     "RECONCILE_FINDING_TYPES",
     "EnvelopeValidationError",
     "validate",
@@ -78,6 +80,7 @@ RESERVED_EVENT_TYPES = frozenset(
         "task.completed",
         "task.blocked",
         "task.failed_terminal",
+        "task.attempt_ended",
         "knowledge.record_written",
         "knowledge.record_compacted",
     }
@@ -94,6 +97,23 @@ SESSION_LIFECYCLE: dict[str, tuple[str, str]] = {
 }
 SESSION_START_TYPES = frozenset(start for start, _ in SESSION_LIFECYCLE.values())
 SESSION_TERMINAL_TYPES = frozenset(end for _, end in SESSION_LIFECYCLE.values())
+
+# The reserved task.* lifecycle events the Kanban adapter emits and observe
+# groups: the five task-level transitions plus the per-attempt terminal — the
+# task-family counterpart of SESSION_LIFECYCLE, from this one mapping.
+TASK_EVENT_TYPES = frozenset(
+    {
+        "task.created",
+        "task.claimed",
+        "task.completed",
+        "task.blocked",
+        "task.failed_terminal",
+        "task.attempt_ended",
+    }
+)
+# The task terminals an operator reads to explain where a task came to rest.
+# task.blocked is recoverable; the other two are final.
+TASK_TERMINAL_TYPES = ("task.completed", "task.blocked", "task.failed_terminal")
 
 # Every event type the reconciler emits as a finding. ``observe --report``
 # lists exactly these and exits non-zero when any exist; a new detector adds
