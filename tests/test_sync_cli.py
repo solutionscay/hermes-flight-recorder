@@ -30,6 +30,7 @@ class _LedgerHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        self.server.request_count += 1
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         records = json.loads(raw)["records"]
         accepted = duplicates = 0
@@ -53,7 +54,7 @@ class _LedgerHandler(BaseHTTPRequestHandler):
 @pytest.fixture
 def ingest_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _LedgerHandler)
-    server.ledger, server.hw = {}, 0
+    server.ledger, server.hw, server.request_count = {}, 0, 0
     threading.Thread(target=server.serve_forever, daemon=True).start()
     host, port = server.server_address
     server.url = f"http://{host}:{port}/ingest"
@@ -106,6 +107,20 @@ def test_second_sync_ships_nothing(tmp_path, ingest_server, capsys):
     out = capsys.readouterr().out
     assert "shipped 0 / acked 0 / pending 0" in out
     assert len(ingest_server.ledger) == 2  # unchanged
+
+
+def test_sync_uses_batch_limits_from_recorder_config(tmp_path, ingest_server, capsys):
+    home = prepared_home(tmp_path, ingest_server.url, n_events=3)
+    (home / "recorder-config.json").write_text(
+        json.dumps({"sync": {"max_records": 1}})
+    )
+
+    code = cli.main(["sync", "--bridge-home", str(home), "--allow-insecure-url"])
+
+    assert code == 0
+    assert ingest_server.request_count == 3
+    assert len(ingest_server.ledger) == 3
+    capsys.readouterr()
 
 
 def test_sync_uninitialized_outbox_is_config_error(tmp_path, capsys):

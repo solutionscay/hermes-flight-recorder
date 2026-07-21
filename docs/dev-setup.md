@@ -65,6 +65,52 @@ capture hook under `$HERMES_HOME/hooks/`; restart the Hermes gateway to
 load it. Then `run` drains the hook spool and polls the durable stores,
 `reconcile` diffs them for gaps, and `observe` renders the log.
 
+## Recorder configuration
+
+Optional non-secret operational settings live in
+`$BRIDGE_HOME/recorder-config.json` (or
+`~/.hermes-flight-recorder/recorder-config.json` when `BRIDGE_HOME` is not
+set). Bridge treats a missing file or missing key as its built-in default.
+Environment variables take precedence over file values. The file is written
+with mode `0600` by `recorder_config.save`; create it with the same mode when
+managing it yourself.
+
+```json
+{
+  "capture": {
+    "max_content_bytes": 65536,
+    "message_roles": ["user", "assistant", "tool"],
+    "sources": {"hook": true}
+  },
+  "retention": {
+    "enabled": false,
+    "max_age_days": 30,
+    "max_bytes": null,
+    "require_delivered": true
+  },
+  "sync": {
+    "interval_seconds": null,
+    "max_records": 500,
+    "max_bytes": 1048576
+  }
+}
+```
+
+`capture` and `retention` are configuration surfaces for the corresponding
+capture-limit and outbox-pruning work. `sync.max_records` and
+`sync.max_bytes` are active now. `sync.interval_seconds` is `null` by default,
+preserving the current one-pass `sync` behavior; set a positive number to run
+continuously. An explicit `sync --interval` takes precedence over that value.
+
+The environment equivalents are `HFR_CAPTURE_MAX_CONTENT_BYTES`,
+`HFR_CAPTURE_MESSAGE_ROLES` (a JSON array), `HFR_CAPTURE_SOURCES` (a JSON
+object), `HFR_RETENTION_ENABLED`, `HFR_RETENTION_MAX_AGE_DAYS`,
+`HFR_RETENTION_MAX_BYTES`, `HFR_RETENTION_REQUIRE_DELIVERED`,
+`HFR_SYNC_INTERVAL_SECONDS`, `HFR_SYNC_MAX_RECORDS`, and
+`HFR_SYNC_MAX_BYTES`. The ingest URL and Cloudflare Access credentials remain
+in the separate private `sync-config.json` or their existing environment
+variables, so credentials do not mix with operational configuration.
+
 ## Safety notes
 
 - **Bridge is read-only against Hermes state.** It reads `state.db` and

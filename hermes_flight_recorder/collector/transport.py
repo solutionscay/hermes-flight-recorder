@@ -192,7 +192,7 @@ class PushOutcome:
     result: SyncResult | None
 
 
-def push(outbox: Any, transport: Any) -> PushOutcome:
+def push(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOutcome:
     """Run one sync pass and never raise on a network or auth failure.
 
     The agent keeps working when the network is down. A retryable failure
@@ -202,7 +202,7 @@ def push(outbox: Any, transport: Any) -> PushOutcome:
     defect still propagates, because it is a bug that must be seen.
     """
     try:
-        result = sync(outbox, transport)
+        result = sync(outbox, transport, **sync_kwargs)
     except RetryableTransportError:
         return PushOutcome(ok=False, reason="offline", result=None)
     except AuthError:
