@@ -172,14 +172,20 @@ def _sync_summary(outbox, before_cursor: int) -> tuple[int, int, int]:
     return after - before_cursor, after, producer_high_water - after
 
 
-def _sync_once(outbox, transport) -> int:
+def _sync_once(
+    outbox,
+    transport,
+    *,
+    max_records: int = 500,
+    max_bytes: int = 1024 * 1024,
+) -> int:
     """One sync pass. Print the summary and return a sync exit code."""
     from .collector.sync import delivery_cursor
     from .collector.transport import TerminalTransportError, push
 
     before = delivery_cursor(outbox)
     try:
-        outcome = push(outbox, transport)
+        outcome = push(outbox, transport, max_records=max_records, max_bytes=max_bytes)
     except TerminalTransportError as exc:
         # A client defect. Resending the same body cannot help.
         print(f"sync stopped: malformed batch (client defect): {exc}", file=sys.stderr)
@@ -200,7 +206,7 @@ def _sync_once(outbox, transport) -> int:
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
-    from .collector import sync_config
+    from .collector import recorder_config, sync_config
     from .collector.outbox import Outbox
     from .collector.transport import HttpsTransport, RetryingTransport
 
@@ -211,7 +217,11 @@ def _cmd_sync(args: argparse.Namespace) -> int:
 
         try:
             config = sync_config.load(args.bridge_home)
-        except sync_config.SyncConfigError as exc:
+            runtime_config = recorder_config.load(args.bridge_home)
+        except (
+            sync_config.SyncConfigError,
+            recorder_config.RecorderConfigError,
+        ) as exc:
             print(f"sync not configured: {exc}", file=sys.stderr)
             return _SYNC_CONFIG
 
@@ -221,15 +231,24 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             )
         )
 
-        if args.interval is None:
-            return _sync_once(outbox, transport)
+        interval = (
+            args.interval
+            if args.interval is not None
+            else runtime_config.sync.interval_seconds
+        )
+        sync_kwargs = {
+            "max_records": runtime_config.sync.max_records,
+            "max_bytes": runtime_config.sync.max_bytes,
+        }
+        if interval is None:
+            return _sync_once(outbox, transport, **sync_kwargs)
 
         # Interval mode ships forever and tolerates an offline network: the
         # outbox buffers and the next pass catches up. Ctrl-C stops it cleanly.
         try:
             while True:
-                _sync_once(outbox, transport)
-                time.sleep(args.interval)
+                _sync_once(outbox, transport, **sync_kwargs)
+                time.sleep(interval)
         except KeyboardInterrupt:
             print("sync stopped.", file=sys.stderr)
             return _SYNC_OK
