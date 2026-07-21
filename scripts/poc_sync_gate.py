@@ -12,7 +12,7 @@ Scenarios:
 2. Dropped batch     - one batch is lost before storage, then re-sent.
 3. Duplicate         - one ack is lost after storage, then re-sent and deduped.
 4. Offline to online - one sync pass fails, then the next catches up.
-5. Bridge restart    - a process stops after the server stores an unacked batch;
+5. recorder restart    - a process stops after the server stores an unacked batch;
                        a reopened outbox resumes from its last durable cursor.
 
 Usage:  python scripts/poc_sync_gate.py [-v]
@@ -261,7 +261,7 @@ def _complete_stream_failures(
 
 
 def scenario_happy(tmp: Path) -> list[str]:
-    outbox = _new_outbox(tmp / "bridge")
+    outbox = _new_outbox(tmp / "flight-recorder")
     try:
         with ingestion_server() as server:
             result = sync(outbox, _transport(server), max_records=2)
@@ -276,7 +276,7 @@ def scenario_happy(tmp: Path) -> list[str]:
 
 
 def scenario_dropped_batch(tmp: Path) -> list[str]:
-    outbox = _new_outbox(tmp / "bridge")
+    outbox = _new_outbox(tmp / "flight-recorder")
     try:
         with ingestion_server([DROP_BEFORE_STORE, NORMAL]) as server:
             sync(outbox, _transport(server, max_attempts=2))
@@ -293,7 +293,7 @@ def scenario_dropped_batch(tmp: Path) -> list[str]:
 
 
 def scenario_duplicate_delivery(tmp: Path) -> list[str]:
-    outbox = _new_outbox(tmp / "bridge")
+    outbox = _new_outbox(tmp / "flight-recorder")
     try:
         with ingestion_server([DROP_AFTER_STORE, NORMAL]) as server:
             sync(outbox, _transport(server, max_attempts=2))
@@ -310,7 +310,7 @@ def scenario_duplicate_delivery(tmp: Path) -> list[str]:
 
 
 def scenario_offline_then_online(tmp: Path) -> list[str]:
-    outbox = _new_outbox(tmp / "bridge")
+    outbox = _new_outbox(tmp / "flight-recorder")
     try:
         with ingestion_server([DROP_BEFORE_STORE]) as server:
             offline = push(outbox, _transport(server, max_attempts=1))
@@ -330,8 +330,8 @@ def scenario_offline_then_online(tmp: Path) -> list[str]:
 
 
 def scenario_restart_mid_sync(tmp: Path) -> list[str]:
-    bridge_home = tmp / "bridge"
-    outbox = _new_outbox(bridge_home)
+    flight_recorder_home = tmp / "flight-recorder"
+    outbox = _new_outbox(flight_recorder_home)
     with ingestion_server([NORMAL, DROP_AFTER_STORE]) as server:
         try:
             try:
@@ -351,7 +351,7 @@ def scenario_restart_mid_sync(tmp: Path) -> list[str]:
         finally:
             outbox.close()
 
-        reopened = Outbox.open(bridge_home)
+        reopened = Outbox.open(flight_recorder_home)
         try:
             sync(reopened, _transport(server, max_attempts=1), max_records=2)
             failures += _complete_stream_failures("restart", reopened, server)

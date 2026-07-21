@@ -1,6 +1,6 @@
 """Non-secret configuration for a Flight Recorder installation.
 
-``recorder-config.json`` lives in the Bridge home.  It holds operational
+``recorder-config.json`` lives in the Flight Recorder home.  It holds operational
 settings that are safe to keep alongside the outbox; the ingest URL and
 Cloudflare Access credential deliberately remain in :mod:`sync_config`.
 
@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ._common import default_bridge_home
+from ._common import default_flight_recorder_home
 from .sync import DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS
 
 CONFIG_FILENAME = "recorder-config.json"
@@ -60,15 +60,15 @@ class RecorderConfig:
     sync: SyncRuntimeConfig = field(default_factory=SyncRuntimeConfig)
 
 
-def config_path(bridge_home: str | os.PathLike[str] | None = None) -> Path:
-    """Return the recorder config path inside the Bridge home."""
-    home = Path(bridge_home).expanduser() if bridge_home else default_bridge_home()
+def config_path(flight_recorder_home: str | os.PathLike[str] | None = None) -> Path:
+    """Return the recorder config path inside the Flight Recorder home."""
+    home = Path(flight_recorder_home).expanduser() if flight_recorder_home else default_flight_recorder_home()
     return home / CONFIG_FILENAME
 
 
-def load(bridge_home: str | os.PathLike[str] | None = None) -> RecorderConfig:
+def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> RecorderConfig:
     """Load config with environment-over-file-over-default precedence."""
-    data = _read_file(config_path(bridge_home))
+    data = _read_file(config_path(flight_recorder_home))
     capture = _section(data, "capture")
     retention = _section(data, "retention")
     sync = _section(data, "sync")
@@ -130,10 +130,10 @@ def load(bridge_home: str | os.PathLike[str] | None = None) -> RecorderConfig:
 
 
 def save(
-    config: RecorderConfig, bridge_home: str | os.PathLike[str] | None = None
+    config: RecorderConfig, flight_recorder_home: str | os.PathLike[str] | None = None
 ) -> Path:
     """Write config atomically enough for local use, with mode ``0600``."""
-    path = config_path(bridge_home)
+    path = config_path(flight_recorder_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "capture": {

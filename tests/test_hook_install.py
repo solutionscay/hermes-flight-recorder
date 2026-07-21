@@ -5,7 +5,7 @@
 These assert the manifest contract Hermes' loader requires (``name``,
 ``description``, a non-empty ``events`` list), that the generated handler is
 valid Python exposing a module-level ``handle``, the force/idempotency guard,
-that the Bridge home is baked in (with a ``$BRIDGE_HOME`` runtime override),
+that the Flight Recorder home is baked in (with a ``$SC_HERMES_FLIGHT_RECORDER_HOME`` runtime override),
 and the invariant that the hook package is the ONLY thing written under the
 Hermes home.
 """
@@ -48,7 +48,7 @@ def test_generated_handler_compiles_and_exposes_handle(tmp_path: Path) -> None:
 
 
 def test_handler_is_stdlib_only(tmp_path: Path) -> None:
-    """The in-gateway handler must not import the Bridge package or crypto."""
+    """The in-gateway handler must not import the Flight Recorder package or crypto."""
     hook_dir = install_hook(tmp_path / "hermes", tmp_path / "bridge")
     tree = ast.parse((hook_dir / "handler.py").read_text())
     imported = set()
@@ -62,10 +62,12 @@ def test_handler_is_stdlib_only(tmp_path: Path) -> None:
     assert "cryptography" not in imported
 
 
-def test_bridge_home_is_baked_in_resolved(tmp_path: Path) -> None:
+def test_flight_recorder_home_is_baked_in_resolved(tmp_path: Path) -> None:
     src = render_handler(tmp_path / "bridge")
     expected = str((tmp_path / "bridge").resolve())
     assert expected in src
+    assert "SC_HERMES_FLIGHT_RECORDER_HOME" in src
+    assert "BRIDGE" + "_HOME" not in src
 
 
 def test_reinstall_without_force_raises(tmp_path: Path) -> None:

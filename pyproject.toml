@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hermes-flight-recorder"
 version = "0.0.0"
-description = "Bridge — the local-first companion for Hermes Flight Recorder: capture, encrypt, buffer, and reconcile Hermes agent execution events."
+description = "Local-first capture, encryption, buffering, and reconciliation for Hermes agent execution events."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"

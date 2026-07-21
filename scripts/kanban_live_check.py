@@ -107,7 +107,7 @@ def leg_a_live_readonly(home: Path, tmp: Path) -> list[str]:
     open_runs = _load_open_task_runs(home)
     healthy = {(r["board"], r["id"]) for r in open_runs if not _lease_is_dead(r, when, cfg)}
 
-    ob = Outbox.open(tmp / "bridge")
+    ob = Outbox.open(tmp / "flight-recorder")
     ob.initialize()
     try:
         poll_counts = kanban_db.poll(ob, home)
@@ -220,7 +220,7 @@ def leg_b_real_cli(home: Path, tmp: Path) -> list[str]:
     # Reconcile with now pushed past the lease window: the worker never
     # heartbeats or ends, so the reconciler must call the attempt dead.
     when = float(expires) + LEG_B_CFG.task_lease_grace + 60.0
-    ob = Outbox.open(tmp / "bridge")
+    ob = Outbox.open(tmp / "flight-recorder")
     ob.initialize()
     try:
         kanban_db.poll(ob, disposable)

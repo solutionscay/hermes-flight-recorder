@@ -259,7 +259,7 @@ def test_report_reflects_a_real_reconciler_terminal_missing_finding(tmp_path):
     ob.close()
 
     bridge = str(tmp_path / "bridge")
-    code = main(["observe", "--report", "--bridge-home", bridge])
+    code = main(["observe", "--report", "--flight-recorder-home", bridge])
 
     assert code == 1  # >=1 finding exists (terminal_missing, plus a coverage gap)
 
@@ -271,7 +271,7 @@ def test_cli_clean_report_exits_zero(tmp_path, capsys):
     add(ob, "session.created", session_id="P", payload={"kind": "cli"})
     ob.close()
 
-    code = main(["observe", "--report", "--bridge-home", bridge])
+    code = main(["observe", "--report", "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
 
     assert code == 0

@@ -23,9 +23,9 @@ def resolve_hermes_home(hermes_home: str | Path | None) -> Path:
     return Path(env).expanduser() if env else Path.home() / ".hermes"
 
 
-def default_bridge_home() -> Path:
-    """The Bridge-owned data directory (never under HERMES_HOME)."""
-    env = os.environ.get("BRIDGE_HOME")
+def default_flight_recorder_home() -> Path:
+    """The Flight Recorder-owned data directory (never under HERMES_HOME)."""
+    env = os.environ.get("SC_HERMES_FLIGHT_RECORDER_HOME")
     return Path(env).expanduser() if env else Path.home() / ".hermes-flight-recorder"
 
 

@@ -155,7 +155,7 @@ def test_kanban_cli_view_prints_header_and_tasks(tmp_path, capsys):
     kanban_db.poll(ob, hh)
     ob.close()
 
-    code = main(["observe", "--kanban", "--bridge-home", bridge])
+    code = main(["observe", "--kanban", "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
     assert code == 0
     assert "── kanban ──" in out
@@ -171,7 +171,7 @@ def test_kanban_cli_view_order_after_report(tmp_path, capsys):
     ob.close()
 
     code = main(["observe", "--kanban", "--report", "--stream", "--tree",
-                 "--bridge-home", bridge])
+                 "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
     assert code == 0
     assert (out.index("── stream") < out.index("── tree ──")

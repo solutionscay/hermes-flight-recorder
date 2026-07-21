@@ -86,7 +86,7 @@ def _log(msg: str) -> None:
 
 
 def _new_outbox(tmp: Path) -> Outbox:
-    ob = Outbox.open(tmp / "bridge")
+    ob = Outbox.open(tmp / "flight-recorder")
     ob.initialize()
     return ob
 

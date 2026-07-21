@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Deploy Hermes Flight Recorder (Bridge) into its systemd runtime venv.
+# Deploy Hermes Flight Recorder into its systemd runtime venv.
 #
 # The runtime venv uses an EDITABLE install pointing at this repo, so ordinary
 # .py edits are already live on the next ~15s service tick. Run this script:
@@ -20,7 +20,7 @@ VENV="${HFR_RUNTIME_VENV:-$HOME/.local/share/hermes-flight-recorder-runtime/venv
 PY="$VENV/bin/python"
 PIP="$VENV/bin/pip"
 RT="$VENV/bin/hermes-flight-recorder"
-BRIDGE_HOME="${BRIDGE_HOME:-$HOME/.hermes-flight-recorder}"
+SC_HERMES_FLIGHT_RECORDER_HOME="${SC_HERMES_FLIGHT_RECORDER_HOME:-$HOME/.hermes-flight-recorder}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 SERVICES=(hermes-flight-recorder-capture hermes-flight-recorder-sync)
 
@@ -61,7 +61,7 @@ sys.exit(0 if ok else 1)
 PYEOF
 
 echo "==> Smoke capture (one pass)"
-"$RT" run --bridge-home "$BRIDGE_HOME" --hermes-home "$HERMES_HOME"
+"$RT" run --flight-recorder-home "$SC_HERMES_FLIGHT_RECORDER_HOME" --hermes-home "$HERMES_HOME"
 
 echo "==> Restarting timers"
 for s in "${SERVICES[@]}"; do

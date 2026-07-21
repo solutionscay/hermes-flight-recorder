@@ -42,7 +42,7 @@ def add(ob, event_type, *, occurred_at=B, session_id=None, parent_session_id=Non
 # --- not initialized ------------------------------------------------------
 def test_observe_not_initialized_exits_2_with_stderr_hint(tmp_path, capsys):
     bridge = str(tmp_path / "bridge")  # never opened/initialized
-    code = main(["observe", "--bridge-home", bridge])
+    code = main(["observe", "--flight-recorder-home", bridge])
     captured = capsys.readouterr()
     assert code == 2
     assert "hermes-flight-recorder init" in captured.err
@@ -57,7 +57,7 @@ def test_observe_default_view_is_stream_with_header(tmp_path, capsys):
     add(ob, "session.created", session_id="Q", payload={"kind": "cli"})
     ob.close()
 
-    code = main(["observe", "--bridge-home", bridge])  # no view flag
+    code = main(["observe", "--flight-recorder-home", bridge])  # no view flag
     out = capsys.readouterr().out
 
     assert code == 0
@@ -78,7 +78,7 @@ def test_observe_multiple_views_each_print_header_exit_from_report(tmp_path, cap
 
     # Flags given out of order; the printed view order must still be the
     # fixed stream -> tree -> report order (per _cmd_observe).
-    code = main(["observe", "--report", "--stream", "--tree", "--bridge-home", bridge])
+    code = main(["observe", "--report", "--stream", "--tree", "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
 
     assert "── stream (2 events) ──" in out
@@ -100,7 +100,7 @@ def test_observe_multiple_views_without_report_flag_exit_zero_even_with_findings
         payload={"job_id": "j1", "expected_fire_at": B, "missed_count": 1}, partial=True)
     ob.close()
 
-    code = main(["observe", "--stream", "--tree", "--bridge-home", bridge])
+    code = main(["observe", "--stream", "--tree", "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
 
     assert "── stream" in out and "── tree ──" in out
@@ -114,7 +114,7 @@ def test_observe_report_only_clean_exits_zero(tmp_path, capsys):
     add(ob, "session.created", session_id="P", payload={"kind": "cli"})  # no findings
     ob.close()
 
-    code = main(["observe", "--report", "--bridge-home", bridge])
+    code = main(["observe", "--report", "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
 
     assert code == 0
@@ -128,7 +128,7 @@ def test_observe_bad_since_exits_2_with_stderr_message_no_traceback(tmp_path, ca
     ob = new_outbox(tmp_path)
     ob.close()
 
-    code = main(["observe", "--since", "not-a-timestamp", "--bridge-home", bridge])
+    code = main(["observe", "--since", "not-a-timestamp", "--flight-recorder-home", bridge])
     captured = capsys.readouterr()
 
     assert code == 2
@@ -149,7 +149,7 @@ def test_observe_since_flag_reaches_load_and_filters_stream(tmp_path, capsys):
     add(ob, "session.created", session_id="new", occurred_at=B + 100, payload={"kind": "cli"})
     ob.close()
 
-    code = main(["observe", "--since", str(B + 50), "--bridge-home", bridge])
+    code = main(["observe", "--since", str(B + 50), "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
 
     assert code == 0
@@ -165,7 +165,7 @@ def test_observe_session_flag_reaches_load_and_filters_tree(tmp_path, capsys):
     add(ob, "session.created", session_id="B", correlation_id="B", payload={"kind": "cli"})
     ob.close()
 
-    code = main(["observe", "--tree", "--session", "A", "--bridge-home", bridge])
+    code = main(["observe", "--tree", "--session", "A", "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
 
     assert code == 0
@@ -188,7 +188,7 @@ def test_observe_since_accepts_iso_timestamp_via_cli(tmp_path, capsys):
         B + 50, datetime.timezone.utc
     ).isoformat()
 
-    code = main(["observe", "--since", since_iso, "--bridge-home", bridge])
+    code = main(["observe", "--since", since_iso, "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
 
     assert code == 0

@@ -4,7 +4,7 @@ The spool-and-drain contract is at-least-once with dedup at the drain, keyed
 on a byte-offset cursor stored in the outbox meta. These assert: the cursor
 advances by the bytes of complete lines only; a partial trailing line (a
 gateway that died mid-write) is left and picked up on the next drain; a
-re-drain after the SAME lines (a Bridge stop before the cursor committed) is
+re-drain after the SAME lines (a Flight Recorder stop before the cursor committed) is
 idempotent via the dedup key — no duplicate row, no consumed sequence; a
 truncated/rotated spool resets the cursor; and an undecodable line is skipped
 rather than sinking the pass.
@@ -19,8 +19,8 @@ from hermes_flight_recorder.collector.hook import CURSOR_NAME, SPOOL_FILENAME, d
 from hermes_flight_recorder.collector.outbox import Outbox
 
 
-def new_outbox(bridge_home: Path) -> Outbox:
-    ob = Outbox.open(bridge_home)
+def new_outbox(flight_recorder_home: Path) -> Outbox:
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     return ob
 
@@ -58,7 +58,7 @@ def test_partial_trailing_line_is_deferred_then_completed(tmp_path: Path) -> Non
 
 
 def test_redrain_of_same_lines_is_idempotent(tmp_path: Path) -> None:
-    """Simulates a Bridge stop after append but before the cursor commit."""
+    """Simulates a Flight Recorder stop after append but before the cursor commit."""
     spool = tmp_path / SPOOL_FILENAME
     spool.write_text(line("session:start", {"session_id": "s1", "session_key": "k1"}) + "\n")
 

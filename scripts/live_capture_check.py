@@ -2,7 +2,7 @@
 """Live capture check — the Phase 0 enrichments against a real Hermes home.
 
 Unlike ``poc_exit_gate.py`` (a deterministic gate over a synthetic home), this
-runs the whole Bridge pipeline against the **real** Hermes home on this host
+runs the whole Flight Recorder pipeline against the **real** Hermes home on this host
 and proves the Phase 0 envelope enrichments hold against real data:
 
 - #16 ``runtime.home_mode`` — every Hermes-runtime poll event carries the
@@ -60,7 +60,7 @@ def _hermes_home() -> Path:
 
 
 def _new_outbox(tmp: Path) -> Outbox:
-    ob = Outbox.open(tmp / "bridge")
+    ob = Outbox.open(tmp / "flight-recorder")
     ob.initialize()
     return ob
 
@@ -170,11 +170,11 @@ def check_gateway_channels(home: Path, tmp: Path) -> list[str]:
     if not platforms:
         platforms = ["discord"]  # a representative channel, if the host has none live
 
-    bridge = tmp / "gw"
-    bridge.mkdir(parents=True, exist_ok=True)
+    flight_recorder_home = tmp / "gw"
+    flight_recorder_home.mkdir(parents=True, exist_ok=True)
     line = {"event_type": "gateway:startup", "context": {"platforms": platforms}, "captured_at": 1_700_000_000.0}
-    (bridge / SPOOL_FILENAME).write_text(json.dumps(line) + "\n")
-    ob = Outbox.open(bridge)
+    (flight_recorder_home / SPOOL_FILENAME).write_text(json.dumps(line) + "\n")
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     drain_hook(ob)
     rec = next(
@@ -220,7 +220,7 @@ def check_gateway_start_failed(home: Path, tmp: Path) -> list[str]:
         "exit_reason": "telegram: dm_policy open is not allowed",
         "updated_at": "2026-07-19T21:29:01.661893+00:00",
     }))
-    ob = Outbox.open(synth / "bridge")
+    ob = Outbox.open(synth / "flight-recorder")
     ob.initialize()
     reconcile(ob, synth)
     found = [e for e in ob.iter_events() if e["payload"]["event_type"] == "runtime.gateway_start_failed"]

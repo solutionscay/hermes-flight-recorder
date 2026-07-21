@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 
-from hermes_flight_recorder.collector.outbox import Outbox, OutboxError
+from hermes_flight_recorder.collector.outbox import (
+    Outbox,
+    OutboxError,
+    default_flight_recorder_home,
+)
 from hermes_flight_recorder.envelope import EnvelopeValidationError, validate
 
 
@@ -48,11 +53,22 @@ def test_init_is_idempotent_and_id_is_stable(tmp_path):
     reopened.close()
 
 
-def test_outbox_lives_at_bridge_path(tmp_path):
+def test_outbox_lives_at_flight_recorder_path(tmp_path):
     ob = open_outbox(tmp_path)
     assert ob.path == tmp_path.resolve() / "outbox.sqlite"
     assert ob.path.exists()
     ob.close()
+
+
+def test_flight_recorder_home_env_overrides_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("SC_HERMES_FLIGHT_RECORDER_HOME", str(tmp_path))
+    assert default_flight_recorder_home() == tmp_path
+
+
+def test_legacy_home_env_is_ignored(monkeypatch, tmp_path):
+    monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
+    monkeypatch.setenv("BRIDGE" + "_HOME", str(tmp_path))
+    assert default_flight_recorder_home() == Path.home() / ".hermes-flight-recorder"
 
 
 def test_refuses_path_under_hermes_home(tmp_path, monkeypatch):

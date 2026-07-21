@@ -34,9 +34,9 @@ from typing import Any, Iterator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from ..envelope import SCHEMA_VERSION, parse, serialize, validate
-from ._common import default_bridge_home, resolve_hermes_home
+from ._common import default_flight_recorder_home, resolve_hermes_home
 
-__all__ = ["OUTBOX_SCHEMA_VERSION", "Outbox", "OutboxError", "default_bridge_home"]
+__all__ = ["OUTBOX_SCHEMA_VERSION", "Outbox", "OutboxError", "default_flight_recorder_home"]
 
 OUTBOX_SCHEMA_VERSION = "1"
 _KEY_VERSION = "aesgcm256:dev"
@@ -72,7 +72,7 @@ class Outbox:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._bridge_home = self.path.parent
+        self._flight_recorder_home = self.path.parent
         self._conn = sqlite3.connect(str(self.path), isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -84,15 +84,15 @@ class Outbox:
 
     # --- construction ---------------------------------------------------
     @classmethod
-    def open(cls, bridge_home: str | os.PathLike[str] | None = None) -> "Outbox":
-        home = Path(bridge_home).expanduser() if bridge_home else default_bridge_home()
+    def open(cls, flight_recorder_home: str | os.PathLike[str] | None = None) -> "Outbox":
+        home = Path(flight_recorder_home).expanduser() if flight_recorder_home else default_flight_recorder_home()
         home = home.resolve()
         path = home / "outbox.sqlite"
         hermes = resolve_hermes_home(None).resolve()
         if path.is_relative_to(hermes):
             raise OutboxError(
                 f"refusing to place the outbox under HERMES_HOME ({hermes}); "
-                f"set BRIDGE_HOME to a directory outside the Hermes home"
+                f"set SC_HERMES_FLIGHT_RECORDER_HOME to a directory outside the Hermes home"
             )
         home.mkdir(parents=True, exist_ok=True)
         return cls(path)
@@ -131,7 +131,7 @@ class Outbox:
     # --- content key ----------------------------------------------------
     @property
     def _key_path(self) -> Path:
-        return self._bridge_home / "content-dev.key"
+        return self._flight_recorder_home / "content-dev.key"
 
     def _ensure_content_key(self) -> bytes:
         if self._content_key is not None:

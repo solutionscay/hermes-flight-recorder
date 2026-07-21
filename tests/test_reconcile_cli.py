@@ -39,27 +39,27 @@ B = 1784415000.0
 
 
 # --- fixtures / helpers ---------------------------------------------------
-def new_outbox(bridge_home: Path) -> Outbox:
+def new_outbox(flight_recorder_home: Path) -> Outbox:
     """Open and initialize an Outbox, matching tests/test_reconcile.py."""
-    ob = Outbox.open(bridge_home)
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     return ob
 
 
-def make_initialized_bridge_home(bridge_home: Path) -> Path:
-    """Initialize an outbox at ``bridge_home`` and close it, so the CLI's
+def make_initialized_flight_recorder_home(flight_recorder_home: Path) -> Path:
+    """Initialize an outbox at ``flight_recorder_home`` and close it, so the CLI's
     own ``Outbox.open()`` call reopens the same on-disk installation.
     """
-    ob = new_outbox(bridge_home)
+    ob = new_outbox(flight_recorder_home)
     ob.close()
-    return bridge_home
+    return flight_recorder_home
 
 
-def append_raw(bridge_home: Path, event_type: str, **over) -> None:
+def append_raw(flight_recorder_home: Path, event_type: str, **over) -> None:
     """Append one minimal valid producer event straight to the outbox,
     through a short-lived connection (mirrors the CLI's own lifecycle).
     """
-    ob = Outbox.open(bridge_home)
+    ob = Outbox.open(flight_recorder_home)
     try:
         rec = build_record(
             event_type=event_type,
@@ -76,9 +76,9 @@ def append_raw(bridge_home: Path, event_type: str, **over) -> None:
         ob.close()
 
 
-def drop_sequence(bridge_home: Path, seq: int) -> None:
+def drop_sequence(flight_recorder_home: Path, seq: int) -> None:
     """Simulate a dropped capture by deleting a producer_sequence row."""
-    conn = sqlite3.connect(bridge_home / "outbox.sqlite")
+    conn = sqlite3.connect(flight_recorder_home / "outbox.sqlite")
     try:
         conn.execute("DELETE FROM events WHERE producer_sequence=?", (seq,))
         conn.commit()
@@ -114,7 +114,7 @@ def test_reconcile_not_initialized_exits_2_with_stderr_hint(tmp_path, capsys):
     hermes_home = tmp_path / "hermes"  # never even created; irrelevant here
 
     code = cli.main(
-        ["reconcile", "--bridge-home", str(bridge), "--hermes-home", str(hermes_home)]
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
     )
     captured = capsys.readouterr()
 
@@ -127,7 +127,7 @@ def test_reconcile_not_initialized_exits_2_with_stderr_hint(tmp_path, capsys):
 # --- normal run: summary + per-event-type lines ---------------------------
 def test_reconcile_normal_run_reports_summary_and_gap_line(tmp_path, capsys):
     bridge = tmp_path / "bridge"
-    make_initialized_bridge_home(bridge)
+    make_initialized_flight_recorder_home(bridge)
     for _ in range(5):
         append_raw(bridge, "session.created")
     drop_sequence(bridge, 3)  # one dropped capture -> exactly one gap
@@ -135,7 +135,7 @@ def test_reconcile_normal_run_reports_summary_and_gap_line(tmp_path, capsys):
     hermes_home = tmp_path / "hermes-missing"  # doesn't exist; tolerated
 
     code = cli.main(
-        ["reconcile", "--bridge-home", str(bridge), "--hermes-home", str(hermes_home)]
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
     )
     captured = capsys.readouterr()
 
@@ -146,21 +146,21 @@ def test_reconcile_normal_run_reports_summary_and_gap_line(tmp_path, capsys):
 
 def test_reconcile_is_idempotent_across_cli_invocations(tmp_path, capsys):
     bridge = tmp_path / "bridge-idem"
-    make_initialized_bridge_home(bridge)
+    make_initialized_flight_recorder_home(bridge)
     for _ in range(3):
         append_raw(bridge, "session.created")
     drop_sequence(bridge, 2)
     hermes_home = tmp_path / "hermes-missing2"
 
     code1 = cli.main(
-        ["reconcile", "--bridge-home", str(bridge), "--hermes-home", str(hermes_home)]
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
     )
     out1 = capsys.readouterr().out
     assert code1 == 0
     assert "reconciled 1 new finding(s)" in out1
 
     code2 = cli.main(
-        ["reconcile", "--bridge-home", str(bridge), "--hermes-home", str(hermes_home)]
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
     )
     out2 = capsys.readouterr().out
     assert code2 == 0
@@ -170,12 +170,12 @@ def test_reconcile_is_idempotent_across_cli_invocations(tmp_path, capsys):
 # --- missing durable stores are tolerated ---------------------------------
 def test_reconcile_missing_state_db_and_cron_dir_tolerated(tmp_path, capsys):
     bridge = tmp_path / "bridge-empty-home"
-    make_initialized_bridge_home(bridge)
+    make_initialized_flight_recorder_home(bridge)
     hermes_home = tmp_path / "hermes-empty"
     hermes_home.mkdir()  # exists, but no state.db and no cron/ subdir
 
     code = cli.main(
-        ["reconcile", "--bridge-home", str(bridge), "--hermes-home", str(hermes_home)]
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
     )
     captured = capsys.readouterr()
 
@@ -187,11 +187,11 @@ def test_reconcile_missing_state_db_and_cron_dir_tolerated(tmp_path, capsys):
 
 def test_reconcile_nonexistent_hermes_home_tolerated(tmp_path, capsys):
     bridge = tmp_path / "bridge-no-home-dir"
-    make_initialized_bridge_home(bridge)
+    make_initialized_flight_recorder_home(bridge)
     hermes_home = tmp_path / "does-not-exist-at-all"  # never created
 
     code = cli.main(
-        ["reconcile", "--bridge-home", str(bridge), "--hermes-home", str(hermes_home)]
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
     )
     captured = capsys.readouterr()
 
@@ -202,7 +202,7 @@ def test_reconcile_nonexistent_hermes_home_tolerated(tmp_path, capsys):
 # --- state.db-backed detectors through the CLI -----------------------------
 def test_reconcile_reports_coverage_gap_for_uncaptured_session(tmp_path, capsys):
     bridge = tmp_path / "bridge-cover"
-    make_initialized_bridge_home(bridge)
+    make_initialized_flight_recorder_home(bridge)
     hermes_home = tmp_path / "hermes-cover"
     hermes_home.mkdir()
     # started "now" (real wall clock): comfortably inside the default
@@ -212,7 +212,7 @@ def test_reconcile_reports_coverage_gap_for_uncaptured_session(tmp_path, capsys)
     make_state_db(hermes_home, [("S", "cli", None, recent_started, None, 0, None)])
 
     code = cli.main(
-        ["reconcile", "--bridge-home", str(bridge), "--hermes-home", str(hermes_home)]
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
     )
     captured = capsys.readouterr()
 
@@ -224,7 +224,7 @@ def test_reconcile_reports_coverage_gap_for_uncaptured_session(tmp_path, capsys)
 
 def test_reconcile_reports_terminal_missing_for_stale_session(tmp_path, capsys):
     bridge = tmp_path / "bridge-term"
-    make_initialized_bridge_home(bridge)
+    make_initialized_flight_recorder_home(bridge)
     hermes_home = tmp_path / "hermes-term"
     hermes_home.mkdir()
 
@@ -235,7 +235,7 @@ def test_reconcile_reports_terminal_missing_for_stale_session(tmp_path, capsys):
     make_state_db(hermes_home, [("S", "cli", None, stale_started, None, 0, None)])
 
     code = cli.main(
-        ["reconcile", "--bridge-home", str(bridge), "--hermes-home", str(hermes_home)]
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
     )
     captured = capsys.readouterr()
 

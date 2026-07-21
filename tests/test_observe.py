@@ -175,7 +175,7 @@ def test_parse_since_accepts_epoch_and_iso():
 def test_cli_report_exit_code_and_no_init(tmp_path, capsys):
     bridge = str(tmp_path / "bridge")
     # not initialized -> exit 2
-    assert main(["observe", "--report", "--bridge-home", bridge]) == 2
+    assert main(["observe", "--report", "--flight-recorder-home", bridge]) == 2
     assert "not initialized" in capsys.readouterr().err
 
     ob = Outbox.open(bridge); ob.initialize()
@@ -183,7 +183,7 @@ def test_cli_report_exit_code_and_no_init(tmp_path, capsys):
         payload={"job_id": "j1", "expected_fire_at": B, "missed_count": 1}, partial=True)
     ob.close()
 
-    code = main(["observe", "--report", "--bridge-home", bridge])
+    code = main(["observe", "--report", "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
     assert code == 1  # a finding exists
     assert "job j1 missed" in out
@@ -194,7 +194,7 @@ def test_cli_stream_default_view(tmp_path, capsys):
     ob = Outbox.open(bridge); ob.initialize()
     add(ob, "session.created", session_id="P", payload={"kind": "cli"})
     ob.close()
-    code = main(["observe", "--bridge-home", bridge])  # no view flag -> stream
+    code = main(["observe", "--flight-recorder-home", bridge])  # no view flag -> stream
     out = capsys.readouterr().out
     assert code == 0
     assert "── stream (1 events) ──" in out

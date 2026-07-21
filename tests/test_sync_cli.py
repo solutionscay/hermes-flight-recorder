@@ -88,7 +88,7 @@ def open_ready_outbox(tmp_path):
 def test_sync_ships_and_reports_summary(tmp_path, ingest_server, capsys):
     home = prepared_home(tmp_path, ingest_server.url, n_events=3)
 
-    code = cli.main(["sync", "--bridge-home", str(home), "--allow-insecure-url"])
+    code = cli.main(["sync", "--flight-recorder-home", str(home), "--allow-insecure-url"])
 
     out = capsys.readouterr().out
     assert code == 0
@@ -98,7 +98,7 @@ def test_sync_ships_and_reports_summary(tmp_path, ingest_server, capsys):
 
 def test_second_sync_ships_nothing(tmp_path, ingest_server, capsys):
     home = prepared_home(tmp_path, ingest_server.url, n_events=2)
-    args = ["sync", "--bridge-home", str(home), "--allow-insecure-url"]
+    args = ["sync", "--flight-recorder-home", str(home), "--allow-insecure-url"]
 
     assert cli.main(args) == 0
     capsys.readouterr()
@@ -115,7 +115,7 @@ def test_sync_uses_batch_limits_from_recorder_config(tmp_path, ingest_server, ca
         json.dumps({"sync": {"max_records": 1}})
     )
 
-    code = cli.main(["sync", "--bridge-home", str(home), "--allow-insecure-url"])
+    code = cli.main(["sync", "--flight-recorder-home", str(home), "--allow-insecure-url"])
 
     assert code == 0
     assert ingest_server.request_count == 3
@@ -124,14 +124,14 @@ def test_sync_uses_batch_limits_from_recorder_config(tmp_path, ingest_server, ca
 
 
 def test_sync_uninitialized_outbox_is_config_error(tmp_path, capsys):
-    code = cli.main(["sync", "--bridge-home", str(tmp_path)])
+    code = cli.main(["sync", "--flight-recorder-home", str(tmp_path)])
     assert code == 2
     assert "not initialized" in capsys.readouterr().err
 
 
 def test_sync_without_config_is_config_error(tmp_path, capsys):
     open_ready_outbox(tmp_path).close()  # initialized, but no sync-config.json
-    code = cli.main(["sync", "--bridge-home", str(tmp_path)])
+    code = cli.main(["sync", "--flight-recorder-home", str(tmp_path)])
     assert code == 2
     assert "not configured" in capsys.readouterr().err
 
@@ -140,7 +140,7 @@ def test_sync_rejects_plaintext_url_without_flag(tmp_path, ingest_server, capsys
     home = prepared_home(tmp_path, ingest_server.url)  # an http:// url
     # No --allow-insecure-url: HttpsTransport refuses the plaintext endpoint.
     with pytest.raises(Exception):
-        cli.main(["sync", "--bridge-home", str(home)])
+        cli.main(["sync", "--flight-recorder-home", str(home)])
 
 
 # --------------------------------------------------------------------------
@@ -198,7 +198,7 @@ def test_interval_loop_runs_then_stops(tmp_path, ingest_server, capsys, monkeypa
 
     monkeypatch.setattr(cli.time, "sleep", fake_sleep)
     code = cli.main(
-        ["sync", "--bridge-home", str(home), "--allow-insecure-url", "--interval", "5"]
+        ["sync", "--flight-recorder-home", str(home), "--allow-insecure-url", "--interval", "5"]
     )
 
     assert code == 0

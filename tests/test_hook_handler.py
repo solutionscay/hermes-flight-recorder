@@ -6,7 +6,7 @@ generated ``handler.py`` by path (as Hermes' loader does) and drive its
 depends on: one newline-terminated JSON line per event with
 ``event_type``/``context``/``captured_at``; that it NEVER raises (even on an
 unserializable context or an unwritable spool); the over-cap drop; and that
-failures are logged to the Bridge-side error log.
+failures are logged to the Flight Recorder-side error log.
 """
 
 from __future__ import annotations
@@ -20,12 +20,12 @@ from hermes_flight_recorder.collector.hook import ERRLOG_FILENAME, SPOOL_FILENAM
 from hermes_flight_recorder.collector.hook.install import install_hook
 
 
-def load_handler(tmp_path: Path, monkeypatch, bridge_home: Path | None = None) -> ModuleType:
+def load_handler(tmp_path: Path, monkeypatch, flight_recorder_home: Path | None = None) -> ModuleType:
     """Install the hook and import the generated handler.py by path."""
-    bridge = bridge_home or (tmp_path / "bridge")
+    bridge = flight_recorder_home or (tmp_path / "bridge")
     hook_dir = install_hook(tmp_path / "hermes", bridge)
     # Force the handler onto our bridge home regardless of any ambient env.
-    monkeypatch.setenv("BRIDGE_HOME", str(bridge))
+    monkeypatch.setenv("SC_HERMES_FLIGHT_RECORDER_HOME", str(bridge))
     spec = importlib.util.spec_from_file_location("gen_handler", hook_dir / "handler.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -75,7 +75,7 @@ def test_handle_never_raises_when_spool_path_unwritable(tmp_path: Path, monkeypa
     (bridge / SPOOL_FILENAME).mkdir()
     handler = load_handler(tmp_path, monkeypatch, bridge)
     handler.handle("session:start", {"session_id": "s1"})  # must not raise
-    # The failure is recorded Bridge-side.
+    # The failure is recorded Flight Recorder-side.
     errlog = bridge / ERRLOG_FILENAME
     assert errlog.exists() and "handler error" in errlog.read_text()
 
@@ -93,11 +93,11 @@ def test_over_cap_drops_event_and_logs(tmp_path: Path, monkeypatch) -> None:
     assert "dropped agent:start" in (bridge / ERRLOG_FILENAME).read_text()
 
 
-def test_runtime_bridge_home_env_overrides_baked(tmp_path: Path, monkeypatch) -> None:
-    # Install baking one home, then point BRIDGE_HOME at another at runtime.
+def test_runtime_flight_recorder_home_env_overrides_baked(tmp_path: Path, monkeypatch) -> None:
+    # Install baking one home, then point SC_HERMES_FLIGHT_RECORDER_HOME at another at runtime.
     hook_dir = install_hook(tmp_path / "hermes", tmp_path / "baked")
     other = tmp_path / "other"
-    monkeypatch.setenv("BRIDGE_HOME", str(other))
+    monkeypatch.setenv("SC_HERMES_FLIGHT_RECORDER_HOME", str(other))
     spec = importlib.util.spec_from_file_location("gen_handler2", hook_dir / "handler.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
