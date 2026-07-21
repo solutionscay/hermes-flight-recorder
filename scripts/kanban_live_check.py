@@ -43,11 +43,15 @@ from _gate import run_gate
 from hermes_flight_recorder.collector import kanban_db
 from hermes_flight_recorder.collector._common import (
     kanban_board_dbs,
-    open_sqlite_read_only,
     resolve_hermes_home,
 )
 from hermes_flight_recorder.collector.outbox import Outbox
-from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
+from hermes_flight_recorder.collector.reconcile import (
+    ReconcileConfig,
+    _lease_is_dead,
+    _load_open_task_runs,
+    reconcile,
+)
 
 VERBOSE = "-v" in sys.argv[1:]
 
@@ -83,44 +87,9 @@ def _terminal_missing_runs(ob: Outbox) -> list[dict]:
     ]
 
 
-def _open_runs(home: Path) -> list[dict]:
-    """Every still-open attempt (``outcome`` NULL) across all boards, with its
-    lease fields — read-only, the same rows the detector judges."""
-    runs: list[dict] = []
-    for board, db_path in kanban_board_dbs(home):
-        conn = open_sqlite_read_only(db_path)
-        try:
-            rows = conn.execute(
-                "SELECT id, claim_lock, claim_expires, last_heartbeat_at "
-                "FROM task_runs WHERE outcome IS NULL"
-            ).fetchall()
-        finally:
-            conn.close()
-        for r in rows:
-            runs.append(
-                {
-                    "board": board,
-                    "id": r["id"],
-                    "claim_lock": r["claim_lock"],
-                    "claim_expires": r["claim_expires"],
-                    "last_heartbeat_at": r["last_heartbeat_at"],
-                }
-            )
-    return runs
-
-
-def _would_fire(run: dict, when: float, cfg: ReconcileConfig) -> bool:
-    """Whether the stale-lease detector would flag this open run at ``when`` —
-    mirrors ``_detect_stale_task_leases`` so a *healthy* run is told from a
-    genuinely dead one without re-running the reconciler."""
-    expires = run["claim_expires"]
-    if expires is None or when - expires <= cfg.task_lease_grace:
-        return False
-    hb = run["last_heartbeat_at"]
-    if hb is not None and when - hb <= cfg.task_heartbeat_stale_after:
-        return False
-    return True
-
+# The live board is judged by the reconciler's own loader and predicate
+# (_load_open_task_runs / _lease_is_dead), so the check validates the exact
+# rows and boundary the detector uses rather than a copy that could drift.
 
 # --- Leg A: live, read-only ----------------------------------------------
 def leg_a_live_readonly(home: Path, tmp: Path) -> list[str]:
@@ -135,8 +104,8 @@ def leg_a_live_readonly(home: Path, tmp: Path) -> list[str]:
     before = {db_path: db_path.read_bytes() for _, db_path in boards}
     when = time.time()
     cfg = ReconcileConfig()
-    open_runs = _open_runs(home)
-    healthy = {(r["board"], r["id"]) for r in open_runs if not _would_fire(r, when, cfg)}
+    open_runs = _load_open_task_runs(home)
+    healthy = {(r["board"], r["id"]) for r in open_runs if not _lease_is_dead(r, when, cfg)}
 
     ob = Outbox.open(tmp / "bridge")
     ob.initialize()
@@ -239,7 +208,7 @@ def leg_b_real_cli(home: Path, tmp: Path) -> list[str]:
         return fails
 
     # Read the genuine open run the CLI just wrote (read-only).
-    open_runs = _open_runs(disposable)
+    open_runs = _load_open_task_runs(disposable)
     if not open_runs:
         _note("Leg B: claim produced no open task_runs row — skipped")
         return fails
