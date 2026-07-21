@@ -37,6 +37,8 @@ from .envelope import (
     RECONCILE_FINDING_TYPES as FINDING_TYPES,
     SESSION_START_TYPES,
     SESSION_TERMINAL_TYPES,
+    TASK_EVENT_TYPES,
+    TASK_TERMINAL_TYPES,
 )
 
 __all__ = [
@@ -355,30 +357,12 @@ def _finding_detail(record: dict[str, Any]) -> str:
 
 
 # --- kanban view --------------------------------------------------------
-# The reserved task.* lifecycle events this view groups. The five task-level
-# transitions plus the per-attempt terminal; kanban_db.poll emits exactly these.
-_TASK_EVENT_TYPES = frozenset(
-    {
-        "task.created",
-        "task.claimed",
-        "task.completed",
-        "task.blocked",
-        "task.failed_terminal",
-        "task.attempt_ended",
-    }
-)
-# The task terminals — the transitions an operator reads to explain where a task
-# came to rest. task.blocked is recoverable; the other two are final. All three
-# are shown under "terminals" per the observe contract.
-_TASK_TERMINAL_TYPES = ("task.completed", "task.blocked", "task.failed_terminal")
-
-
 def render_kanban(records: Iterable[dict[str, Any]]) -> list[str]:
     """Per-task board view: status, current lease, and the attempt timeline."""
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for r in records:
         p = r.get("payload", {})
-        if p.get("event_type") not in _TASK_EVENT_TYPES:
+        if p.get("event_type") not in TASK_EVENT_TYPES:
             continue
         key = (p.get("board") or "-", p.get("task_id") or "-")
         groups.setdefault(key, []).append(r)
@@ -418,16 +402,27 @@ def _render_task(
         elif p["event_type"] == "task.attempt_ended":
             ends[rid] = p
 
-    # Latest status: the tasks.status snapshot on the newest task-level event.
-    lifecycle = [r for r in rows if r["payload"]["event_type"] != "task.attempt_ended"]
-    status = "?"
-    if lifecycle:
-        status = lifecycle[-1]["payload"].get("status") or "?"
+    # Latest status: the tasks.status snapshot on the newest task-level event
+    # (rows are ascending, so the last non-attempt event is the newest).
+    status = next(
+        (
+            r["payload"].get("status") or "?"
+            for r in reversed(rows)
+            if r["payload"]["event_type"] != "task.attempt_ended"
+        ),
+        "?",
+    )
     lines.append(f"▣ task {task_id}  [{status}]  board={board}")
 
-    # Current holder + lease: the newest event carrying a holder. It is still
+    # Current holder + lease: the newest event carrying a holder. Attempt events
+    # are appended in run-id order, not chronological order, so pick by
+    # occurred_at (tie-broken by stream position), not the last row. It is still
     # held only when that event is an open claim (no attempt_ended for its run).
-    holder_ev = _latest_with(rows, "holder")
+    holder_ev = max(
+        (r for r in rows if r["payload"].get("holder") is not None),
+        key=lambda r: (_as_float(r.get("occurred_at")), _stream_key(r)),
+        default=None,
+    )
     if holder_ev is not None:
         p = holder_ev["payload"]
         rid = p.get("run_id")
@@ -448,29 +443,11 @@ def _render_task(
                 outcome = "running"
             lines.append(f"      run {rid}  {holder}  {outcome}")
 
-    terminals = [r for r in rows if r["payload"]["event_type"] in _TASK_TERMINAL_TYPES]
+    terminals = [r for r in rows if r["payload"]["event_type"] in TASK_TERMINAL_TYPES]
     if terminals:
         lines.append("    terminals:")
         for t in terminals:
             lines.append(f"      {_task_terminal_detail(t['payload'])}")
-
-
-def _latest_with(rows: list[dict[str, Any]], field: str) -> dict[str, Any] | None:
-    """The most recent record (by ``occurred_at``) whose payload has ``field``.
-
-    Attempt events are appended in run-id order, not chronological order, so
-    the newest lease is the one with the latest ``occurred_at``, tie-broken by
-    stream position — not simply the last row in producer_sequence.
-    """
-    found: dict[str, Any] | None = None
-    best: tuple[float, tuple] | None = None
-    for r in rows:
-        if r["payload"].get(field) is None:
-            continue
-        key = (_as_float(r.get("occurred_at")), _stream_key(r))
-        if best is None or key >= best:
-            found, best = r, key
-    return found
 
 
 def _task_terminal_detail(payload: dict[str, Any]) -> str:
