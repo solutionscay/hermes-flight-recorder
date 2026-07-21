@@ -1,4 +1,4 @@
-"""Tests for the Bridge-side drain event mapping (issue #4).
+"""Tests for the Flight Recorder-side drain event mapping (issue #4).
 
 The drain reads raw spool lines and produces canonical envelope v1 records.
 These write spool lines directly (independent of the in-gateway handler) and
@@ -19,33 +19,33 @@ from hermes_flight_recorder.collector.hook import SPOOL_FILENAME, drain
 from hermes_flight_recorder.collector.outbox import Outbox
 
 
-def new_outbox(bridge_home: Path) -> Outbox:
-    ob = Outbox.open(bridge_home)
+def new_outbox(flight_recorder_home: Path) -> Outbox:
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     return ob
 
 
-def write_spool(bridge_home: Path, events: list[tuple[str, dict, float]]) -> None:
+def write_spool(flight_recorder_home: Path, events: list[tuple[str, dict, float]]) -> None:
     """Write (event_type, context, captured_at) tuples as the whole spool file."""
     lines = [
         json.dumps({"event_type": et, "context": ctx, "captured_at": ts})
         for et, ctx, ts in events
     ]
-    (bridge_home / SPOOL_FILENAME).write_text("\n".join(lines) + "\n")
+    (flight_recorder_home / SPOOL_FILENAME).write_text("\n".join(lines) + "\n")
 
 
-def append_spool(bridge_home: Path, events: list[tuple[str, dict, float]]) -> None:
+def append_spool(flight_recorder_home: Path, events: list[tuple[str, dict, float]]) -> None:
     """Append tuples to an existing spool file, as the real spooler does."""
     lines = [
         json.dumps({"event_type": et, "context": ctx, "captured_at": ts})
         for et, ctx, ts in events
     ]
-    with open(bridge_home / SPOOL_FILENAME, "a") as fh:
+    with open(flight_recorder_home / SPOOL_FILENAME, "a") as fh:
         fh.write("\n".join(lines) + "\n")
 
 
-def drain_to_records(bridge_home: Path) -> list[dict]:
-    ob = new_outbox(bridge_home)
+def drain_to_records(flight_recorder_home: Path) -> list[dict]:
+    ob = new_outbox(flight_recorder_home)
     drain(ob)
     records = list(ob.iter_events())
     ob.close()

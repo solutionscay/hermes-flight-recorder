@@ -4,7 +4,7 @@ The sync client needs the ingestion URL and a Cloudflare Access service
 token (a client id and a client secret). Ingestion protocol v1 authenticates
 at the edge with these two headers, not with a field in the request body.
 
-The credential lives in the **Bridge** home, next to the outbox and the
+The credential lives in the **Flight Recorder** home, next to the outbox and the
 content key, and never under the Hermes home. A process may also supply any
 field from the environment, which takes priority over the file so an operator
 can inject a secret without writing it to disk:
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._common import default_bridge_home
+from ._common import default_flight_recorder_home
 
 CONFIG_FILENAME = "sync-config.json"
 
@@ -57,9 +57,9 @@ class SyncConfig:
         }
 
 
-def config_path(bridge_home: str | os.PathLike[str] | None = None) -> Path:
-    """The path of the sync config file inside the Bridge home."""
-    home = Path(bridge_home).expanduser() if bridge_home else default_bridge_home()
+def config_path(flight_recorder_home: str | os.PathLike[str] | None = None) -> Path:
+    """The path of the sync config file inside the Flight Recorder home."""
+    home = Path(flight_recorder_home).expanduser() if flight_recorder_home else default_flight_recorder_home()
     return home / CONFIG_FILENAME
 
 
@@ -75,13 +75,13 @@ def _read_file(path: Path) -> dict[str, Any]:
     return data
 
 
-def load(bridge_home: str | os.PathLike[str] | None = None) -> SyncConfig:
+def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> SyncConfig:
     """Load the sync config, with the environment overriding the file.
 
     Raise :class:`SyncConfigError` when a required field is missing from both
     the environment and the file.
     """
-    data = _read_file(config_path(bridge_home))
+    data = _read_file(config_path(flight_recorder_home))
 
     ingest_url = os.environ.get(_ENV_INGEST_URL) or data.get("ingest_url")
     client_id = os.environ.get(_ENV_CLIENT_ID) or data.get("cf_access_client_id")
@@ -111,14 +111,14 @@ def load(bridge_home: str | os.PathLike[str] | None = None) -> SyncConfig:
 
 
 def save(
-    config: SyncConfig, bridge_home: str | os.PathLike[str] | None = None
+    config: SyncConfig, flight_recorder_home: str | os.PathLike[str] | None = None
 ) -> Path:
-    """Write the sync config to the Bridge home with mode ``0600``.
+    """Write the sync config to the Flight Recorder home with mode ``0600``.
 
-    The secret never leaves the Bridge home. The file is created private and
+    The secret never leaves the Flight Recorder home. The file is created private and
     kept private on rewrite.
     """
-    path = config_path(bridge_home)
+    path = config_path(flight_recorder_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "ingest_url": config.ingest_url,

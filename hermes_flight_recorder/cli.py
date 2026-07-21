@@ -1,4 +1,4 @@
-"""Command-line entry point for the Bridge companion.
+"""Command-line entry point for the Flight Recorder companion.
 
 Subcommands land across the Phase 0 steps. ``init`` creates the local
 outbox and mints the installation identity. ``run`` polls the durable
@@ -44,7 +44,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     from .collector.hook import install_hook
     from .collector.outbox import Outbox
 
-    outbox = Outbox.open(args.bridge_home)
+    outbox = Outbox.open(args.flight_recorder_home)
     try:
         installation_id = outbox.initialize()
         print(f"outbox:          {outbox.path}")
@@ -66,7 +66,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     from .collector import run_pass
     from .collector.outbox import Outbox
 
-    outbox = Outbox.open(args.bridge_home)
+    outbox = Outbox.open(args.flight_recorder_home)
     try:
         if not _check_initialized(outbox):
             return 2
@@ -90,7 +90,7 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
     from .collector.outbox import Outbox
     from .collector.reconcile import reconcile
 
-    outbox = Outbox.open(args.bridge_home)
+    outbox = Outbox.open(args.flight_recorder_home)
     try:
         if not _check_initialized(outbox):
             return 2
@@ -117,7 +117,7 @@ def _cmd_observe(args: argparse.Namespace) -> int:
             print(str(exc), file=sys.stderr)
             return 2
 
-    outbox = Outbox.open(args.bridge_home)
+    outbox = Outbox.open(args.flight_recorder_home)
     try:
         if not _check_initialized(outbox):
             return 2
@@ -210,14 +210,14 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     from .collector.outbox import Outbox
     from .collector.transport import HttpsTransport, RetryingTransport
 
-    outbox = Outbox.open(args.bridge_home)
+    outbox = Outbox.open(args.flight_recorder_home)
     try:
         if not _check_initialized(outbox):
             return _SYNC_CONFIG
 
         try:
-            config = sync_config.load(args.bridge_home)
-            runtime_config = recorder_config.load(args.bridge_home)
+            config = sync_config.load(args.flight_recorder_home)
+            runtime_config = recorder_config.load(args.flight_recorder_home)
         except (
             sync_config.SyncConfigError,
             recorder_config.RecorderConfigError,
@@ -260,9 +260,9 @@ def _home_options(*, hermes: bool = False) -> argparse.ArgumentParser:
     """A parent parser carrying the data-directory options every subcommand shares."""
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument(
-        "--bridge-home",
+        "--flight-recorder-home",
         default=None,
-        help="Bridge data directory (default: $BRIDGE_HOME or ~/.hermes-flight-recorder).",
+        help="Flight Recorder data directory (default: $SC_HERMES_FLIGHT_RECORDER_HOME or ~/.hermes-flight-recorder).",
     )
     if hermes:
         parent.add_argument(
@@ -276,7 +276,7 @@ def _home_options(*, hermes: bool = False) -> argparse.ArgumentParser:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hermes-flight-recorder",
-        description="Bridge — the local-first companion for Hermes Flight Recorder.",
+        description="Hermes Flight Recorder — the local-first companion for Hermes agents.",
     )
     parser.add_argument(
         "--version",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 0 POC exit-gate — capture, reconcile, observe end to end (issue #8).
 
-Runs the whole Bridge pipeline against a throwaway, synthetic-but-schema-
+Runs the whole Flight Recorder pipeline against a throwaway, synthetic-but-schema-
 accurate Hermes home and proves the Phase 0 claim: **loss is detectable.**
 Four scenarios, each on its own disposable outbox:
 
@@ -10,7 +10,7 @@ Four scenarios, each on its own disposable outbox:
                       one `reconcile.gap_detected` (sequence hole); report exit != 0.
 3. Missed cron      — a scheduled fire with no execution row yields exactly one
                       `cron.run_missed`; report exit != 0.
-4. Bridge restart   — reopen the outbox; the `producer_sequence` high-water mark
+4. recorder restart   — reopen the outbox; the `producer_sequence` high-water mark
                       survives, and the next append continues with no reuse or gap.
 
 Determinism: a fixed `now` (no wall clock) and a fixed synthetic home, so the
@@ -138,9 +138,9 @@ def build_cron_store(home: Path, *, missed: bool = False) -> None:
     (cron / "jobs.json").write_text(json.dumps({"jobs": jobs}))
 
 
-def seed_spool(bridge: Path) -> None:
+def seed_spool(flight_recorder_home: Path) -> None:
     """The live hook spool for one Discord-style turn on session ``root``."""
-    bridge.mkdir(parents=True, exist_ok=True)
+    flight_recorder_home.mkdir(parents=True, exist_ok=True)
     events = [
         ("gateway:startup", {"platforms": ["cli"]}, NOW - 305),
         ("session:start", {"platform": "cli", "user_id": "u1", "session_id": "root", "session_key": "lane"}, NOW - 300),
@@ -149,17 +149,17 @@ def seed_spool(bridge: Path) -> None:
         ("session:end", {"platform": "cli", "user_id": "u1", "session_key": "lane"}, NOW - 60),
     ]
     lines = [json.dumps({"event_type": et, "context": ctx, "captured_at": ts}) for et, ctx, ts in events]
-    (bridge / SPOOL_FILENAME).write_text("\n".join(lines) + "\n")
+    (flight_recorder_home / SPOOL_FILENAME).write_text("\n".join(lines) + "\n")
 
 
 # --- pipeline helpers -----------------------------------------------------
 def build_home(tmp: Path, *, missed: bool = False) -> tuple[Path, Path]:
-    """The synthetic (bridge, hermes) homes every scenario starts from."""
-    bridge, hermes = tmp / "b", tmp / "h"
+    """The synthetic (flight_recorder_home, hermes) homes every scenario starts from."""
+    flight_recorder_home, hermes = tmp / "b", tmp / "h"
     build_state_db(hermes)
     build_cron_store(hermes, missed=missed)
-    seed_spool(bridge)
-    return bridge, hermes
+    seed_spool(flight_recorder_home)
+    return flight_recorder_home, hermes
 
 
 def report_code(ob: Outbox) -> tuple[list[str], int]:
@@ -199,9 +199,9 @@ def drop_event(ob_path: Path, event_type: str) -> int:
 # --- scenarios ------------------------------------------------------------
 def scenario_happy(tmp: Path) -> list[str]:
     fails: list[str] = []
-    bridge, hermes = build_home(tmp)
+    flight_recorder_home, hermes = build_home(tmp)
 
-    ob = Outbox.open(bridge)
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     run_pass(ob, hermes)
     findings = reconcile(ob, hermes, now=NOW, config=CFG)
@@ -220,17 +220,17 @@ def scenario_happy(tmp: Path) -> list[str]:
 
 def scenario_dropped_capture(tmp: Path) -> list[str]:
     fails: list[str] = []
-    bridge, hermes = build_home(tmp)
+    flight_recorder_home, hermes = build_home(tmp)
 
-    ob = Outbox.open(bridge)
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     run_pass(ob, hermes)
     ob.close()
 
     # Lose one live event (the hook's invocation.completed): a middle sequence.
-    missing = drop_event(bridge / "outbox.sqlite", "invocation.completed")
+    missing = drop_event(flight_recorder_home / "outbox.sqlite", "invocation.completed")
 
-    ob = Outbox.open(bridge)
+    ob = Outbox.open(flight_recorder_home)
     findings = reconcile(ob, hermes, now=NOW, config=CFG)
     show(ob, "dropped-capture")
     _, code = report_code(ob)
@@ -248,9 +248,9 @@ def scenario_dropped_capture(tmp: Path) -> list[str]:
 
 def scenario_missed_cron(tmp: Path) -> list[str]:
     fails: list[str] = []
-    bridge, hermes = build_home(tmp, missed=True)
+    flight_recorder_home, hermes = build_home(tmp, missed=True)
 
-    ob = Outbox.open(bridge)
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     run_pass(ob, hermes)
     findings = reconcile(ob, hermes, now=NOW, config=CFG)
@@ -270,16 +270,16 @@ def scenario_missed_cron(tmp: Path) -> list[str]:
 
 def scenario_restart(tmp: Path) -> list[str]:
     fails: list[str] = []
-    bridge, hermes = build_home(tmp)
+    flight_recorder_home, hermes = build_home(tmp)
 
-    ob = Outbox.open(bridge)
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     run_pass(ob, hermes)
     hw, n, inst = ob.high_water(), ob.count(), ob.installation_id
-    ob.close()  # simulate the Bridge process stopping
+    ob.close()  # simulate the recorder process stopping
 
     # Reopen — a fresh process/handle onto the same durable outbox.
-    ob = Outbox.open(bridge)
+    ob = Outbox.open(flight_recorder_home)
     if ob.high_water() != hw:
         fails.append(f"restart: high-water {ob.high_water()} != pre-restart {hw}")
     if ob.installation_id != inst:
@@ -290,7 +290,7 @@ def scenario_restart(tmp: Path) -> list[str]:
     # A new capture appends to the durable spool; the drain continues from the
     # persisted cursor (which survived the restart), so the sequence continues
     # with no reuse, no gap, and no duplicate.
-    with open(bridge / SPOOL_FILENAME, "a", encoding="utf-8") as fh:
+    with open(flight_recorder_home / SPOOL_FILENAME, "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"event_type": "gateway:startup", "context": {"platforms": []}, "captured_at": NOW}) + "\n")
     drain_hook(ob)
     if ob.high_water() != hw + 1:
@@ -305,7 +305,7 @@ SCENARIOS = [
     ("happy path", scenario_happy),
     ("dropped capture", scenario_dropped_capture),
     ("missed cron", scenario_missed_cron),
-    ("bridge restart", scenario_restart),
+    ("recorder restart", scenario_restart),
 ]
 
 

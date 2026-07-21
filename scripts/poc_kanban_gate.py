@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 2 POC Kanban gate — capture, reconcile, detect a dead attempt (issue #56).
 
-Runs the Kanban slice of the Bridge pipeline against a throwaway, synthetic-
+Runs the Kanban slice of the Flight Recorder pipeline against a throwaway, synthetic-
 but-schema-accurate ``kanban.db`` and proves the Phase 2 claim: **a claimed-
 then-abandoned attempt is detectable.** Three scenarios, each on its own
 disposable outbox:
@@ -11,7 +11,7 @@ disposable outbox:
 2. Abandoned claim  — an open ``task_runs`` row whose ``claim_expires`` lapsed
                       past the grace with a dead heartbeat yields exactly one
                       ``reconcile.terminal_missing`` with ``subject_type='task_run'``.
-3. Bridge restart   — reopen the outbox: the ``producer_sequence`` high-water
+3. recorder restart   — reopen the outbox: the ``producer_sequence`` high-water
                       mark survives, and a second reconcile over the same durable
                       state appends nothing new (idempotent, one finding total).
 
@@ -185,21 +185,21 @@ def scenario_restart(tmp: Path) -> list[str]:
     fails: list[str] = []
     home = tmp / "h"
     build_kanban(home, abandoned=True)
-    bridge = tmp / "b"
+    flight_recorder_home = tmp / "b"
 
-    ob = Outbox.open(bridge)
+    ob = Outbox.open(flight_recorder_home)
     ob.initialize()
     kanban_db.poll(ob, home)
     reconcile(ob, home, now=NOW, config=CFG)
     hw, n, inst = ob.high_water(), ob.count(), ob.installation_id
     before = len(terminal_missing(ob))
-    ob.close()  # simulate the Bridge process stopping
+    ob.close()  # simulate the recorder process stopping
 
     if before != 1:
         fails.append(f"restart: pre-restart stream has {before} terminal_missing, want 1")
 
     # Reopen — a fresh process/handle onto the same durable outbox.
-    ob = Outbox.open(bridge)
+    ob = Outbox.open(flight_recorder_home)
     if ob.high_water() != hw:
         fails.append(f"restart: high-water {ob.high_water()} != pre-restart {hw}")
     if ob.installation_id != inst:
@@ -226,7 +226,7 @@ def scenario_restart(tmp: Path) -> list[str]:
 SCENARIOS = [
     ("healthy board", scenario_healthy),
     ("abandoned claim", scenario_abandoned),
-    ("bridge restart", scenario_restart),
+    ("recorder restart", scenario_restart),
 ]
 
 

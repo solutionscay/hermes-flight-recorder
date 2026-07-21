@@ -31,7 +31,7 @@ Four scenarios, each on its own disposable outbox:
 | **Happy path** | none | a full session (live hook + durable poll) reconciles clean; `observe --report` exits **0** |
 | **Dropped capture** | delete one captured event (a hook `invocation.completed`) | reconciler finds **exactly one** `reconcile.gap_detected` (`gap_kind=sequence`) pointing at the lost `producer_sequence`; report exits **≠ 0** |
 | **Missed cron** | a 1-minute interval job with an expected fire that has no execution row | **exactly one** `cron.run_missed` for that job; report exits **≠ 0** |
-| **Bridge restart** | close and reopen the outbox mid-run | the `producer_sequence` high-water mark and `installation_id` survive; the next capture continues the sequence with no reuse, gap, or duplicate |
+| **recorder restart** | close and reopen the outbox mid-run | the `producer_sequence` high-water mark and `installation_id` survive; the next capture continues the sequence with no reuse, gap, or duplicate |
 
 ## Pass criteria
 
@@ -68,7 +68,7 @@ depend on elapsed time. This is unlike the fixed-clock gate above.
 `run` and the verbs above stay local. `sync` is the one step that reaches the
 network: it ships the pending outbox events to the ingestion service and
 advances a durable delivery cursor. Point it at an endpoint first — the URL and
-the Cloudflare Access service token live in the Bridge home (`sync-config.json`,
+the Cloudflare Access service token live in the Flight Recorder home (`sync-config.json`,
 mode `0600`) or in the environment, never in the Hermes home:
 
 ```bash
@@ -105,7 +105,7 @@ It exercises five scenarios:
 | **Dropped batch** | the connection closes before storage | The client resends the same batch and the final stream has no gap. |
 | **Duplicate delivery** | the server stores a batch, then loses its ack | The client resends it and the server deduplicates every event by `event_id`. |
 | **Offline then online** | one complete sync pass cannot reach the service | The cursor stays in place; the next pass catches up. |
-| **Restart mid-sync** | Bridge stops after storage but before the ack | A reopened outbox resumes at its last acknowledged cursor and safely resends the stored batch. |
+| **Restart mid-sync** | recorder stops after storage but before the ack | A reopened outbox resumes at its last acknowledged cursor and safely resends the stored batch. |
 
 Every scenario asserts that the server ledger contains each
 `producer_sequence` exactly once with no gap. It also checks the Access token

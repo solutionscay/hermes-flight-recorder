@@ -2,8 +2,8 @@
 
 _Status: frozen._
 
-The ingestion protocol is the wire contract between the Bridge companion (the
-client) and the hosted service (the server). The Bridge ships the events it
+The ingestion protocol is the wire contract between the local Hermes Flight Recorder
+client and the hosted service (the server). Hermes Flight Recorder ships the events it
 captured; the service ingests them into a durable, per-installation ledger.
 This repository owns the contract, next to the envelope it carries
 ([`envelope-v1.md`](envelope-v1.md)). The companion is the client of this
@@ -106,7 +106,7 @@ Authentication). The Worker does not produce these; the edge does.
 - **Advance rule.** After a `202`, and only then, the client advances its
   delivery cursor to the batch's maximum `producer_sequence`. On any non-2xx,
   the client does not advance the cursor.
-- **Resume.** After a Bridge restart, the client resumes from its persisted
+- **Resume.** After a recorder restart, the client resumes from its persisted
   delivery cursor. It may also read the server's `high_water` and re-ship any
   range above the cursor; re-shipping is idempotent, so this never harms.
 

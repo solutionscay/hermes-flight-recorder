@@ -1,12 +1,12 @@
 # Dev setup
 
-How to develop Bridge against a **dev** Hermes install, so you do not
+How to develop Hermes Flight Recorder against a **dev** Hermes install, so you do not
 touch your production agents.
 
 ## The golden rule
 
-Bridge attaches to a Hermes install and reads its durable state. **Never
-point Bridge at a production Hermes home.** Use a throwaway dev instance
+Hermes Flight Recorder attaches to a Hermes install and reads its durable state. **Never
+point Hermes Flight Recorder at a production Hermes home.** Use a throwaway dev instance
 you can wipe and reset freely.
 
 Hermes locates its home directory from the `HERMES_HOME` environment
@@ -36,7 +36,7 @@ You have two options:
 Whichever you pick, this must not be a home that any production agent
 uses.
 
-## 2. Install Bridge (editable)
+## 2. Install Hermes Flight Recorder (editable)
 
 From the repo root:
 
@@ -54,11 +54,11 @@ uv venv --python 3.11
 uv pip install -e .
 ```
 
-## 3. Point Bridge at the dev Hermes
+## 3. Point Hermes Flight Recorder at the dev Hermes
 
-Bridge reads the Hermes home the same way Hermes does — from
+Hermes Flight Recorder reads the Hermes home the same way Hermes does — from
 `HERMES_HOME`, and defaults to `~/.hermes`. Set it to the dev instance
-from step 1 when you run Bridge commands.
+from step 1 when you run Hermes Flight Recorder commands.
 
 `hermes-flight-recorder init` creates the outbox and installs the live
 capture hook under `$HERMES_HOME/hooks/`; restart the Hermes gateway to
@@ -68,9 +68,9 @@ load it. Then `run` drains the hook spool and polls the durable stores,
 ## Recorder configuration
 
 Optional non-secret operational settings live in
-`$BRIDGE_HOME/recorder-config.json` (or
-`~/.hermes-flight-recorder/recorder-config.json` when `BRIDGE_HOME` is not
-set). Bridge treats a missing file or missing key as its built-in default.
+`$SC_HERMES_FLIGHT_RECORDER_HOME/recorder-config.json` (or
+`~/.hermes-flight-recorder/recorder-config.json` when `SC_HERMES_FLIGHT_RECORDER_HOME` is not
+set). Hermes Flight Recorder treats a missing file or missing key as its built-in default.
 Environment variables take precedence over file values. The file is written
 with mode `0600` by `recorder_config.save`; create it with the same mode when
 managing it yourself.
@@ -113,7 +113,7 @@ variables, so credentials do not mix with operational configuration.
 
 ## Safety notes
 
-- **Bridge is read-only against Hermes state.** It reads `state.db` and
+- **Hermes Flight Recorder is read-only against Hermes state.** It reads `state.db` and
   the cron execution database; it does not write to them. Its only write
   into the Hermes home is the event hook it installs under
   `$HERMES_HOME/hooks/`.

@@ -4,7 +4,7 @@ Components:
 
 - ``outbox``:    durable local SQLite queue with a monotonic
                  producer_sequence
-- ``hook``:      in-gateway spooler plus a Bridge-side drain for live
+- ``hook``:      in-gateway spooler plus a Flight Recorder-side drain for live
                  lifecycle capture
 - ``state_db``:  adapter that reads Hermes ``state.db`` into
                  canonical events

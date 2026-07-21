@@ -201,7 +201,7 @@ Do not add one global sequence. It is not needed and it makes a bottleneck.
   the outbox. One outbox is one installation. Multiple Hermes profiles
   under one home share one `installation_id`; `profile` is a separate
   field. For two runtimes that share one `HERMES_HOME`, give each its own
-  Bridge data directory, so each `init` makes its own id.
+  Flight Recorder data directory, so each `init` makes its own id.
 - **Defaulting.** Normalize a NULL or absent `profile` and `tenant_id` to
   `"default"`, never `"unknown"`.
 

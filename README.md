@@ -4,16 +4,16 @@
 
 Hermes Flight Recorder records what your agents did, what failed, and where the record is incomplete. It runs beside Hermes, keeps working when the network is down, and encrypts sensitive captured content before it leaves the machine.
 
-Bridge—the local companion in this repository—captures Hermes activity into a durable, append-only event log. It can reconcile that log against Hermes state, so missing events and failed work are visible instead of silently disappearing.
+Hermes Flight Recorder captures Hermes activity into a durable, append-only event log. It can reconcile that log against Hermes state, so missing events and failed work are visible instead of silently disappearing.
 
 ## Local first. Cloud optional.
 
-Bridge is useful on its own: capture, inspect, reconcile, and keep the data local.
+It is useful on its own: capture, inspect, reconcile, and keep the data local.
 
 For a shared fleet view, it can sync encrypted event envelopes to **Hermes DBaaS**, the hosted control plane at `hermesdbass.com`. The ingestion protocol is open, so you can also run your own compatible backend.
 
 ```text
-Hermes → Bridge → local encrypted event log → Hermes DBaaS or your backend
+Hermes → local encrypted event log → Hermes DBaaS or your backend
 ```
 
 The cloud is never in an agent's critical path.
@@ -46,6 +46,6 @@ hermes-flight-recorder observe --tree
 
 ## Status
 
-Work in progress; not production-ready. Bridge, the Hermes hook, and the protocol documents are Apache-2.0. Hermes DBaaS is a separate hosted product.
+Work in progress; not production-ready. Flight Recorder, the Hermes hook, and the protocol documents are Apache-2.0. Hermes DBaaS is a separate hosted product.
 
 Read the [development setup](docs/dev-setup.md), [event envelope](docs/schema/envelope-v1.md), and [ingestion protocol](docs/schema/ingestion-protocol-v1.md) for the technical detail.

@@ -2,7 +2,7 @@
 
 ``terminal.home_mode`` (``auto`` | ``real`` | ``profile``, default ``auto``)
 is the Hermes policy that decides where tools run and which git identity they
-use. Bridge captures it as plaintext operational metadata on the runtime
+use. Hermes Flight Recorder captures it as plaintext operational metadata on the runtime
 stamp of Hermes-runtime poll events — never the resolved home path, which is
 sensitive content. The reader is a standard-library scanner (the project
 declares no YAML dependency).

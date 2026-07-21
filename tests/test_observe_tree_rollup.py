@@ -214,7 +214,7 @@ def test_cli_tree_end_to_end_renders_exact_rollup(tmp_path, capsys):
                                      "estimated_cost_usd": 0.0029})
     ob.close()
 
-    code = main(["observe", "--tree", "--bridge-home", bridge])
+    code = main(["observe", "--tree", "--flight-recorder-home", bridge])
     out = capsys.readouterr().out
     assert code == 0
     # own totals for root: 3/7 cost=$0.0011; subtree = 3+14=17, 7+2=9,

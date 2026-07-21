@@ -1,13 +1,13 @@
-"""Bridge-side drain for the live hook spool.
+"""Flight Recorder-side drain for the live hook spool.
 
 The in-gateway spooler appends one JSON line per Hermes lifecycle event to
-``hook-spool.jsonl``. This module runs in the Bridge environment and turns
+``hook-spool.jsonl``. This module runs in the Flight Recorder environment and turns
 those raw lines into canonical envelope v1 records: it maps each event,
 encrypts the content, assigns the ``producer_sequence`` via the outbox, and
 appends with a dedup key.
 
 Durability model (issue #4): at-least-once with dedup at the drain. The read
-cursor is a byte offset stored in the outbox meta. On a Bridge stop between
+cursor is a byte offset stored in the outbox meta. On a Flight Recorder stop between
 an append and the cursor commit, the next drain re-reads the same lines at
 the same byte offsets; the dedup key is the line's offset, so re-processing
 is idempotent (no duplicate row, no consumed sequence). A partial trailing
@@ -37,14 +37,14 @@ from .._common import append_and_count, build_record, gateway_runtime_stamp, run
 from . import CURSOR_NAME, SPOOL_FILENAME
 
 
-def drain(outbox: Any, bridge_home: str | Path | None = None) -> dict[str, int]:
+def drain(outbox: Any, flight_recorder_home: str | Path | None = None) -> dict[str, int]:
     """Drain new spool lines into the outbox. Returns per-type counts.
 
-    ``bridge_home`` defaults to the outbox's own home, so the spool and the
+    ``flight_recorder_home`` defaults to the outbox's own home, so the spool and the
     outbox always align. Only newly-created rows are counted (a dedup hit on
     re-drain does not count).
     """
-    home = Path(bridge_home) if bridge_home else Path(outbox.path).parent
+    home = Path(flight_recorder_home) if flight_recorder_home else Path(outbox.path).parent
     spool = home / SPOOL_FILENAME
     if not spool.exists():
         return {}
