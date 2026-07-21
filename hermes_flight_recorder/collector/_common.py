@@ -61,6 +61,36 @@ def gateway_starts_log_path(home: Path) -> Path:
     return home / "gateway-starts.log"
 
 
+def kanban_db_path(home: Path) -> Path:
+    """The legacy top-level board (board slug ``"default"``)."""
+    return home / "kanban.db"
+
+
+def kanban_boards_dir(home: Path) -> Path:
+    return home / "kanban" / "boards"
+
+
+def kanban_board_dbs(home: Path) -> list[tuple[str, Path]]:
+    """Every Kanban board as ``(slug, kanban.db path)``.
+
+    Hermes keeps one SQLite file per board under
+    ``<home>/kanban/boards/<slug>/kanban.db``, plus a legacy top-level
+    ``<home>/kanban.db`` reported as board ``"default"`` and listed first.
+    Only existing files are returned, so a home with no Kanban yields ``[]``.
+    """
+    boards: list[tuple[str, Path]] = []
+    legacy = kanban_db_path(home)
+    if legacy.exists():
+        boards.append(("default", legacy))
+    board_dir = kanban_boards_dir(home)
+    if board_dir.is_dir():
+        for child in sorted(board_dir.iterdir()):
+            db = child / "kanban.db"
+            if child.is_dir() and db.exists():
+                boards.append((child.name, db))
+    return boards
+
+
 def to_epoch(value: Any) -> float | None:
     """Normalize a Hermes timestamp to epoch seconds.
 

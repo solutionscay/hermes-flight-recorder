@@ -125,7 +125,7 @@ def _cmd_observe(args: argparse.Namespace) -> int:
         records = observe.load(outbox, session=args.session, since=since)
 
         # Default to the stream view when no view is selected.
-        views = [v for v in ("stream", "tree", "report") if getattr(args, v)]
+        views = [v for v in ("stream", "tree", "report", "kanban") if getattr(args, v)]
         if not views:
             views = ["stream"]
 
@@ -147,6 +147,10 @@ def _cmd_observe(args: argparse.Namespace) -> int:
                 for line in lines:
                     print(line)
                 exit_code = code
+            elif view == "kanban":
+                print("── kanban ──")
+                for line in observe.render_kanban(records):
+                    print(line)
     finally:
         outbox.close()
     return exit_code
@@ -290,7 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_obs = sub.add_parser(
         "observe",
-        help="Render the captured outbox locally: stream, tree, report (no network).",
+        help="Render the captured outbox locally: stream, tree, report, kanban (no network).",
         parents=[_home_options()],
     )
     p_obs.add_argument("--stream", action="store_true", help="Event stream in producer_sequence order.")
@@ -299,6 +303,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--report",
         action="store_true",
         help="Reconciler findings; exits non-zero when any exist.",
+    )
+    p_obs.add_argument(
+        "--kanban",
+        action="store_true",
+        help="Kanban task boards: status, lease, and per-attempt timeline.",
     )
     p_obs.add_argument("--session", default=None, help="Filter to one session/operation id.")
     p_obs.add_argument("--since", default=None, help="Keep events at/after an epoch or ISO timestamp.")

@@ -93,10 +93,23 @@ the `task_events.kind` together with the closing `task_runs.outcome`:
 | `task.failed_terminal` | kind `gave_up`/`block_loop_detected`, run outcome `gave_up` | Hermes's circuit breaker gave up after repeated crash/timeout/spawn failures (`consecutive_failures >= failure_limit`). Terminal. |
 
 `review` and `archived` are lifecycle states with no reserved event and are not
-captured as `task.*`; a later revision may add them additively. Per-run failure
-outcomes that feed the breaker — `crashed`, `timed_out`, `spawn_failed` — are
-attempt-level facts carried on the run's own terminal event, not task-level
-failures; only the breaker's final `gave_up` fails the task.
+captured as `task.*`; a later revision may add them additively.
+
+The five events above are **task-level**. An individual attempt — a `task_runs`
+row — has its own terminal that often does *not* end the task: a `crashed`,
+`timed_out`, or `spawn_failed` attempt feeds the circuit breaker and the task
+retries; a `reclaimed`, `stale`, or `rate_limited` attempt releases the task
+back to the queue. These attempt terminals are captured as a sixth event,
+**`task.attempt_ended`**, emitted once per ended run and keyed on `run_id`. Only
+the breaker's final `gave_up` fails the *task* (`task.failed_terminal`); every
+attempt on the way there is a `task.attempt_ended`. Its plaintext `payload`
+adds `run_id`, `run_outcome` (the raw `task_runs.outcome`), and
+`attempt_disposition` — `success` (`completed`), `failure` (`crashed` /
+`timed_out` / `spawn_failed` / `gave_up`), or `released` (`reclaimed` / `stale` /
+`rate_limited` / `blocked` / `scheduled`) — plus the attempt's `holder`,
+`claim_expires`, `worker_pid`, and `last_heartbeat_at`. An attempt's full
+history is therefore the `task.claimed` that opened it paired by `run_id` with
+the `task.attempt_ended` that closed it.
 
 Plaintext `payload` for every `task.*` event: `event_type`, `board` (slug;
 `"default"` for the legacy top-level DB), `task_id` (`t_<8hex>`), `status`,
@@ -130,12 +143,14 @@ tokens Hermes writes.
 `HERMES_KANBAN_CLAIM_TTL_SECONDS`). A live worker renews it by heartbeat; a
 one-hour heartbeat backstop reclaims even a live-but-stuck worker. When a lease
 lapses without a terminal, Hermes resets the task to `ready` and closes the run
-`reclaimed` — but if the Bridge is offline across that window, the reset can go
-uncaptured. The reconciler therefore treats a captured `task.claimed` whose
-`claim_expires` has passed, with a stale `last_heartbeat_at` and no captured
-terminal, as a `reconcile.terminal_missing` with `subject_type='task_run'`,
-dedup-keyed on `run_id` + `claim_expires` — a durable event time, never the
-reconcile-run clock.
+`reclaimed`. The reconciler judges this from the authoritative durable
+`task_runs` row — a run still open (`outcome` NULL) whose `claim_expires` has
+lapsed past a grace, with a `last_heartbeat_at` stale beyond the claim window,
+is a worker that died mid-attempt (a live worker renews `claim_expires` by
+heartbeat, so a lapsed lease is the death signal). It emits a
+`reconcile.terminal_missing` with `subject_type='task_run'`, dedup-keyed on
+`board` + `run_id` — the strictly-increasing per-board attempt id, stable across
+lease renewals, never the reconcile-run clock.
 
 ## Event-type surface
 
@@ -155,7 +170,7 @@ reconcile-run clock.
 `tool.approval_responded`, `delegation.delivered`, `delegation.progress`,
 `cron.definition_changed`, `command.invoked`, `handoff.state_changed`,
 `task.created`, `task.claimed`, `task.completed`, `task.blocked`,
-`task.failed_terminal`, `knowledge.record_written`,
+`task.failed_terminal`, `task.attempt_ended`, `knowledge.record_written`,
 `knowledge.record_compacted`.
 
 ## Ordering model
