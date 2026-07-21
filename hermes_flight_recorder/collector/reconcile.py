@@ -186,6 +186,7 @@ def _detect_coverage_gaps(outbox, events, home, exec_rows, counts, when):
             subject_type="execution", subject_id=r["id"],
             source_table="cron:executions.db", correlation_id=r["job_id"],
         )
+    _coverage_kanban(outbox, home, captured, counts, when)
     return session_rows, parent_map
 
 
@@ -236,12 +237,61 @@ def _coverage_model_usage(outbox, conn, parent_map, captured, counts, when) -> N
         )
 
 
+def _coverage_kanban(outbox, home, captured, counts, when) -> None:
+    """A durable Kanban task/run with no captured ``task.*`` event.
+
+    The Kanban analog of the session/execution coverage diff: every board's
+    ``tasks`` and ``task_runs`` rows are authoritative, so a row the live poll
+    never turned into a captured event is a dropped capture. The subject_id is
+    board-scoped (``board:id``) so equal ids across boards never collide and the
+    shared ``reconcile:cover:*`` dedup key stays unique per board.
+    """
+    for board, db_path in kanban_board_dbs(home):
+        conn = open_sqlite_read_only(db_path)
+        try:
+            present = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            tasks = (
+                conn.execute("SELECT id, session_id FROM tasks").fetchall()
+                if "tasks" in present else []
+            )
+            runs = (
+                conn.execute("SELECT id, task_id FROM task_runs").fetchall()
+                if "task_runs" in present else []
+            )
+        finally:
+            conn.close()
+        for r in tasks:
+            if (board, r["id"]) in captured["tasks"]:
+                continue
+            _emit_coverage(
+                outbox, counts, when,
+                subject_type="task", subject_id=f"{board}:{r['id']}",
+                source_table=f"kanban:{board}:tasks", correlation_id=r["id"],
+                session_id=r["session_id"],
+            )
+        for r in runs:
+            if (board, r["id"]) in captured["task_runs"]:
+                continue
+            _emit_coverage(
+                outbox, counts, when,
+                subject_type="task_run", subject_id=f"{board}:{r['id']}",
+                source_table=f"kanban:{board}:task_runs", correlation_id=r["task_id"],
+            )
+
+
 def _captured_subjects(events) -> dict[str, set]:
     """Index the captured stream by the durable subject each event covers."""
     sessions: set[str] = set()
     tool_messages: set[int] = set()
     model_usage: set[tuple] = set()
     executions: set[str] = set()
+    tasks: set[tuple] = set()
+    task_runs: set[tuple] = set()
     for e in events:
         pl = e.get("payload", {})
         et = pl.get("event_type")
@@ -258,11 +308,23 @@ def _captured_subjects(events) -> dict[str, set]:
             exid = pl.get("execution_id")
             if exid is not None:
                 executions.add(exid)
+        elif isinstance(et, str) and et.startswith("task."):
+            # Every task.* event carries board + task_id; task.claimed and
+            # task.attempt_ended additionally carry the owning run_id.
+            board = pl.get("board")
+            task_id = pl.get("task_id")
+            if board is not None and task_id is not None:
+                tasks.add((board, task_id))
+            run_id = pl.get("run_id")
+            if board is not None and run_id is not None:
+                task_runs.add((board, run_id))
     return {
         "sessions": sessions,
         "tool_messages": tool_messages,
         "model_usage": model_usage,
         "executions": executions,
+        "tasks": tasks,
+        "task_runs": task_runs,
     }
 
 
