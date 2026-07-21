@@ -6,7 +6,7 @@ read-only and prints what was captured. It never makes a network call and
 never decrypts ``content_ciphertext`` — only plaintext payload metadata and
 ``content_hash`` are shown.
 
-Three views:
+Four views:
 
 - **stream** — every event in (``installation_id``, ``producer_sequence``)
   order, one line each, with the key plaintext payload fields.
@@ -17,6 +17,11 @@ Three views:
   :data:`hermes_flight_recorder.envelope.RECONCILE_FINDING_TYPES`). Returns a
   non-zero exit code when any finding exists, zero when clean, so a script
   can gate on it.
+- **kanban** — the Kanban task boards built from the reserved ``task.*``
+  events: each task grouped by (``board``, ``task_id``) with its latest
+  status, current holder and lease state, the per-attempt timeline (each
+  ``task.claimed`` paired with its ``task.attempt_ended`` by ``run_id``),
+  and the task terminals. So an operator can explain a task's transitions.
 
 The render functions take a plain list of envelope records, so they are
 testable without an outbox. ``load()`` is the thin adapter that pulls and
@@ -32,6 +37,8 @@ from .envelope import (
     RECONCILE_FINDING_TYPES as FINDING_TYPES,
     SESSION_START_TYPES,
     SESSION_TERMINAL_TYPES,
+    TASK_EVENT_TYPES,
+    TASK_TERMINAL_TYPES,
 )
 
 __all__ = [
@@ -39,6 +46,7 @@ __all__ = [
     "render_stream",
     "render_tree",
     "render_report",
+    "render_kanban",
     "parse_since",
     "FINDING_TYPES",
 ]
@@ -346,6 +354,111 @@ def _finding_detail(record: dict[str, Any]) -> str:
         target = p.get("platform") or "gateway"
         return f"{target} failed to start: {p.get('reason_class')}"
     return str(p)
+
+
+# --- kanban view --------------------------------------------------------
+def render_kanban(records: Iterable[dict[str, Any]]) -> list[str]:
+    """Per-task board view: status, current lease, and the attempt timeline."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for r in records:
+        p = r.get("payload", {})
+        if p.get("event_type") not in TASK_EVENT_TYPES:
+            continue
+        key = (p.get("board") or "-", p.get("task_id") or "-")
+        groups.setdefault(key, []).append(r)
+
+    if not groups:
+        return ["(no kanban tasks captured)"]
+
+    lines: list[str] = []
+    for i, key in enumerate(sorted(groups)):
+        if i:
+            lines.append("")
+        _render_task(key, groups[key], lines)
+    return lines
+
+
+def _render_task(
+    key: tuple[str, str], records: list[dict[str, Any]], lines: list[str]
+) -> None:
+    board, task_id = key
+    rows = sorted(records, key=_stream_key)  # newest last, per producer_sequence
+
+    # Pair each attempt's claim with its end by run_id, and remember when each
+    # run first appears so the timeline reads oldest-first even though run ids
+    # are not chronological (a reclaimed early attempt can carry a higher id).
+    claims: dict[Any, dict[str, Any]] = {}
+    ends: dict[Any, dict[str, Any]] = {}
+    run_time: dict[Any, float] = {}
+    for r in rows:
+        p = r["payload"]
+        rid = p.get("run_id")
+        if rid is not None:
+            t = _as_float(r.get("occurred_at"))
+            if rid not in run_time or t < run_time[rid]:
+                run_time[rid] = t
+        if p["event_type"] == "task.claimed" and rid is not None:
+            claims[rid] = p
+        elif p["event_type"] == "task.attempt_ended":
+            ends[rid] = p
+
+    # Latest status: the tasks.status snapshot on the newest task-level event
+    # (rows are ascending, so the last non-attempt event is the newest).
+    status = next(
+        (
+            r["payload"].get("status") or "?"
+            for r in reversed(rows)
+            if r["payload"]["event_type"] != "task.attempt_ended"
+        ),
+        "?",
+    )
+    lines.append(f"▣ task {task_id}  [{status}]  board={board}")
+
+    # Current holder + lease: the newest event carrying a holder. Attempt events
+    # are appended in run-id order, not chronological order, so pick by
+    # occurred_at (tie-broken by stream position), not the last row. It is still
+    # held only when that event is an open claim (no attempt_ended for its run).
+    holder_ev = max(
+        (r for r in rows if r["payload"].get("holder") is not None),
+        key=lambda r: (_as_float(r.get("occurred_at")), _stream_key(r)),
+        default=None,
+    )
+    if holder_ev is not None:
+        p = holder_ev["payload"]
+        rid = p.get("run_id")
+        held = p["event_type"] == "task.claimed" and rid not in ends
+        expires = p.get("claim_expires")
+        lease = f"  expires={expires}" if expires is not None else ""
+        lines.append(f"    holder {p['holder']}  [{'held' if held else 'released'}]{lease}")
+
+    run_ids = sorted(set(claims) | set(ends), key=lambda rid: (run_time.get(rid, 0.0), rid))
+    if run_ids:
+        lines.append("    attempts:")
+        for rid in run_ids:
+            end = ends.get(rid)
+            holder = (end or claims.get(rid) or {}).get("holder", "?")
+            if end is not None:
+                outcome = f"{end.get('run_outcome', '?')}/{end.get('attempt_disposition', '?')}"
+            else:
+                outcome = "running"
+            lines.append(f"      run {rid}  {holder}  {outcome}")
+
+    terminals = [r for r in rows if r["payload"]["event_type"] in TASK_TERMINAL_TYPES]
+    if terminals:
+        lines.append("    terminals:")
+        for t in terminals:
+            lines.append(f"      {_task_terminal_detail(t['payload'])}")
+
+
+def _task_terminal_detail(payload: dict[str, Any]) -> str:
+    """One task terminal line: the event, plus the raw kind that explains it."""
+    et = payload["event_type"]
+    kind = payload.get("hermes_event_kind")
+    if et == "task.blocked" and payload.get("block_kind"):
+        return f"{et}  ({kind}, block_kind={payload['block_kind']})"
+    if kind:
+        return f"{et}  ({kind})"
+    return et
 
 
 # --- shared helpers -----------------------------------------------------
