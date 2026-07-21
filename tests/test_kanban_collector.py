@@ -25,7 +25,8 @@ _TASKS_DDL = (
 )
 _RUNS_DDL = (
     "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, claim_lock TEXT, "
-    "claim_expires INT, worker_pid INT, last_heartbeat_at INT, outcome TEXT)"
+    "claim_expires INT, worker_pid INT, last_heartbeat_at INT, started_at INT, "
+    "ended_at INT, outcome TEXT, profile TEXT, step_key TEXT)"
 )
 _EVENTS_DDL = (
     "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INT, "
@@ -52,10 +53,16 @@ def make_board(db_path) -> None:
         ],
     )
     db.executemany(
-        "INSERT INTO task_runs VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
-            (1, "t_aaaaaaaa", "host-1:100", 2000, 100, 1900, "completed"),
-            (2, "t_bbbbbbbb", "host-1:200", 1500, 200, None, "gave_up"),
+            # A first attempt on t_aaaaaaaa that was reclaimed (released), then a
+            # second that completed (success) — the retry history the task-level
+            # events alone do not show.
+            (3, "t_aaaaaaaa", "host-1:101", 1200, 101, None, 1000, 1005, "reclaimed", "default", None),
+            (1, "t_aaaaaaaa", "host-1:100", 2000, 100, 1900, 1010, 1050, "completed", "default", None),
+            (2, "t_bbbbbbbb", "host-1:200", 1500, 200, None, 1015, 1060, "gave_up", "default", None),
+            # A still-running attempt (outcome NULL) — skipped until it closes.
+            (4, "t_cccccccc", "host-1:300", 3000, 300, 2950, 1018, None, None, "default", None),
         ],
     )
     db.executemany(
@@ -101,6 +108,7 @@ def test_kanban_event_mapping(tmp_path):
         "task.completed": 1,
         "task.failed_terminal": 1,  # from gave_up, not the blocked status
         "task.blocked": 1,
+        "task.attempt_ended": 3,  # runs 1/2/3 ended; run 4 still running
     }
     for e in ob.iter_events():
         validate(e)
@@ -171,6 +179,79 @@ def test_blocked_carries_block_kind(tmp_path):
         e for e in ob.iter_events() if e["payload"]["event_type"] == "task.blocked"
     )
     assert blocked["payload"]["block_kind"] == "needs_input"
+
+
+def _attempts(outbox) -> dict:
+    return {
+        e["payload"]["run_id"]: e["payload"]
+        for e in outbox.iter_events()
+        if e["payload"]["event_type"] == "task.attempt_ended"
+    }
+
+
+def test_attempt_ended_disposition(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    make_board(hh / "kanban.db")
+    ob = new_outbox(tmp_path)
+    kanban_db.poll(ob, hh)
+
+    attempts = _attempts(ob)
+    assert attempts[1]["run_outcome"] == "completed"
+    assert attempts[1]["attempt_disposition"] == "success"
+    assert attempts[2]["run_outcome"] == "gave_up"
+    assert attempts[2]["attempt_disposition"] == "failure"
+    assert attempts[3]["run_outcome"] == "reclaimed"
+    assert attempts[3]["attempt_disposition"] == "released"
+
+
+def test_running_attempt_is_not_ended(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    make_board(hh / "kanban.db")
+    ob = new_outbox(tmp_path)
+    kanban_db.poll(ob, hh)
+    assert 4 not in _attempts(ob)  # run 4 has no outcome yet
+
+
+def test_attempt_ended_carries_fencing_and_lease(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    make_board(hh / "kanban.db")
+    ob = new_outbox(tmp_path)
+    kanban_db.poll(ob, hh)
+
+    ev = next(
+        e
+        for e in ob.iter_events()
+        if e["payload"]["event_type"] == "task.attempt_ended"
+        and e["payload"]["run_id"] == 2
+    )
+    p = ev["payload"]
+    assert p["run_id"] == 2  # the per-attempt fencing token
+    assert p["holder"] == "host-1:200"
+    assert p["claim_expires"] == 1500
+    assert ev["correlation_id"] == "t_bbbbbbbb"
+
+
+def test_running_attempt_ends_on_a_later_poll(tmp_path):
+    """A run captured while running gains its attempt_ended once it closes."""
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    db_path = hh / "kanban.db"
+    make_board(db_path)
+    ob = new_outbox(tmp_path)
+    kanban_db.poll(ob, hh)
+    assert 4 not in _attempts(ob)
+
+    # Hermes closes run 4; the next poll emits exactly its attempt_ended.
+    db = sqlite3.connect(db_path)
+    db.execute("UPDATE task_runs SET ended_at=2000, outcome='timed_out' WHERE id=4")
+    db.commit()
+    db.close()
+    second = kanban_db.poll(ob, hh)
+    assert second == {"task.attempt_ended": 1}
+    assert _attempts(ob)[4]["attempt_disposition"] == "failure"
 
 
 def test_repoll_is_idempotent(tmp_path):
