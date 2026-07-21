@@ -79,6 +79,89 @@ invisible to live capture, so the reconciler reads the durable
 `error_message` is sensitive and lives only in encrypted content. Liveness is
 never keyed off `updated_at` — a healthy idle gateway never advances it.
 
+**Phase 2 · Kanban task coordination (`task.*`):** Hermes ships a first-class
+Kanban kernel. Its board databases —
+`<HERMES_HOME>/kanban/boards/<slug>/kanban.db`, plus a legacy top-level
+`kanban.db` — hold `tasks`, `task_runs` (one row per claim attempt),
+`task_links` (a dependency DAG), and an append-only `task_events` audit log. The
+collector reads these read-only and maps them onto the five reserved `task.*`
+types. All coordination fields are plaintext metadata; task and result text are
+encrypted content (and, until the encrypted-content phase, simply omitted — that
+is Phase 3).
+
+State is **not** read from the `tasks.status` column alone, because Hermes
+overloads it: both a recoverable human/dependency block and a terminal
+circuit-breaker give-up land in `status='blocked'`. The authoritative signal is
+the `task_events.kind` together with the closing `task_runs.outcome`:
+
+| Event | Trigger (event kind / run outcome) | Meaning |
+|---|---|---|
+| `task.created` | kind `created` (parked in `triage`/`todo`/`ready`/`blocked` at creation) | A card exists and is queued. |
+| `task.claimed` | kind `claimed` (`ready`→`running`; a `task_runs` row opens). `claim_extended` renews the same claim — a lease update, not a new claim. | A worker took the task under a TTL lease. |
+| `task.completed` | kind `completed`, run outcome `completed`, status→`done` | The one success terminal. |
+| `task.blocked` | kinds `blocked`/`dependency_wait`/`scheduled`; run outcomes `reclaimed`/`stale`/`rate_limited` | Recoverable, non-terminal: awaiting human input, a parent dependency, a schedule, or released to the queue after a lease lapse. Not a failure. The inverse `unblocked` transition is not itself a `task.*` event — the task returns to the queue, and its next `claimed`/terminal event carries the progress. |
+| `task.failed_terminal` | kind `gave_up`/`block_loop_detected`, run outcome `gave_up` | Hermes's circuit breaker gave up after repeated crash/timeout/spawn failures (`consecutive_failures >= failure_limit`). Terminal. |
+
+`review` and `archived` are lifecycle states with no reserved event and are not
+captured as `task.*`; a later revision may add them additively.
+
+The five events above are **task-level**. An individual attempt — a `task_runs`
+row — has its own terminal that often does *not* end the task: a `crashed`,
+`timed_out`, or `spawn_failed` attempt feeds the circuit breaker and the task
+retries; a `reclaimed`, `stale`, or `rate_limited` attempt releases the task
+back to the queue. These attempt terminals are captured as a sixth event,
+**`task.attempt_ended`**, emitted once per ended run and keyed on `run_id`. Only
+the breaker's final `gave_up` fails the *task* (`task.failed_terminal`); every
+attempt on the way there is a `task.attempt_ended`. Its plaintext `payload`
+adds `run_id`, `run_outcome` (the raw `task_runs.outcome`), and
+`attempt_disposition` — `success` (`completed`), `failure` (`crashed` /
+`timed_out` / `spawn_failed` / `gave_up`), or `released` (`reclaimed` / `stale` /
+`rate_limited` / `blocked` / `scheduled`) — plus the attempt's `holder`,
+`claim_expires`, `worker_pid`, and `last_heartbeat_at`. An attempt's full
+history is therefore the `task.claimed` that opened it paired by `run_id` with
+the `task.attempt_ended` that closed it.
+
+Plaintext `payload` for every `task.*` event: `event_type`, `board` (slug;
+`"default"` for the legacy top-level DB), `task_id` (`t_<8hex>`), `status`,
+`run_id` (the claiming attempt, when applicable), `holder` (the `claim_lock`
+`host:pid` string), `claim_expires` (lease deadline, epoch s), `worker_pid`,
+`last_heartbeat_at`, `block_kind`
+(`dependency`/`needs_input`/`capability`/`transient`), `consecutive_failures`,
+`priority`, `assignee`, `project_id`, `idempotency_key`, `run_outcome` (on
+terminal run events), and `attempt_disposition`
+(`success`/`failure`/`released`, derived from the run outcome). Encrypted
+content only: `title`, `body`, `result`, `summary`, `error`,
+`last_failure_error`, run `metadata`, comment bodies, and any `task_events`
+payload excerpt.
+
+**Attempt history and fencing.** Each `task_runs` row is one claim episode;
+`task_runs.id` is a per-board AUTOINCREMENT integer, strictly increasing and
+never reused, and Hermes itself uses it as a compare-and-swap guard
+(`expected_run_id`) on every terminal write. It is therefore the recorder's
+**fencing token**: capture it as `run_id` at claim time and carry it on every
+later event for that attempt, so a resurrected stale worker's late write is
+distinguishable by its lower `run_id`. The `tasks.current_run_id` pointer is
+valid only *during* an attempt — it resets to NULL when the run closes — so the
+token must be snapshotted from the claim event, never read live. Hermes has no
+cross-host fencing authority and no monotonic token beyond this per-board run
+id; a lease or fencing authority spanning installations is a hosted-service
+(`hermes-dbass`) concern, out of scope for the recorder, which captures only the
+tokens Hermes writes.
+
+**Lease semantics (for reconciliation).** A claim carries a TTL lease:
+`claim_expires = claim_time + TTL` (Hermes default 900 s, override
+`HERMES_KANBAN_CLAIM_TTL_SECONDS`). A live worker renews it by heartbeat; a
+one-hour heartbeat backstop reclaims even a live-but-stuck worker. When a lease
+lapses without a terminal, Hermes resets the task to `ready` and closes the run
+`reclaimed`. The reconciler judges this from the authoritative durable
+`task_runs` row — a run still open (`outcome` NULL) whose `claim_expires` has
+lapsed past a grace, with a `last_heartbeat_at` stale beyond the claim window,
+is a worker that died mid-attempt (a live worker renews `claim_expires` by
+heartbeat, so a lapsed lease is the death signal). It emits a
+`reconcile.terminal_missing` with `subject_type='task_run'`, dedup-keyed on
+`board` + `run_id` — the strictly-increasing per-board attempt id, stable across
+lease renewals, never the reconcile-run clock.
+
 ## Event-type surface
 
 **P0-poc** — captured and observed in the Phase 0 POC:
@@ -97,7 +180,7 @@ never keyed off `updated_at` — a healthy idle gateway never advances it.
 `tool.approval_responded`, `delegation.delivered`, `delegation.progress`,
 `cron.definition_changed`, `command.invoked`, `handoff.state_changed`,
 `task.created`, `task.claimed`, `task.completed`, `task.blocked`,
-`task.failed_terminal`, `knowledge.record_written`,
+`task.failed_terminal`, `task.attempt_ended`, `knowledge.record_written`,
 `knowledge.record_compacted`.
 
 ## Ordering model
@@ -134,11 +217,15 @@ non-partial event. Do not compact in the POC.
 - **Plaintext:** all identity fields, timestamps, `source` and
   `capture_method`, `payload` operational fields, model and billing
   metadata, token classes and counts, cost figures, durations, `tool_name`,
-  cron schedule metadata, `content_hash`, and `key_version`.
+  cron schedule metadata, task coordination metadata (`board`, `task_id`,
+  `run_id`, `status`, `holder`, `claim_expires`, `worker_pid`,
+  `last_heartbeat_at`, `block_kind`, `run_outcome`, `attempt_disposition`),
+  `content_hash`, and `key_version`.
 - **Encrypted on the host:** user and assistant text, tool arguments and
   results, the system prompt, reasoning, agent and subagent goals and
-  summaries, cron output, error messages, and sensitive path or identity
-  context (`cwd`, `git_branch`, `git_repo_root`, chat names).
+  summaries, cron output, error messages, task title/body/result and run
+  summaries, and sensitive path or identity context (`cwd`, `git_branch`,
+  `git_repo_root`, chat names).
 
 ## Golden example
 
