@@ -184,7 +184,11 @@ def _cmd_observe(args: argparse.Namespace) -> int:
         records = observe.load(outbox, session=args.session, since=since)
 
         # Default to the stream view when no view is selected.
-        views = [v for v in ("stream", "tree", "report", "kanban") if getattr(args, v)]
+        views = [
+            v
+            for v in ("stream", "tree", "report", "kanban", "knowledge")
+            if getattr(args, v)
+        ]
         if not views:
             views = ["stream"]
 
@@ -209,6 +213,10 @@ def _cmd_observe(args: argparse.Namespace) -> int:
             elif view == "kanban":
                 print("── kanban ──")
                 for line in observe.render_kanban(records):
+                    print(line)
+            elif view == "knowledge":
+                print("── knowledge ──")
+                for line in observe.render_knowledge(outbox, records):
                     print(line)
     finally:
         outbox.close()
@@ -477,6 +485,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--kanban",
         action="store_true",
         help="Kanban task boards: status, lease, and per-attempt timeline.",
+    )
+    p_obs.add_argument(
+        "--knowledge",
+        action="store_true",
+        help="Knowledge store: per-artifact latest manifest, version history, and diff.",
     )
     p_obs.add_argument("--session", default=None, help="Filter to one session/operation id.")
     p_obs.add_argument("--since", default=None, help="Keep events at/after an epoch or ISO timestamp.")

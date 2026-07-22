@@ -99,6 +99,29 @@ def iter_disk_artifacts(
     return _iter_artifacts(home)
 
 
+def restore_version(
+    outbox: Any, artifact_id: str, seq: int | None = None
+) -> dict[str, bytes] | None:
+    """Reconstruct an artifact version's files from the store.
+
+    Returns ``{relative_path: content_bytes}`` by decrypting each blob the
+    version's manifest references, so any single version restores byte-for-byte
+    from the content-addressed store alone. ``seq=None`` restores the latest.
+    A tombstone restores to ``{}`` (the artifact was deleted at that version).
+    Returns ``None`` when the artifact or the requested version is unknown.
+    """
+    versions = outbox.knowledge_versions(artifact_id)
+    if not versions:
+        return None
+    if seq is None:
+        version = versions[-1]
+    else:
+        version = next((v for v in versions if v["seq"] == seq), None)
+        if version is None:
+            return None
+    return {entry["path"]: outbox.get_blob(entry["blob_hash"]) for entry in version["manifest"]}
+
+
 def read_manifest(
     outbox: Any, files: list[tuple[str, Path]]
 ) -> tuple[list[dict[str, str]], float]:
