@@ -185,6 +185,81 @@ heartbeat, so a lapsed lease is the death signal). It emits a
 `board` + `run_id` — the strictly-increasing per-board attempt id, stable across
 lease renewals, never the reconcile-run clock.
 
+**Phase 3 · Knowledge capture (`knowledge.*`):** Hermes creates durable learned
+state — agent-authored **skills** under
+`<HERMES_HOME>/skills/<category>/<name>/` (a `SKILL.md` plus the four supporting
+subdirectories `references`, `templates`, `scripts`, `assets`) and the built-in
+**memory** files `<HERMES_HOME>/memories/MEMORY.md` and `USER.md`. The recorder
+captures these along two paths that meet at a content-addressed artifact store.
+
+*Path 1 — event classification (from `state.db`).* A foreground `skill_manage`
+or `memory` tool call is already logged; the collector additionally classifies
+it as a `knowledge.record_written`. The mutation arguments live in the assistant
+row's `tool_calls` column (the tool-call `function.arguments` JSON), never in
+`content` — the `role='tool'` result row carries only a `{success, message}`
+outcome. Plaintext `payload`: `artifact_kind` (`skill` \| `memory` \|
+`user_profile`), `action`, `skill_name`/`category` or memory `target`, the
+`artifact_version_ref` that ties the event to its store version, `origin`
+(`foreground`), `provenance` (`agent`), the relative artifact path,
+`content_hash`, and byte and file counts. The tool-call arguments, diffs, and
+replacement text are sensitive and live only in encrypted content. This path is
+best-effort and foreground-only: Hermes's background self-improvement review
+runs persist-disabled — it shares the session id but writes no message rows — so
+a background skill or memory write is invisible to `state.db` and is captured
+only by Path 2.
+
+Skill `action` is one of `create`, `edit`, `patch`, `delete`, `write_file`,
+`remove_file`; memory `action` is `add`, `replace`, or `remove` (a single call
+may batch several under one `operations` argument). State is read from the
+tool-call `action`, not from any skill status field. Delete is asymmetric: a
+foreground delete removes the skill directory, while a background-curator delete
+archives it recoverably — both record a terminal (tombstone) version rather than
+erasing history.
+
+*Path 2 — the content-addressed artifact store.* The recorder owns a versioned
+store — a minimal, encryption-native content-addressed model, not the user's git
+and not a shelled-out git repository. Three record kinds:
+
+- a **blob** is one file's content, stored once and keyed by the hash of its
+  plaintext, encrypted at rest;
+- an **artifact** is a tracked unit — a memory file or a Hermes-created skill,
+  identified by kind, name, and category;
+- a **version** is a manifest — an ordered list of `{path, blob_hash}` — with
+  its `occurred_at`, its `origin` (`foreground` \| `background` \| `external`),
+  and the `linked_event_id` of its Path 1 event when one exists.
+
+The latest version is the newest manifest; the history is the version chain; a
+diff between two versions compares their manifests and the changed blobs. Because
+an unchanged file reuses its existing blob, editing one file of a multi-file
+skill adds one version and one blob, so full history is inexpensive and identical
+content deduplicates globally.
+
+The store scans the filesystem read-only, so it captures both foreground and
+background writes. It tracks a skill only when the skill is **Hermes-created** —
+absent from both `.bundled_manifest` and `.hub/lock.json`. Bundled and
+Hub-installed skills are never ingested, even though a Hermes edit of such a
+skill is captured. The two memory files are always tracked. Sidecar churn
+(`*.md.lock`, `.mem_*.tmp`, `*.md.bak.<ts>`, `.usage.json`, `.archive/`,
+`pending/`) is ignored.
+
+Two controls govern retention. `knowledge.history` is `full` (the default; cheap
+because of deduplication) or `latest_only` (current content and hashes only, for
+an installation that already versions its home in its own git). The store keeps
+its own retention independent of the outbox: it always keeps the latest version
+of every tracked artifact, and pruning acknowledged events never drops current
+knowledge state.
+
+`knowledge.record_compacted` marks a knowledge-artifact supersession — the skill
+curator's consolidation, where one skill is absorbed into another (the
+`absorbed_into` signal). It is not conversation or context compaction, which is
+the separate reserved `session.compressed`; the memory tool has no compaction
+operation and never emits `knowledge.record_compacted`.
+
+A `knowledge.record_written` event is dedup-keyed on its `state.db` message row,
+as other message-derived events are. A store version is identified by its
+`(artifact_id, seq)` and its content manifest, so a restart, a re-scan, or a
+re-poll produces no duplicate version and no duplicate event.
+
 ## Event-type surface
 
 **P0-poc** — captured and observed in the Phase 0 POC:
@@ -250,11 +325,16 @@ its payload.
   cron schedule metadata, task coordination metadata (`board`, `task_id`,
   `run_id`, `status`, `holder`, `claim_expires`, `worker_pid`,
   `last_heartbeat_at`, `block_kind`, `run_outcome`, `attempt_disposition`),
-  `content_hash`, and `key_version`.
+  knowledge artifact metadata (`artifact_kind`, `action`, `skill_name`,
+  `category`, memory `target`, the relative artifact `path`, `provenance`,
+  `origin`, `artifact_version_ref`, and file and byte counts), `content_hash`,
+  and `key_version`.
 - **Encrypted on the host:** user and assistant text, tool arguments and
   results, the system prompt, reasoning, agent and subagent goals and
   summaries, cron output, error messages, task title/body/result and run
-  summaries, and sensitive path or identity context (`cwd`, `git_branch`,
+  summaries, skill and memory file contents (`SKILL.md` and its supporting
+  files, `MEMORY.md`, `USER.md`) with their tool-call arguments, diffs, and
+  replacement text, and sensitive path or identity context (`cwd`, `git_branch`,
   `git_repo_root`, chat names).
 
 ## Golden example
