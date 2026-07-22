@@ -30,21 +30,23 @@ the reconciler (#79). This adapter never writes to a Hermes home.
 
 from __future__ import annotations
 
+import base64
+import json
 import time
 from pathlib import Path
 from typing import Any, Iterator
 
 from ._common import (
     SKILL_SUBDIRS,
+    build_record,
     hermes_created_skills,
     memory_files,
+    read_home_mode,
     resolve_hermes_home,
+    runtime_stamp,
 )
 
-# Non-envelope counter key returned by ``poll`` — the number of artifact
-# versions newly recorded this pass (including tombstones). It is operational
-# feedback for the run summary, not an event type.
-VERSIONS_RECORDED = "knowledge:versions_recorded"
+KNOWLEDGE_EVENT = "knowledge.record_written"
 
 
 def poll(
@@ -53,29 +55,36 @@ def poll(
     *,
     knowledge_config: Any = None,
 ) -> dict[str, int]:
-    """One read-only scan of the knowledge surface. Returns per-key counts."""
+    """One read-only scan of the knowledge surface.
+
+    Two steps: record any content change into the content-addressed store, then
+    emit a ``knowledge.record_written`` event for every store version that does
+    not yet have one (so the encrypted server ledger receives both foreground and
+    background writes, and any versions that predate this transport are
+    backfilled). Returns per-event-type counts.
+    """
     from .recorder_config import KnowledgeConfig
 
     config = knowledge_config or KnowledgeConfig()
     home = resolve_hermes_home(hermes_home)
+    home_mode = read_home_mode(hermes_home)
 
-    recorded = 0
     seen: set[str] = set()
     for artifact_id, kind, name, category, files in _iter_artifacts(home):
         # Mark seen BEFORE the read so a transient I/O error on one artifact does
         # not make it look deleted (which would record a spurious tombstone).
         seen.add(artifact_id)
         try:
-            if _capture(outbox, config, artifact_id, kind, name, category, files):
-                recorded += 1
+            _capture(outbox, config, artifact_id, kind, name, category, files)
         except OSError:
             # A live file can vanish or become unreadable between listing and
             # reading (TOCTOU), or hit a permission error. Isolate it: one bad
             # artifact must not sink the rest of the pass. The next tick re-scans.
             continue
-    recorded += _tombstone_vanished(outbox, config, seen)
+    _tombstone_vanished(outbox, config, seen)
 
-    return {VERSIONS_RECORDED: recorded} if recorded else {}
+    emitted = _emit_pending_events(outbox, home_mode)
+    return {KNOWLEDGE_EVENT: emitted} if emitted else {}
 
 
 def _iter_artifacts(
@@ -180,3 +189,92 @@ def _apply_retention(outbox: Any, config: Any, artifact_id: str) -> None:
         return
     if outbox.prune_knowledge_versions(artifact_id, keep=keep):
         outbox.gc_orphan_blobs()
+
+
+def _emit_pending_events(outbox: Any, home_mode: str) -> int:
+    """Emit a ``knowledge.record_written`` for every not-yet-shipped version.
+
+    A per-artifact meta cursor tracks the highest version already turned into an
+    event, so this is idempotent across restarts and backfills versions that
+    predate the transport. Content is reconstructed from the deduped blobs, so
+    each event carries the complete after-state of its version — foreground and
+    background writes alike.
+    """
+    runtime = runtime_stamp("knowledge", home_mode=home_mode)
+    emitted = 0
+    for artifact_id in outbox.knowledge_artifact_ids():
+        artifact = outbox.knowledge_artifact(artifact_id)
+        if artifact is None:
+            continue
+        cursor_key = f"knowledge:emitted:{artifact_id}"
+        last_emitted = int(outbox.get_meta(cursor_key) or 0)
+        for version in outbox.knowledge_versions(artifact_id):
+            if version["seq"] <= last_emitted:
+                continue
+            if _emit_version_event(outbox, runtime, artifact, version):
+                emitted += 1
+            outbox.set_meta(cursor_key, str(version["seq"]))
+    return emitted
+
+
+def _emit_version_event(
+    outbox: Any, runtime: dict[str, Any], artifact: dict[str, Any], version: dict[str, Any]
+) -> bool:
+    """Build and append one knowledge event; return whether a new row landed."""
+    kind = artifact["kind"]
+    seq = version["seq"]
+    is_tombstone = version["is_tombstone"]
+    action = "delete" if is_tombstone else ("create" if seq == 1 else "update")
+
+    if is_tombstone:
+        content: str | None = None
+        file_count = 0
+        byte_count = 0
+    else:
+        files = []
+        byte_count = 0
+        for entry in version["manifest"]:
+            raw = outbox.get_blob(entry["blob_hash"])
+            byte_count += len(raw)
+            files.append(
+                {"path": entry["path"], "content_b64": base64.b64encode(raw).decode("ascii")}
+            )
+        file_count = len(files)
+        content = json.dumps(
+            {"manifest_hash": version["manifest_hash"], "files": files}
+        )
+
+    payload: dict[str, Any] = {
+        "artifact_kind": kind,
+        "action": action,
+        "artifact_id": artifact["artifact_id"],
+        "version_seq": seq,
+        "manifest_hash": version["manifest_hash"],
+        "content_hash": version["manifest_hash"],
+        "origin": version["origin"],
+        "provenance": artifact["provenance"],
+        "file_count": file_count,
+        "byte_count": byte_count,
+    }
+    if kind == "skill":
+        payload["skill_name"] = artifact["name"]
+        if artifact["category"]:
+            payload["category"] = artifact["category"]
+    else:  # memory / user_profile
+        payload["target"] = artifact["name"]
+
+    record = build_record(
+        event_type=KNOWLEDGE_EVENT,
+        occurred_at=version["occurred_at"],
+        source="knowledge_store",
+        capture_method="scan:knowledge_store",
+        runtime=runtime,
+        correlation_id=f"knowledge:{artifact['artifact_id']}",
+        payload=payload,
+        partial=False,
+    )
+    return outbox.append_if_new(
+        record,
+        content=content,
+        dedup_key=f"knowledge:{artifact['artifact_id']}:v{seq}",
+    )

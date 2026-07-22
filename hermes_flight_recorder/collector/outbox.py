@@ -346,6 +346,23 @@ class Outbox:
             )
         ]
 
+    def knowledge_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT artifact_id, kind, name, category, provenance, first_seen "
+            "FROM knowledge_artifact WHERE artifact_id=?",
+            (artifact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "artifact_id": row[0],
+            "kind": row[1],
+            "name": row[2],
+            "category": row[3],
+            "provenance": row[4],
+            "first_seen": row[5],
+        }
+
     @staticmethod
     def _version_row(row: Any) -> dict[str, Any] | None:
         if row is None:
