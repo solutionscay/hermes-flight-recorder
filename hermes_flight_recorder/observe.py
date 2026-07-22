@@ -6,7 +6,7 @@ read-only and prints what was captured. It never makes a network call and
 never decrypts ``content_ciphertext`` — only plaintext payload metadata and
 ``content_hash`` are shown.
 
-Four views:
+Five views:
 
 - **stream** — every event in (``installation_id``, ``producer_sequence``)
   order, one line each, with the key plaintext payload fields.
@@ -22,9 +22,15 @@ Four views:
   status, current holder and lease state, the per-attempt timeline (each
   ``task.claimed`` paired with its ``task.attempt_ended`` by ``run_id``),
   and the task terminals. So an operator can explain a task's transitions.
+- **knowledge** — the content-addressed store: for each Hermes-created skill
+  and memory file, its latest manifest, the version history, and the diff
+  between the last two versions, joined to the ``knowledge.record_written``
+  events that shipped each version. Reads the store for structure but never
+  decrypts a blob, so the diff is at the manifest level, not the text.
 
-The render functions take a plain list of envelope records, so they are
-testable without an outbox. ``load()`` is the thin adapter that pulls and
+Most render functions take a plain list of envelope records, so they are
+testable without an outbox; ``render_knowledge`` additionally reads the store
+tables, so it takes the outbox. ``load()`` is the thin adapter that pulls and
 filters records from an :class:`~hermes_flight_recorder.collector.outbox.Outbox`.
 """
 
@@ -47,6 +53,7 @@ __all__ = [
     "render_tree",
     "render_report",
     "render_kanban",
+    "render_knowledge",
     "parse_since",
     "FINDING_TYPES",
 ]
@@ -463,6 +470,105 @@ def _task_terminal_detail(payload: dict[str, Any]) -> str:
     if kind:
         return f"{et}  ({kind})"
     return et
+
+
+# --- knowledge view -----------------------------------------------------
+def render_knowledge(outbox: Any, records: Iterable[dict[str, Any]]) -> list[str]:
+    """Per-artifact knowledge view: latest manifest, version history, and the
+    latest diff, joined to the ``knowledge.record_written`` events that shipped
+    each version.
+
+    Reads the content-addressed store for structure (manifests, hashes, version
+    chain) but — like every other view — never decrypts a blob: the diff is at
+    the manifest level (which files were added/removed/changed), not the text.
+    """
+    artifact_ids = outbox.knowledge_artifact_ids()
+    if not artifact_ids:
+        return ["(no knowledge artifacts captured)"]
+
+    events_by_version: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for r in records:
+        p = r.get("payload", {})
+        if p.get("event_type") == "knowledge.record_written":
+            events_by_version[(p.get("artifact_id"), p.get("version_seq"))] = p
+
+    lines: list[str] = []
+    for i, artifact_id in enumerate(artifact_ids):
+        if i:
+            lines.append("")
+        _render_artifact(outbox, artifact_id, events_by_version, lines)
+    return lines
+
+
+def _render_artifact(
+    outbox: Any,
+    artifact_id: str,
+    events_by_version: dict[tuple[Any, Any], dict[str, Any]],
+    lines: list[str],
+) -> None:
+    artifact = outbox.knowledge_artifact(artifact_id)
+    if artifact is None:
+        return
+    versions = outbox.knowledge_versions(artifact_id)
+    if not versions:
+        return
+    latest = versions[-1]
+    kind = artifact["kind"]
+    label = artifact["name"]
+    if kind == "skill" and artifact.get("category"):
+        label = f"{artifact['category']}/{artifact['name']}"
+    state = "deleted" if latest["is_tombstone"] else "live"
+    lines.append(
+        f"◈ {kind} {label}  [{state}]  v{latest['seq']}  "
+        f"({len(versions)} version(s), {artifact['provenance']})"
+    )
+
+    if latest["is_tombstone"]:
+        lines.append("    files: (deleted)")
+    else:
+        lines.append("    files:")
+        for entry in latest["manifest"]:
+            lines.append(f"      {entry['path']:<28}  {_short_hash(entry['blob_hash'])}")
+
+    lines.append("    history:")
+    for v in versions:
+        linked = "event✓" if events_by_version.get((artifact_id, v["seq"])) else "event✗"
+        tomb = " tombstone" if v["is_tombstone"] else ""
+        lines.append(
+            f"      v{v['seq']}  {v['origin']:<10}  {_iso(v['occurred_at'])}  "
+            f"{_short_hash(v['manifest_hash'])}  {linked}{tomb}"
+        )
+
+    if len(versions) >= 2:
+        diff = _manifest_diff(versions[-2]["manifest"], versions[-1]["manifest"])
+        if diff:
+            lines.append(f"    diff v{versions[-2]['seq']}→v{versions[-1]['seq']}:")
+            lines.extend(f"      {line}" for line in diff)
+
+
+def _manifest_diff(
+    before: list[dict[str, str]], after: list[dict[str, str]]
+) -> list[str]:
+    """Manifest-level diff: which files were added, removed, or changed."""
+    old = {e["path"]: e["blob_hash"] for e in before}
+    new = {e["path"]: e["blob_hash"] for e in after}
+    out: list[str] = []
+    for path in sorted(set(old) | set(new)):
+        if path not in old:
+            out.append(f"+ {path}")
+        elif path not in new:
+            out.append(f"- {path}")
+        elif old[path] != new[path]:
+            out.append(f"~ {path}")
+    return out
+
+
+def _short_hash(content_hash: Any) -> str:
+    """A ``sha256:<64hex>`` shortened to its first 12 hex digits for display."""
+    if not isinstance(content_hash, str) or ":" not in content_hash:
+        return str(content_hash)
+    algo, _, digest = content_hash.partition(":")
+    return f"{algo}:{digest[:12]}"
 
 
 # --- shared helpers -----------------------------------------------------
