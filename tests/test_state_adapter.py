@@ -116,6 +116,7 @@ def test_state_poll_event_mapping(tmp_path):
         "session.created": 1,          # parent (cli)
         "subagent.child_spawned": 1,   # child (subagent)
         "subagent.completed": 1,       # child ended
+        "invocation.started": 1,       # full role=user content
         "tool.call_completed": 3,      # terminal + delegate_task + read_file (all role=tool)
         "model.usage_recorded": 2,     # main + title_generation
         "delegation.dispatched": 1,

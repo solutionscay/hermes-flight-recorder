@@ -25,6 +25,9 @@ The cloud is never in an agent's critical path.
 - Gaps, missed cron runs, stale work, and failed gateway starts
 
 Messages, responses, tool output, and raw provider errors are encrypted. Operational metadata remains available for debugging and reconciliation.
+Invocation hooks record timing and attribution immediately without Hermes's
+truncated previews. Complete user and assistant text is collected from
+`state.db` on the next poll and linked to the same invocation.
 
 ## Try it
 

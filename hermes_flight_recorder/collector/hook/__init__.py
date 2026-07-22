@@ -5,12 +5,14 @@ Two parts, with a durable file journal between them:
 - The **spooler** (``handler.py``, installed under ``$HERMES_HOME/hooks/``)
   runs inside the Hermes gateway process. It is standard-library only: it
   appends one JSON line per lifecycle event to ``hook-spool.jsonl`` in the
-  Flight Recorder home and never raises into the gateway. It imports nothing from
+  Flight Recorder home and never raises into the gateway. Agent message and
+  response previews are removed because Hermes truncates them before hook
+  delivery; complete content comes from ``state.db``. It imports nothing from
   this package, so it runs in whatever Python environment Hermes uses.
 - The **drain** (:func:`drain`) runs in the Flight Recorder environment inside
   ``hermes-flight-recorder run``. It reads new spool lines after a stored
-  byte-offset cursor, maps each event to an envelope v1 record, encrypts
-  the content, assigns the ``producer_sequence`` via the outbox, and
+  byte-offset cursor, maps each event to an envelope v1 record, assigns the
+  ``producer_sequence`` via the outbox, and
   appends with a dedup key.
 
 This keeps the encryption key and the sequence authority in Hermes Flight Recorder, never

@@ -10,6 +10,8 @@ Grounded in a real probe session (see issue #5):
   ``parent_session_id`` -> ``subagent.child_spawned`` / ``subagent.completed``.
 - ``messages.id`` is a global autoincrement, so an ``id > cursor`` poll is
   incremental.
+- Content-bearing ``user`` / ``assistant`` rows are the durable message and
+  response bodies for hook-derived invocation windows.
 - Tool status is inside the (encrypted) ``role='tool'`` result body; parse
   it best-effort before encrypting.
 - Tokens and cost live in ``session_model_usage`` per (session, model, task).
@@ -40,6 +42,7 @@ from ._common import (
     safe_json_dict,
     state_db_path,
 )
+from .recorder_config import CaptureConfig
 
 _SESSION_COLS = (
     "id, source, parent_session_id, model, message_count, tool_call_count, "
@@ -56,6 +59,13 @@ _USAGE_COUNTERS = (
     "estimated_cost_usd",
 )
 _USAGE_STATE_VERSION = "delta-v1"
+# v1 advanced one global cursor while selecting only role='tool'. A new
+# cursor intentionally starts at zero once so upgrades backfill durable
+# user/assistant content; existing tool rows hit their stable dedup keys.
+_MESSAGE_CURSOR = "state.db:messages:v2"
+# Hermes persists an incoming user message shortly before firing agent:start.
+# Keep the skew narrow so an old, unrelated row cannot attach to a later turn.
+_USER_START_SKEW_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -67,13 +77,20 @@ class _InvocationWindow:
     ended_at: float | None
 
 
-def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
+def poll(
+    outbox: Any,
+    hermes_home: str | Path | None = None,
+    *,
+    capture_config: CaptureConfig | None = None,
+) -> dict[str, int]:
     """One read-only poll pass over ``state.db``. Returns per-type counts."""
     db_path = state_db_path(resolve_hermes_home(hermes_home))
     if not db_path.exists():
         raise FileNotFoundError(f"state.db not found at {db_path}")
 
-    # Resolve the terminal home-mode policy once per poll, not per record.
+    # Resolve configuration and the terminal home-mode policy once per poll,
+    # not per record.
+    capture = capture_config or CaptureConfig()
     home_mode = read_home_mode(hermes_home)
 
     conn = open_sqlite_read_only(db_path)
@@ -86,7 +103,14 @@ def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
         counts: dict[str, int] = defaultdict(int)
         _poll_sessions(outbox, sessions, parent_map, counts, home_mode)
         _poll_messages(
-            outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
+            outbox,
+            conn,
+            parent_map,
+            profile_of,
+            invocation_windows,
+            counts,
+            home_mode,
+            capture,
         )
         _poll_model_usage(
             outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
@@ -164,24 +188,89 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
 
 
 def _poll_messages(
-    outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
+    outbox,
+    conn,
+    parent_map,
+    profile_of,
+    invocation_windows,
+    counts,
+    home_mode,
+    capture_config,
 ) -> None:
-    cursor = int(outbox.get_cursor("state.db:messages") or 0)
-    rows = conn.execute(
-        "SELECT id, session_id, tool_name, tool_call_id, effect_disposition, "
-        "content, timestamp FROM messages WHERE id > ? AND role='tool' ORDER BY id",
-        (cursor,),
-    ).fetchall()
+    cursor = int(outbox.get_cursor(_MESSAGE_CURSOR) or 0)
+    supported_roles = tuple(
+        role
+        for role in ("user", "assistant", "tool")
+        if role in capture_config.message_roles
+    )
+    if supported_roles:
+        placeholders = ",".join("?" for _ in supported_roles)
+        rows = conn.execute(
+            "SELECT id, session_id, role, tool_name, tool_call_id, "
+            "effect_disposition, content, timestamp FROM messages "
+            f"WHERE id > ? AND role IN ({placeholders}) ORDER BY id",
+            (cursor, *supported_roles),
+        ).fetchall()
+    else:
+        rows = []
+
     for r in rows:
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
-        invocation_id = _infer_invocation(invocation_windows, sid, r["timestamp"])
+        role = r["role"]
+        content = r["content"]
+        # Hermes writes empty assistant rows to carry tool-call structure.
+        # They are not assistant response content and already surface through
+        # the corresponding role='tool' result rows.
+        if role in ("user", "assistant") and not content:
+            continue
+
+        invocation_id = _infer_message_invocation(
+            invocation_windows, sid, r["timestamp"], role
+        )
+        limited_content, content_metadata = _limit_content(
+            content, capture_config.max_content_bytes
+        )
+
+        if role in ("user", "assistant"):
+            payload = {
+                "message_row_id": r["id"],
+                "message_role": role,
+                **content_metadata,
+            }
+            if invocation_id is not None:
+                payload["invocation_attribution"] = "inferred_from_session_window"
+            record = build_record(
+                event_type=(
+                    "invocation.started" if role == "user" else "invocation.completed"
+                ),
+                occurred_at=r["timestamp"] or 0.0,
+                source="state.db:messages",
+                capture_method="poll:state.db:messages",
+                runtime=runtime_stamp(role, home_mode=home_mode),
+                correlation_id=corr,
+                session_id=sid,
+                invocation_id=invocation_id,
+                profile=profile_of.get(sid, "default"),
+                partial=content_metadata["content_truncated"],
+                payload=payload,
+            )
+            append_and_count(
+                outbox,
+                counts,
+                record,
+                content=limited_content,
+                dedup_key=f"state.db:{role}:{r['id']}",
+            )
+            continue
+
         payload = {
             "tool_name": r["tool_name"],
             "tool_call_id": r["tool_call_id"],
             "effect_disposition": r["effect_disposition"],
-            "status": _derive_tool_status(r["content"]),
+            "status": _derive_tool_status(content),
             "message_row_id": r["id"],
+            **content_metadata,
         }
         if invocation_id is not None:
             payload["invocation_attribution"] = "inferred_from_session_window"
@@ -195,18 +284,19 @@ def _poll_messages(
             session_id=sid,
             invocation_id=invocation_id,
             profile=profile_of.get(sid, "default"),
+            partial=content_metadata["content_truncated"],
             payload=payload,
         )
         append_and_count(
             outbox,
             counts,
             record,
-            content=r["content"],
+            content=limited_content,
             dedup_key=f"state.db:tool:{r['id']}",
         )
 
     max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-    outbox.set_cursor("state.db:messages", max_id)
+    outbox.set_cursor(_MESSAGE_CURSOR, max_id)
 
 
 def _poll_model_usage(
@@ -341,6 +431,10 @@ def _invocation_windows(outbox: Any) -> dict[str, list[_InvocationWindow]]:
         event_type = event.get("payload", {}).get("event_type")
         if event_type not in ("invocation.started", "invocation.completed"):
             continue
+        # Durable message rows reuse invocation.* as their content carrier.
+        # They must not recursively redefine the hook-derived time windows.
+        if not str(event.get("capture_method", "")).startswith("hook:agent:"):
+            continue
         sid = event.get("session_id")
         invocation_id = event.get("invocation_id")
         if not sid or not invocation_id:
@@ -386,6 +480,73 @@ def _infer_invocation(
     if candidate.ended_at is not None and timestamp > candidate.ended_at:
         return None
     return candidate.invocation_id
+
+
+def _infer_message_invocation(
+    windows: dict[str, list[_InvocationWindow]],
+    sid: str | None,
+    occurred_at: Any,
+    role: str,
+) -> str | None:
+    """Attribute one durable message row to its hook-derived invocation.
+
+    Assistant responses and tools land inside the start/end window. Hermes
+    persists an incoming user row just before it emits ``agent:start``, so a
+    user row may also bind to the nearest following start within a small,
+    measured skew allowance.
+    """
+    invocation_id = _infer_invocation(windows, sid, occurred_at)
+    if invocation_id is not None or role != "user" or not sid:
+        return invocation_id
+
+    timestamp = _number(occurred_at)
+    if timestamp <= 0:
+        return None
+    for window in windows.get(sid, ()):
+        skew = window.started_at - timestamp
+        if skew < 0:
+            continue
+        if skew <= _USER_START_SKEW_SECONDS:
+            return window.invocation_id
+        break
+    return None
+
+
+def _limit_content(
+    content: str | bytes | None, max_bytes: int
+) -> tuple[str | bytes | None, dict[str, int | bool]]:
+    """Bound encrypted content by UTF-8 bytes and report any truncation.
+
+    Metadata makes the cap visible; plaintext is never decorated with a
+    marker that could be mistaken for source content. String truncation
+    stops before a partial UTF-8 code point.
+    """
+    if content is None:
+        return None, {
+            "content_original_bytes": 0,
+            "content_captured_bytes": 0,
+            "content_truncated": False,
+        }
+    raw = content.encode("utf-8") if isinstance(content, str) else content
+    if len(raw) <= max_bytes:
+        return content, {
+            "content_original_bytes": len(raw),
+            "content_captured_bytes": len(raw),
+            "content_truncated": False,
+        }
+
+    limited_raw = raw[:max_bytes]
+    if isinstance(content, str):
+        limited: str | bytes = limited_raw.decode("utf-8", "ignore")
+        captured_bytes = len(limited.encode("utf-8"))
+    else:
+        limited = limited_raw
+        captured_bytes = len(limited_raw)
+    return limited, {
+        "content_original_bytes": len(raw),
+        "content_captured_bytes": captured_bytes,
+        "content_truncated": True,
+    }
 
 
 def _number(value: Any) -> int | float:

@@ -118,6 +118,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         totals = run_pass(
             outbox,
             args.hermes_home,
+            capture_config=runtime_config.capture,
             on_source_error=lambda label, exc: print(
                 f"  ({label}: {exc})", file=sys.stderr
             ),
@@ -132,6 +133,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_reconcile(args: argparse.Namespace) -> int:
+    from .collector import recorder_config
     from .collector.outbox import Outbox
     from .collector.reconcile import reconcile
 
@@ -140,7 +142,15 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
         if not _check_initialized(outbox):
             return 2
 
-        counts = reconcile(outbox, args.hermes_home)
+        try:
+            capture_config = recorder_config.load(args.flight_recorder_home).capture
+        except recorder_config.RecorderConfigError as exc:
+            print(f"reconcile not configured: {exc}", file=sys.stderr)
+            return 2
+
+        counts = reconcile(
+            outbox, args.hermes_home, capture_config=capture_config
+        )
         total = sum(counts.values())
         print(f"reconciled {total} new finding(s) into {outbox.path}:")
         for event_type in sorted(counts):

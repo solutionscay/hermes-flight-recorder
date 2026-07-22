@@ -73,7 +73,8 @@ def coverage_gaps(ob, subject_type: str | None = None):
 _SESSIONS_SCHEMA = """
 CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
     started_at REAL, ended_at REAL, expiry_finalized INT, profile_name TEXT);
-CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT);
+CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
+    content TEXT);
 CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
 """
 
@@ -85,7 +86,7 @@ def make_state_db(hh, *, sessions=(), messages=(), model_usage=()):
     db = sqlite3.connect(hh / "state.db")
     db.executescript(_SESSIONS_SCHEMA)
     db.executemany("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)", sessions)
-    db.executemany("INSERT INTO messages VALUES (?,?,?)", messages)
+    db.executemany("INSERT INTO messages VALUES (?,?,?,?)", messages)
     db.executemany("INSERT INTO session_model_usage VALUES (?,?,?)", model_usage)
     db.commit()
     db.close()
@@ -186,7 +187,7 @@ def test_uncaptured_tool_message_surfaces_once_as_coverage_gap(tmp_path):
     make_state_db(
         hh,
         sessions=[("P", "cli", None, B, B + 1, 1, None)],
-        messages=[(10, "P", "tool")],
+        messages=[(10, "P", "tool", "{}")],
     )
     ob = new_outbox(tmp_path)
     append_event(ob, "session.created", session_id="P", correlation_id="P")
@@ -208,7 +209,7 @@ def test_captured_tool_message_does_not_surface(tmp_path):
     make_state_db(
         hh,
         sessions=[("P", "cli", None, B, B + 1, 1, None)],
-        messages=[(10, "P", "tool")],
+        messages=[(10, "P", "tool", "{}")],
     )
     ob = new_outbox(tmp_path)
     append_event(ob, "session.created", session_id="P", correlation_id="P")
@@ -223,19 +224,55 @@ def test_captured_tool_message_does_not_surface(tmp_path):
     assert coverage_gaps(ob, "message") == []
 
 
-def test_non_tool_message_role_is_out_of_scope_for_coverage(tmp_path):
-    """Only role='tool' messages are covered; a non-tool row never surfaces
-    as a 'message' coverage gap, captured or not.
-    """
+def test_uncaptured_user_and_assistant_messages_surface_as_coverage_gaps(tmp_path):
     hh = tmp_path / "hermes"
     hh.mkdir()
     make_state_db(
         hh,
         sessions=[("P", "cli", None, B, B + 1, 1, None)],
-        messages=[(11, "P", "user"), (12, "P", "assistant")],
+        messages=[
+            (11, "P", "user", "prompt"),
+            (12, "P", "assistant", "response"),
+            (13, "P", "assistant", ""),  # tool-call scaffold is out of scope
+        ],
     )
     ob = new_outbox(tmp_path)
     append_event(ob, "session.created", session_id="P", correlation_id="P")
+
+    reconcile(ob, hh, now=B, config=CFG)
+
+    assert {
+        gap["payload"]["subject_id"] for gap in coverage_gaps(ob, "message")
+    } == {"11", "12"}
+
+
+def test_captured_user_and_assistant_messages_do_not_surface(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    make_state_db(
+        hh,
+        sessions=[("P", "cli", None, B, B + 1, 1, None)],
+        messages=[
+            (11, "P", "user", "prompt"),
+            (12, "P", "assistant", "response"),
+        ],
+    )
+    ob = new_outbox(tmp_path)
+    append_event(ob, "session.created", session_id="P", correlation_id="P")
+    append_event(
+        ob,
+        "invocation.started",
+        session_id="P",
+        correlation_id="P",
+        payload={"message_row_id": 11},
+    )
+    append_event(
+        ob,
+        "invocation.completed",
+        session_id="P",
+        correlation_id="P",
+        payload={"message_row_id": 12},
+    )
 
     reconcile(ob, hh, now=B, config=CFG)
 
@@ -355,8 +392,8 @@ def test_mixed_captured_and_uncaptured_rows_across_all_subject_kinds(tmp_path):
             ("gap-sess", "cli", None, B, None, 0, None),
         ],
         messages=[
-            (20, "cap-sess", "tool"),
-            (21, "cap-sess", "tool"),
+            (20, "cap-sess", "tool", "{}"),
+            (21, "cap-sess", "tool", "{}"),
         ],
         model_usage=[
             ("cap-sess", "m1", "chat"),

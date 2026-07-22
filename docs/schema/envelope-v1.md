@@ -39,7 +39,7 @@ adapter, and the reconciler. The validator lives in
 | `content_nonce` | string (base64) | no | encrypted | The per-record AEAD nonce for `content_ciphertext`. |
 | `content_hash` | string (hex) | no | integrity | The hash of the plaintext content, computed before encryption. |
 | `key_version` | string | no | encrypted | The id of the encryption key and algorithm for `content_ciphertext`. |
-| `partial` | boolean | yes | integrity | True when the event is reconstructed or not yet terminal. Consumers treat it as provisional and expect a later, better event. |
+| `partial` | boolean | yes | integrity | True when the event is reconstructed, not yet terminal, or content was capped. Consumers treat it as provisional or consult event-specific truncation metadata. |
 
 **Content-field invariant:** `content_nonce`, `content_hash`, and
 `key_version` are present if and only if `content_ciphertext` is present.
@@ -67,6 +67,26 @@ absolute source values. An unchanged re-poll emits nothing. If Hermes resets a
 counter, its current absolute value becomes the first delta of the new counter
 epoch and the affected names appear in `counter_reset_fields`. Consumers can
 therefore sum event values without double-counting cumulative snapshots.
+
+**Invocation content projection:** the live `hook:agent:start` and
+`hook:agent:end` records are immediate, partial, metadata-only bookends.
+Hermes truncates their message/response context before the hook runs, so the
+spooler removes those previews instead of persisting a silent cutoff. A later
+`poll:state.db:messages` pass projects each non-empty `role='user'` row as
+`invocation.started` and each non-empty `role='assistant'` row as
+`invocation.completed`. These durable content carriers reuse the hook-derived
+`invocation_id`, set `payload.message_role` and `payload.message_row_id`, and
+store the body only in encrypted content fields. User-row attribution permits
+a bounded pre-start skew because Hermes persists the row shortly before firing
+`agent:start`. Empty assistant rows used for tool-call structure are not
+responses; the corresponding `role='tool'` rows remain
+`tool.call_completed`.
+
+Every state-message content carrier includes `payload.content_original_bytes`,
+`payload.content_captured_bytes`, and `payload.content_truncated`. The configured
+byte cap applies uniformly to user, assistant, and tool bodies. Truncation
+stops before a partial UTF-8 code point and sets `partial=true`; `content_hash`
+is the hash of the exact captured plaintext bytes.
 
 **`runtime.gateway_start_failed`** is emitted by the reconciler (`source`
 `reconciler`, `capture_method` `derive:reconciler`, `partial` true) because
@@ -207,10 +227,16 @@ Do not add one global sequence. It is not needed and it makes a bottleneck.
 
 ## Supersession
 
-Keep both the partial event and the later authoritative event. The
-authoritative event carries a `supersedes` pointer, matched on
-`correlation_id`, subject, and `content_hash`. Consumers pick the
-non-partial event. Do not compact in the POC.
+Keep both the partial event and the later authoritative event. Consumers
+match them on their stable subject identity (`session_id`, `invocation_id`,
+or another event-family key) and prefer the non-partial representation. Do
+not compact in the POC.
+
+Invocation hook bookends and durable message rows are complementary rather
+than duplicate content records: the hook supplies immediate timing/metadata,
+the state row supplies encrypted content, and `invocation_id` joins them. A
+truncated state row remains partial and advertises the configured cutoff in
+its payload.
 
 ## Privacy boundary
 

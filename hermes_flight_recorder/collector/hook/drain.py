@@ -3,8 +3,9 @@
 The in-gateway spooler appends one JSON line per Hermes lifecycle event to
 ``hook-spool.jsonl``. This module runs in the Flight Recorder environment and turns
 those raw lines into canonical envelope v1 records: it maps each event,
-encrypts the content, assigns the ``producer_sequence`` via the outbox, and
-appends with a dedup key.
+assigns the ``producer_sequence`` via the outbox, and appends with a dedup
+key. Invocation hooks are metadata-only; complete user/assistant content is
+captured later from ``state.db``.
 
 Durability model (issue #4): at-least-once with dedup at the drain. The read
 cursor is a byte offset stored in the outbox meta. On a Flight Recorder stop between
@@ -244,7 +245,6 @@ def _map_event(
         if is_start:
             payload["thread_id"] = ctx.get("thread_id")
             payload["chat_id"] = ctx.get("chat_id")
-        content = ctx.get("message") if is_start else ctx.get("response")
         return (
             build_record(
                 event_type="invocation.started" if is_start else "invocation.completed",
@@ -260,7 +260,7 @@ def _map_event(
                 partial=True,
                 payload=_clean(payload),
             ),
-            content or None,
+            None,
         )
 
     return None  # an event we do not map; ignore it

@@ -97,8 +97,26 @@ managing it yourself.
 }
 ```
 
-`capture` is the configuration surface for capture limits. Retention is off
-by default, preserving the unbounded local history. When enabled,
+`capture.message_roles` selects which supported `state.db` message roles
+(`user`, `assistant`, and `tool`) become encrypted events.
+`capture.max_content_bytes` limits each encrypted body by UTF-8 byte length
+(64 KiB by default). A capped event records `content_truncated`,
+`content_original_bytes`, and `content_captured_bytes` in plaintext metadata,
+so a shortened body is never silent. The limit applies uniformly to user,
+assistant, and tool content.
+
+Invocation hooks remain the immediate metadata source. Hermes truncates the
+message and response values it supplies to hooks, so the installed spooler
+removes those previews before writing the spool. The next `state.db` poll
+captures complete content-bearing user/assistant rows, encrypts them, and
+attributes them to the hook invocation window. Empty assistant rows that only
+carry tool-call structure are skipped; their tool results are captured through
+the `tool` role. On the first poll after upgrading to this capture model, a
+versioned cursor performs a one-time message-table backfill. Existing tool
+events deduplicate by their stable keys; user/assistant rows gain their
+encrypted durable record.
+
+Retention is off by default, preserving the unbounded local history. When enabled,
 `hermes-flight-recorder prune` removes events older than `max_age_days` or,
 oldest-first, until retained event-envelope JSON fits `max_bytes`. Only events
 at or below the server-acknowledged delivery cursor are eligible;
