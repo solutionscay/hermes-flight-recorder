@@ -14,6 +14,7 @@ Components:
 - ``gateway_log``: read-only adapter for terminal model-provider failures
 - ``reconcile``: diff the durable stores against the outbox to detect
                  gaps, missing terminals, and missed cron runs
+- ``retention``: prune only server-acknowledged rows by age or byte budget
 - ``sync``:      batch pending outbox events for an acknowledged transport
 """
 

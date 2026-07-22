@@ -112,9 +112,12 @@ def reconcile(
     home = resolve_hermes_home(hermes_home)
     installation_id = outbox.installation_id
 
-    # Snapshot the captured stream once, before any emission, so findings
-    # appended this pass never perturb detection within the same pass.
+    # Snapshot the retained stream and compact retention summaries once,
+    # before any emission, so findings appended this pass never perturb
+    # detection. Summaries keep intentionally pruned sequences and durable
+    # subjects from looking like capture loss without restoring event bodies.
     events = list(outbox.iter_events(installation_id))
+    events.extend(outbox.iter_pruned_summaries(installation_id))
     # Snapshot the cron executions once too; three detectors read them.
     exec_rows = _load_execution_rows(home)
     counts: dict[str, int] = defaultdict(int)

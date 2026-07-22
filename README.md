@@ -4,7 +4,7 @@
 
 Hermes Flight Recorder records what your agents did, what failed, and where the record is incomplete. It runs beside Hermes, keeps working when the network is down, and encrypts sensitive captured content before it leaves the machine.
 
-Hermes Flight Recorder captures Hermes activity into a durable, append-only event log. It can reconcile that log against Hermes state, so missing events and failed work are visible instead of silently disappearing.
+Hermes Flight Recorder captures Hermes activity into a durable, append-ordered event log. It can reconcile that log against Hermes state, so missing events and failed work are visible instead of silently disappearing. Optional retention can bound the local copy after the server has durably acknowledged it; retention is off by default.
 
 ## Local first. Cloud optional.
 
@@ -43,6 +43,8 @@ hermes-flight-recorder observe --tree
 ```
 
 `sync` is optional and is the only command that uses the network. Configure it with an HTTPS endpoint and credentials, then run `hermes-flight-recorder sync`.
+
+When retention is enabled in `recorder-config.json`, `hermes-flight-recorder prune` applies the configured age and byte limits immediately. `run` and `sync` also apply it automatically on a six-hour cadence. Events beyond the durable delivery cursor are never deleted.
 
 ## Status
 

@@ -86,7 +86,8 @@ managing it yourself.
     "enabled": false,
     "max_age_days": 30,
     "max_bytes": null,
-    "require_delivered": true
+    "require_delivered": true,
+    "vacuum": "auto"
   },
   "sync": {
     "interval_seconds": null,
@@ -96,9 +97,22 @@ managing it yourself.
 }
 ```
 
-`capture` and `retention` are configuration surfaces for the corresponding
-capture-limit and outbox-pruning work. `sync.max_records` and
-`sync.max_bytes` are active now. `sync.interval_seconds` is `null` by default,
+`capture` is the configuration surface for capture limits. Retention is off
+by default, preserving the unbounded local history. When enabled,
+`hermes-flight-recorder prune` removes events older than `max_age_days` or,
+oldest-first, until retained event-envelope JSON fits `max_bytes`. Only events
+at or below the server-acknowledged delivery cursor are eligible;
+`require_delivered` must remain `true`. `vacuum: "auto"` reclaims SQLite pages
+after a deletion. `run` and `sync` also check the policy at most once every six
+hours. The `seq` and `meta` tables, including all producer and delivery
+cursors, are preserved. Before an envelope is deleted, the recorder keeps a
+compact tombstone with its sequence, deduplication identity, and non-content
+reconciliation fields. Tombstones contain no encrypted body or full envelope;
+they stop durable-store polls from recreating delivered events and stop
+reconciliation from reporting intentional retention as capture loss.
+
+`sync.max_records` and `sync.max_bytes` are active now.
+`sync.interval_seconds` is `null` by default,
 preserving the current one-pass `sync` behavior; set a positive number to run
 continuously. An explicit `sync --interval` takes precedence over that value.
 
@@ -106,6 +120,7 @@ The environment equivalents are `HFR_CAPTURE_MAX_CONTENT_BYTES`,
 `HFR_CAPTURE_MESSAGE_ROLES` (a JSON array), `HFR_CAPTURE_SOURCES` (a JSON
 object), `HFR_RETENTION_ENABLED`, `HFR_RETENTION_MAX_AGE_DAYS`,
 `HFR_RETENTION_MAX_BYTES`, `HFR_RETENTION_REQUIRE_DELIVERED`,
+`HFR_RETENTION_VACUUM`,
 `HFR_SYNC_INTERVAL_SECONDS`, `HFR_SYNC_MAX_RECORDS`, and
 `HFR_SYNC_MAX_BYTES`. The ingest URL and Cloudflare Access credentials remain
 in the separate private `sync-config.json` or their existing environment
