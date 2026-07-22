@@ -20,6 +20,8 @@ def test_missing_or_partial_config_uses_current_defaults(tmp_path):
     assert missing.capture.message_roles == ("user", "assistant", "tool")
     assert missing.retention.enabled is False
     assert missing.retention.vacuum == "auto"
+    assert missing.knowledge.history == "full"
+    assert missing.knowledge.max_versions is None
     assert missing.sync.interval_seconds is None
     assert missing.sync.max_records == 500
     assert missing.sync.max_bytes == 1024 * 1024
@@ -46,12 +48,16 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     monkeypatch.setenv("HFR_SYNC_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("HFR_SYNC_MAX_RECORDS", "50")
     monkeypatch.setenv("HFR_CAPTURE_MESSAGE_ROLES", '["assistant", "tool"]')
+    monkeypatch.setenv("HFR_KNOWLEDGE_HISTORY", "latest_only")
+    monkeypatch.setenv("HFR_KNOWLEDGE_MAX_VERSIONS", "5")
 
     config = recorder_config.load(tmp_path)
 
     assert config.capture.max_content_bytes == 20
     assert config.capture.message_roles == ("assistant", "tool")
     assert config.retention.enabled is True
+    assert config.knowledge.history == "latest_only"
+    assert config.knowledge.max_versions == 5
     assert config.sync.interval_seconds == 2.5
     assert config.sync.max_records == 50
     assert config.sync.max_bytes == 100
@@ -66,6 +72,8 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
         ({"sync": {"max_records": 1.5}}, "sync.max_records"),
         ({"capture": {"message_roles": "user"}}, "message_roles"),
         ({"capture": {"sources": {"hook": "yes"}}}, "capture.sources"),
+        ({"knowledge": {"history": "some"}}, "knowledge.history"),
+        ({"knowledge": {"max_versions": 0}}, "knowledge.max_versions"),
     ],
 )
 def test_invalid_values_are_rejected(tmp_path, payload, match):
@@ -77,6 +85,7 @@ def test_invalid_values_are_rejected(tmp_path, payload, match):
 def test_save_writes_private_file_and_round_trips(tmp_path):
     config = recorder_config.RecorderConfig(
         capture=recorder_config.CaptureConfig(sources={"hook": False}),
+        knowledge=recorder_config.KnowledgeConfig(history="latest_only", max_versions=3),
         sync=recorder_config.SyncRuntimeConfig(max_records=25),
     )
 

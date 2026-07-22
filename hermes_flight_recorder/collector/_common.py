@@ -91,6 +91,86 @@ def kanban_board_dbs(home: Path) -> list[tuple[str, Path]]:
     return boards
 
 
+def skills_dir(home: Path) -> Path:
+    return home / "skills"
+
+
+def memories_dir(home: Path) -> Path:
+    return home / "memories"
+
+
+def memory_files(home: Path) -> list[tuple[str, Path]]:
+    """The two built-in memory artifacts as ``(target, path)``.
+
+    ``target`` is Hermes's own selector: ``"memory"`` → ``MEMORY.md`` and
+    ``"user"`` → ``USER.md``. Only existing files are returned.
+    """
+    md = memories_dir(home)
+    out: list[tuple[str, Path]] = []
+    for target, name in (("memory", "MEMORY.md"), ("user", "USER.md")):
+        path = md / name
+        if path.is_file():
+            out.append((target, path))
+    return out
+
+
+# The four supporting subdirectories a skill may carry (Hermes
+# ``ALLOWED_SUBDIRS``); there is no ``examples/``. SKILL.md sits at the root.
+SKILL_SUBDIRS = ("references", "templates", "scripts", "assets")
+
+
+def _provenance_skill_names(skills: Path) -> set[str]:
+    """Skill names that are bundled or Hub-installed (never Hermes-created).
+
+    Provenance lives in two sidecars under ``<skills>/``: ``.bundled_manifest``
+    (``name:hash`` per line) and ``.hub/lock.json`` (an ``installed`` map keyed
+    by name). Either presence means Hermes did not author the skill.
+    """
+    names: set[str] = set()
+    try:
+        for line in (skills / ".bundled_manifest").read_text().splitlines():
+            entry = line.strip()
+            if entry:
+                names.add(entry.split(":", 1)[0].strip())
+    except OSError:
+        pass
+    installed = load_json_dict(skills / ".hub" / "lock.json").get("installed")
+    if isinstance(installed, dict):
+        names.update(str(name) for name in installed)
+    return names
+
+
+def hermes_created_skills(home: Path) -> list[tuple[str, str | None, Path]]:
+    """Hermes-created skills as ``(name, category, skill_dir)``.
+
+    A skill directory holds a ``SKILL.md``, at ``<skills>/<name>/`` or
+    ``<skills>/<category>/<name>/``. Bundled and Hub-installed skills are
+    excluded by name; dot-prefixed sidecars (``.bundled_manifest``, ``.hub``,
+    ``.usage.json``, ``.archive``, …) are skipped. A home with no skills, or
+    only out-of-the-box ones, yields ``[]``.
+    """
+    skills = skills_dir(home)
+    if not skills.is_dir():
+        return []
+    excluded = _provenance_skill_names(skills)
+    out: list[tuple[str, str | None, Path]] = []
+
+    def consider(name: str, category: str | None, path: Path) -> None:
+        if name not in excluded and (path / "SKILL.md").is_file():
+            out.append((name, category, path))
+
+    for child in sorted(skills.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if (child / "SKILL.md").is_file():
+            consider(child.name, None, child)
+            continue
+        for grandchild in sorted(child.iterdir()):  # child is a category dir
+            if grandchild.is_dir() and not grandchild.name.startswith("."):
+                consider(grandchild.name, child.name, grandchild)
+    return out
+
+
 def to_epoch(value: Any) -> float | None:
     """Normalize a Hermes timestamp to epoch seconds.
 
