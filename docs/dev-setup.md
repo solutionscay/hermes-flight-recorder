@@ -105,7 +105,11 @@ at or below the server-acknowledged delivery cursor are eligible;
 `require_delivered` must remain `true`. `vacuum: "auto"` reclaims SQLite pages
 after a deletion. `run` and `sync` also check the policy at most once every six
 hours. The `seq` and `meta` tables, including all producer and delivery
-cursors, are preserved.
+cursors, are preserved. Before an envelope is deleted, the recorder keeps a
+compact tombstone with its sequence, deduplication identity, and non-content
+reconciliation fields. Tombstones contain no encrypted body or full envelope;
+they stop durable-store polls from recreating delivered events and stop
+reconciliation from reporting intentional retention as capture loss.
 
 `sync.max_records` and `sync.max_bytes` are active now.
 `sync.interval_seconds` is `null` by default,

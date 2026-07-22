@@ -7,8 +7,10 @@ import json
 import pytest
 
 from hermes_flight_recorder import cli
+from hermes_flight_recorder.collector import state_db
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.recorder_config import RetentionConfig
+from hermes_flight_recorder.collector.reconcile import reconcile
 from hermes_flight_recorder.collector.retention import (
     RetentionError,
     maybe_prune,
@@ -16,6 +18,7 @@ from hermes_flight_recorder.collector.retention import (
 )
 
 from test_outbox import base_record
+from test_state_adapter import make_state_db
 
 
 NOW = 2_000_000_000.0
@@ -94,10 +97,11 @@ def test_age_policy_prunes_only_delivered_and_preserves_authority_and_meta(tmp_p
     assert outbox.get_cursor("state.db") == "99"
     assert outbox.get_meta("collector:pairing") == "kept"
 
-    # Pruning releases an old dedup key, but the advanced producer cursor is
-    # preserved and sequence authority never reuses the removed sequence.
+    # The compact tombstone preserves dedup without retaining the envelope.
     replacement = outbox.append(base_record(), dedup_key="old-one")
-    assert replacement["producer_sequence"] == 5
+    assert replacement["producer_sequence"] == 1
+    assert event_sequences(outbox) == [2, 4]
+    assert outbox.high_water() == 4
     assert outbox.get_cursor("state.db") == "99"
     outbox.close()
 
@@ -164,8 +168,37 @@ def test_vacuum_reclaims_database_pages_after_prune(tmp_path):
     assert result is not None
     assert result.pruned_count == 80
     assert result.database_bytes_reclaimed > 0
+    assert result.space_reclaim_error is None
     assert outbox._conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
     assert wal_path.stat().st_size == 0
+    outbox.close()
+
+
+def test_vacuum_failure_reports_successful_prune_with_warning(
+    tmp_path, monkeypatch, capsys
+):
+    outbox = open_outbox(tmp_path)
+    append_at(outbox, OLD)
+    outbox.set_cursor("delivery", 1)
+
+    def fail_reclaim() -> None:
+        raise RuntimeError("simulated vacuum failure")
+
+    monkeypatch.setattr(outbox, "_reclaim_space", fail_reclaim)
+    result = prune(
+        outbox,
+        RetentionConfig(enabled=True, max_age_days=30),
+        now=NOW,
+    )
+
+    assert result is not None
+    assert result.pruned_count == 1
+    assert result.space_reclaim_error == "simulated vacuum failure"
+    assert outbox.count() == 0
+    cli._print_prune_result(result)
+    output = capsys.readouterr()
+    assert "pruned 1 delivered event" in output.out
+    assert "space reclamation failed after pruning" in output.err
     outbox.close()
 
 
@@ -199,6 +232,72 @@ def test_automatic_prune_is_persistently_throttled(tmp_path):
     assert first is not None and first.pruned_count == 1
     assert second is None
     assert third is not None and third.pruned_count == 1
+    outbox.close()
+
+
+def _pruned_state_history(tmp_path):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    make_state_db(hermes_home)
+    outbox = open_outbox(tmp_path / "recorder")
+    first = state_db.poll(outbox, hermes_home)
+    original_high_water = outbox.high_water()
+    outbox.set_cursor("delivery", original_high_water)
+    result = prune(
+        outbox,
+        RetentionConfig(enabled=True, max_age_days=None, max_bytes=1),
+        now=NOW,
+    )
+    assert result is not None and result.pruned_count == sum(first.values())
+    assert outbox.count() == 0
+    return outbox, hermes_home, original_high_water
+
+
+def test_pruned_tombstones_prevent_full_scan_sources_from_recapturing(tmp_path):
+    outbox, hermes_home, original_high_water = _pruned_state_history(tmp_path)
+
+    raw_summaries = [
+        row[0]
+        for row in outbox._conn.execute(
+            "SELECT summary_json FROM retention_tombstones"
+        )
+    ]
+    assert len(raw_summaries) == original_high_water
+    assert all("content_ciphertext" not in raw for raw in raw_summaries)
+    assert all("envelope_json" not in raw for raw in raw_summaries)
+    assert state_db.poll(outbox, hermes_home) == {}
+    assert outbox.count() == 0
+    assert outbox.high_water() == original_high_water
+    outbox.close()
+
+
+def test_reconcile_treats_intentionally_pruned_history_as_captured(tmp_path):
+    outbox, hermes_home, original_high_water = _pruned_state_history(tmp_path)
+
+    assert reconcile(outbox, hermes_home, now=1020.0) == {}
+    assert outbox.count() == 0
+    assert outbox.high_water() == original_high_water
+    outbox.close()
+
+
+def test_reconcile_does_not_report_intentionally_pruned_sequence_gaps(tmp_path):
+    outbox = open_outbox(tmp_path / "recorder")
+    append_at(outbox, OLD)
+    append_at(outbox, NOW)
+    append_at(outbox, OLD)
+    append_at(outbox, NOW)
+    outbox.set_cursor("delivery", 4)
+
+    result = prune(
+        outbox,
+        RetentionConfig(enabled=True, max_age_days=30),
+        now=NOW,
+    )
+
+    assert result is not None and result.pruned_count == 2
+    assert event_sequences(outbox) == [2, 4]
+    assert reconcile(outbox, tmp_path / "missing-hermes", now=NOW) == {}
+    assert event_sequences(outbox) == [2, 4]
     outbox.close()
 
 

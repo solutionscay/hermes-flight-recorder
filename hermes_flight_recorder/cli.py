@@ -55,6 +55,12 @@ def _print_prune_result(result, *, automatic: bool = False) -> None:
         f"removed {result.event_bytes_removed} event bytes and reclaimed "
         f"{result.database_bytes_reclaimed} database bytes"
     )
+    if result.space_reclaim_error is not None:
+        print(
+            f"{prefix}space reclamation failed after pruning: "
+            f"{result.space_reclaim_error}",
+            file=sys.stderr,
+        )
 
 
 def _automatic_prune(outbox, config) -> None:

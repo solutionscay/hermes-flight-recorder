@@ -17,7 +17,9 @@ Key properties:
 - Content is encrypted before write with a local dev key (POC only; real
   key custody is deferred).
 - Retention can remove acknowledged event rows, but never sequence or meta
-  state. The independent high-water mark therefore remains authoritative.
+  state. Compact non-content tombstones preserve deduplication and
+  reconciliation identity. The independent high-water mark therefore remains
+  authoritative.
 
 The outbox database must never live under ``HERMES_HOME``.
 """
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import sqlite3
 import time
@@ -69,11 +72,49 @@ CREATE TABLE IF NOT EXISTS events (
     envelope_json     TEXT NOT NULL,
     UNIQUE (installation_id, producer_sequence)
 );
+CREATE TABLE IF NOT EXISTS retention_tombstones (
+    installation_id   TEXT NOT NULL,
+    producer_sequence INTEGER NOT NULL,
+    event_id          TEXT NOT NULL,
+    dedup_key         TEXT UNIQUE,
+    recorded_at       REAL NOT NULL,
+    summary_json      TEXT NOT NULL,
+    PRIMARY KEY (installation_id, producer_sequence)
+);
 """
 
 
 class OutboxError(RuntimeError):
     pass
+
+
+_RETENTION_PAYLOAD_KEYS = (
+    "message_row_id",
+    "model",
+    "task",
+    "execution_id",
+    "board",
+    "task_id",
+    "run_id",
+)
+
+
+def _retention_summary(record: dict[str, Any], sequence: int) -> dict[str, Any]:
+    """Return the non-content fields reconciliation needs after a prune."""
+    payload = record.get("payload", {})
+    summary_payload = {"event_type": payload.get("event_type")}
+    for key in _RETENTION_PAYLOAD_KEYS:
+        if key in payload:
+            summary_payload[key] = payload[key]
+
+    summary: dict[str, Any] = {
+        "producer_sequence": sequence,
+        "payload": summary_payload,
+    }
+    for key in ("session_id", "invocation_id"):
+        if record.get(key) is not None:
+            summary[key] = record[key]
+    return summary
 
 
 @dataclass(frozen=True)
@@ -88,6 +129,7 @@ class PruneResult:
     event_bytes_after: int
     database_bytes_reclaimed: int
     delivery_cursor: int
+    space_reclaim_error: str | None = None
 
 
 class Outbox:
@@ -267,6 +309,22 @@ class Outbox:
                     conn.execute("COMMIT")
                     return (parse(existing[0]) if return_stored else rec), False
 
+                pruned = conn.execute(
+                    "SELECT event_id, producer_sequence, recorded_at "
+                    "FROM retention_tombstones WHERE dedup_key=?",
+                    (dedup_key,),
+                ).fetchone()
+                if pruned is not None:
+                    conn.execute("COMMIT")
+                    if return_stored:
+                        # The full envelope was intentionally removed. Return
+                        # the caller's logical record with the original stable
+                        # identity instead of creating a replacement event.
+                        rec["event_id"] = pruned[0]
+                        rec["producer_sequence"] = pruned[1]
+                        rec["recorded_at"] = pruned[2]
+                    return rec, False
+
             row = conn.execute(
                 "SELECT high_water FROM seq WHERE installation_id=?", (inst,)
             ).fetchone()
@@ -443,6 +501,7 @@ class Outbox:
                 "FROM retention_prune"
             ).fetchone()
             if pruned_count:
+                self._store_retention_tombstones()
                 conn.execute(
                     "DELETE FROM events WHERE rowid_pk IN "
                     "(SELECT rowid_pk FROM retention_prune)"
@@ -452,12 +511,15 @@ class Outbox:
             conn.execute("ROLLBACK")
             raise
 
+        space_reclaim_error = None
         if pruned_count and vacuum:
-            conn.execute("VACUUM")
-            # VACUUM rebuilds the logical database. In WAL mode, checkpoint
-            # that rebuild and truncate the log so the reclaimed pages also
-            # become free filesystem space promptly.
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            try:
+                self._reclaim_space()
+            except Exception as exc:
+                # The event deletion committed before VACUUM. Preserve and
+                # report that successful prune instead of misreporting the
+                # whole operation as refused.
+                space_reclaim_error = str(exc)
 
         database_bytes_after = self._allocated_bytes()
         return PruneResult(
@@ -471,13 +533,84 @@ class Outbox:
                 0, database_bytes_before - database_bytes_after
             ),
             delivery_cursor=delivery_cursor,
+            space_reclaim_error=space_reclaim_error,
         )
+
+    def _store_retention_tombstones(self) -> None:
+        """Keep compact idempotency and reconciliation state before deletion."""
+        rows = self._conn.execute(
+            "SELECT e.installation_id, e.producer_sequence, e.event_id, "
+            "e.dedup_key, e.recorded_at, e.envelope_json "
+            "FROM events AS e JOIN retention_prune AS p "
+            "ON p.rowid_pk=e.rowid_pk ORDER BY e.producer_sequence"
+        )
+        batch: list[tuple[str, int, str, str | None, float, str]] = []
+        try:
+            for installation_id, sequence, event_id, dedup_key, recorded_at, raw in rows:
+                record = parse(raw)
+                summary = _retention_summary(record, sequence)
+                batch.append(
+                    (
+                        installation_id,
+                        sequence,
+                        event_id,
+                        dedup_key,
+                        recorded_at,
+                        json.dumps(
+                            summary,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
+                if len(batch) == 1_000:
+                    self._insert_retention_tombstones(batch)
+                    batch.clear()
+            if batch:
+                self._insert_retention_tombstones(batch)
+        finally:
+            rows.close()
+
+    def _insert_retention_tombstones(
+        self,
+        rows: list[tuple[str, int, str, str | None, float, str]],
+    ) -> None:
+        self._conn.executemany(
+            "INSERT INTO retention_tombstones "
+            "(installation_id, producer_sequence, event_id, dedup_key, "
+            "recorded_at, summary_json) VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+    def _reclaim_space(self) -> None:
+        """Rebuild the database and release its WAL pages to the filesystem."""
+        self._conn.execute("VACUUM")
+        checkpoint = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is not None and checkpoint[0] != 0:
+            raise sqlite3.OperationalError("WAL checkpoint remained busy")
 
     def _allocated_bytes(self) -> int:
         """Return bytes allocated to the SQLite database's pages."""
         page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
         page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
         return page_size * page_count
+
+    def iter_pruned_summaries(
+        self,
+        installation_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield compact summaries for intentionally pruned event sequences."""
+        inst = installation_id or self.installation_id
+        rows = self._conn.execute(
+            "SELECT summary_json FROM retention_tombstones "
+            "WHERE installation_id=? ORDER BY producer_sequence",
+            (inst,),
+        )
+        try:
+            for (raw,) in rows:
+                yield json.loads(raw)
+        finally:
+            rows.close()
 
     def iter_events(
         self,
