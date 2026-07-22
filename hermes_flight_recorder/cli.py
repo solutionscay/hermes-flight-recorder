@@ -144,13 +144,16 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
             return 2
 
         try:
-            capture_config = recorder_config.load(args.flight_recorder_home).capture
+            runtime_config = recorder_config.load(args.flight_recorder_home)
         except recorder_config.RecorderConfigError as exc:
             print(f"reconcile not configured: {exc}", file=sys.stderr)
             return 2
 
         counts = reconcile(
-            outbox, args.hermes_home, capture_config=capture_config
+            outbox,
+            args.hermes_home,
+            capture_config=runtime_config.capture,
+            knowledge_config=runtime_config.knowledge,
         )
         total = sum(counts.values())
         print(f"reconciled {total} new finding(s) into {outbox.path}:")

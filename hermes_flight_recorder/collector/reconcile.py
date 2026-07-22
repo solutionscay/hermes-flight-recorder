@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import CAPTURE_HEARTBEAT_KEY
+from . import CAPTURE_HEARTBEAT_KEY, knowledge_store
 from ..envelope import SESSION_LIFECYCLE, SESSION_START_TYPES
 from ._common import (
     append_and_count,
@@ -58,6 +58,7 @@ from ._common import (
     load_json_dict,
     open_sqlite_read_only,
     read_float,
+    read_home_mode,
     resolve_hermes_home,
     root_session,
     runtime_stamp,
@@ -66,7 +67,7 @@ from ._common import (
     to_epoch,
 )
 from .cron_schedule import expected_instants
-from .recorder_config import CaptureConfig
+from .recorder_config import CaptureConfig, KnowledgeConfig
 
 _SOURCE = "reconciler"
 _CAPTURE = "derive:reconciler"
@@ -99,6 +100,12 @@ class ReconcileConfig:
     # ticks, comfortably above deploy-restart jitter yet far tighter than the
     # 3h20m blackout that went unseen.
     capture_stale_after: float = 300.0
+    # A knowledge change on disk (or a store version with no event) younger than
+    # this is not yet drift — a healthy capture pass runs every ~15s and would
+    # still be catching up. Older than this, the scanner/emitter genuinely missed
+    # it. Same 5-min margin as the capture heartbeat; avoids the :00 boundary
+    # race where capture and reconcile both see a just-written file.
+    knowledge_drift_grace: float = 300.0
     # How far an execution may sit from an expected fire and still count as
     # that fire. Absorbs ticker jitter (a "1m" job fired ~78s apart).
     cron_match_slack: float = 45.0
@@ -114,10 +121,12 @@ def reconcile(
     now: float | None = None,
     config: ReconcileConfig | None = None,
     capture_config: CaptureConfig | None = None,
+    knowledge_config: KnowledgeConfig | None = None,
 ) -> dict[str, int]:
     """One reconcile pass. Returns per-event-type counts of new findings."""
     cfg = config or ReconcileConfig()
     capture = capture_config or CaptureConfig()
+    knowledge = knowledge_config or KnowledgeConfig()
     when = float(now) if now is not None else time.time()
     home = resolve_hermes_home(hermes_home)
     installation_id = outbox.installation_id
@@ -143,6 +152,7 @@ def reconcile(
     _detect_gateway_start_failed(outbox, home, counts, when)
     _detect_stale_task_leases(outbox, home, counts, when, cfg)
     _detect_capture_stale(outbox, counts, when, cfg)
+    _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
     return dict(counts)
 
 
@@ -986,6 +996,102 @@ def _detect_capture_stale(outbox, counts, when, cfg) -> None:
         },
         dedup_key=f"reconcile:capture_stale:{int(last)}",
     )
+
+
+# --- knowledge drift + event gap ----------------------------------------
+def _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge_config) -> None:
+    """The Phase 3 analog of the coverage/missed-cron reconcilers.
+
+    Two integrity checks over the two-stage knowledge pipeline (disk → store →
+    event), each a backstop for one stage the scanner runs on the capture path:
+
+    - **Store-vs-disk drift.** A tracked artifact whose on-disk content no longer
+      matches its latest store version — the scanner missed a change (capture was
+      down, or a write slipped a scan). Emit ``gap_kind='uncaptured_knowledge'``
+      and heal by recording the missed version through the scanner's own path.
+    - **Store-vs-event gap.** A store version the emitter never turned into a
+      ``knowledge.record_written`` — the transport fell behind. Emit
+      ``gap_kind='unemitted_knowledge'``.
+
+    Both walk the same Hermes-created surface the scanner does, so a bundled or
+    Hub skill is never flagged or backfilled. Both apply a grace window so a
+    just-written file (which a healthy capture would still be catching up on) is
+    not mistaken for a missed scan, and dedup on durable identity + content hash,
+    never the reconcile clock.
+    """
+    home_mode = read_home_mode(home)
+    _detect_knowledge_drift(outbox, home, home_mode, counts, when, cfg, knowledge_config)
+    _detect_unemitted_knowledge(outbox, counts, when, cfg)
+
+
+def _detect_knowledge_drift(
+    outbox, home, home_mode, counts, when, cfg, knowledge_config
+) -> None:
+    for artifact_id, kind, name, category, files in knowledge_store.iter_disk_artifacts(home):
+        try:
+            manifest, occurred_at = knowledge_store.read_manifest(outbox, files)
+        except OSError:
+            continue  # a live file vanished/locked between listing and read
+        if not manifest:
+            continue
+        disk_hash = outbox._manifest_hash(manifest)
+        latest = outbox.latest_knowledge_version(artifact_id)
+        stored_hash = (
+            None if (latest is None or latest["is_tombstone"]) else latest["manifest_hash"]
+        )
+        if stored_hash == disk_hash:
+            continue  # the store already reflects disk — no drift
+        if when - occurred_at <= cfg.knowledge_drift_grace:
+            continue  # too fresh — a healthy capture would still be catching up
+        _emit(
+            outbox,
+            counts,
+            event_type="reconcile.gap_detected",
+            occurred_at=when,
+            correlation_id=f"knowledge:{artifact_id}",
+            partial=True,
+            payload={
+                "gap_kind": "uncaptured_knowledge",
+                "subject_type": kind,
+                "subject_id": artifact_id,
+                "source_table": "fs:knowledge",
+                "disk_manifest_hash": disk_hash,
+                "stored_manifest_hash": stored_hash,
+            },
+            dedup_key=f"reconcile:knowledge:{artifact_id}:{disk_hash}",
+        )
+        # Heal: record the missed version (and emit its event) so the content is
+        # captured, not just flagged. Idempotent — a re-run finds no drift.
+        knowledge_store.heal_artifact(
+            outbox, knowledge_config, home_mode, artifact_id, kind, name, category, files
+        )
+
+
+def _detect_unemitted_knowledge(outbox, counts, when, cfg) -> None:
+    for artifact_id in outbox.knowledge_artifact_ids():
+        last_emitted = int(outbox.get_meta(f"knowledge:emitted:{artifact_id}") or 0)
+        for version in outbox.knowledge_versions(artifact_id):
+            if version["seq"] <= last_emitted:
+                continue  # already emitted
+            if when - version["occurred_at"] <= cfg.knowledge_drift_grace:
+                continue  # freshly captured — the emitter will ship it next tick
+            _emit(
+                outbox,
+                counts,
+                event_type="reconcile.gap_detected",
+                occurred_at=when,
+                correlation_id=f"knowledge:{artifact_id}",
+                partial=True,
+                payload={
+                    "gap_kind": "unemitted_knowledge",
+                    "subject_type": "knowledge_version",
+                    "subject_id": f"{artifact_id}:v{version['seq']}",
+                    "source_table": "store:knowledge_version",
+                    "origin": version["origin"],
+                    "version_seq": version["seq"],
+                },
+                dedup_key=f"reconcile:knowledge_unemitted:{artifact_id}:v{version['seq']}",
+            )
 
 
 # --- durable helpers ----------------------------------------------------
