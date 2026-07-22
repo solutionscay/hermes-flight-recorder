@@ -101,7 +101,8 @@ def _write_state_db(hh: Path) -> None:
             estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
             profile_name TEXT, expiry_finalized INT);
         CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT, timestamp REAL);
+            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
+            timestamp REAL, finish_reason TEXT);
         CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
             api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
             reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
@@ -119,9 +120,9 @@ def _write_state_db(hh: Path) -> None:
         ("C", "subagent", "P", "m", 1, 0, 0, 0, 0.0, B + 5, None, None, "default", 0),
     )
     conn.execute(
-        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
         (5, "P", "tool", "read_file", "tc1", None,
-         '{"exit_code":0,"detail":"SECRET-XYZ"}', B + 2),
+         '{"exit_code":0,"detail":"SECRET-XYZ"}', B + 2, None),
     )
     conn.execute(
         "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -139,8 +140,8 @@ def _insert_extra_tool_message(hh: Path, msg_id: int, session_id: str, content: 
     """Simulate a row that lands in state.db after a poll already ran."""
     conn = sqlite3.connect(hh / "state.db")
     conn.execute(
-        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
-        (msg_id, session_id, "tool", "write_file", "tc2", None, content, ts),
+        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
+        (msg_id, session_id, "tool", "write_file", "tc2", None, content, ts, None),
     )
     conn.commit()
     conn.close()

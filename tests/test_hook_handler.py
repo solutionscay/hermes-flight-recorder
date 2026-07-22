@@ -57,11 +57,17 @@ def test_agent_previews_are_removed_before_the_spool(tmp_path: Path, monkeypatch
         "agent:start", {"session_id": "s1", "message": "truncated prompt"}
     )
     handler.handle(
-        "agent:end", {"session_id": "s1", "response": "truncated response"}
+        "agent:end",
+        {
+            "session_id": "s1",
+            "message": "truncated prompt",
+            "response": "truncated response",
+        },
     )
 
     started, completed = read_spool(bridge)
     assert "message" not in started["context"]
+    assert "message" not in completed["context"]
     assert "response" not in completed["context"]
 
 

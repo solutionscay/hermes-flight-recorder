@@ -80,7 +80,10 @@ store the body only in encrypted content fields. User-row attribution permits
 a bounded pre-start skew because Hermes persists the row shortly before firing
 `agent:start`. Empty assistant rows used for tool-call structure are not
 responses; the corresponding `role='tool'` rows remain
-`tool.call_completed`.
+`tool.call_completed`. When a tool-call assistant row also contains text, it
+is retained as `model.call_succeeded` with
+`payload.message_phase='intermediate'`. Only the final assistant row becomes
+`invocation.completed`.
 
 Every state-message content carrier includes `payload.content_original_bytes`,
 `payload.content_captured_bytes`, and `payload.content_truncated`. The configured
@@ -187,7 +190,8 @@ lease renewals, never the reconcile-run clock.
 **P0-poc** — captured and observed in the Phase 0 POC:
 `runtime.gateway_started`, `runtime.gateway_start_failed`,
 `session.created`, `session.ended`,
-`invocation.started`, `invocation.completed`, `model.usage_recorded`,
+`invocation.started`, `invocation.completed`, `model.call_succeeded`,
+`model.usage_recorded`,
 `tool.call_completed`, `subagent.child_spawned`, `subagent.completed`,
 `delegation.dispatched`, `cron.ticker_heartbeat`, `cron.run_claimed`,
 `cron.run_finished`, `cron.run_missed`, `reconcile.gap_detected`,
@@ -195,8 +199,8 @@ lease renewals, never the reconcile-run clock.
 
 **Reserved** — defined in v1, not captured in the POC:
 `runtime.gateway_stopped`, `session.finalized`, `session.compressed`,
-`step.iterated`, `model.call_requested`, `model.call_succeeded`,
-`model.call_failed`, `tool.call_requested`, `tool.approval_requested`,
+`step.iterated`, `model.call_requested`, `model.call_failed`,
+`tool.call_requested`, `tool.approval_requested`,
 `tool.approval_responded`, `delegation.delivered`, `delegation.progress`,
 `cron.definition_changed`, `command.invoked`, `handoff.state_changed`,
 `task.created`, `task.claimed`, `task.completed`, `task.blocked`,

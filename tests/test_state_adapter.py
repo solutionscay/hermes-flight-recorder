@@ -26,7 +26,8 @@ def make_state_db(hermes_home) -> None:
             estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
             profile_name TEXT, expiry_finalized INT);
         CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT, timestamp REAL);
+            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
+            timestamp REAL, finish_reason TEXT);
         CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
             api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
             reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
@@ -44,13 +45,13 @@ def make_state_db(hermes_home) -> None:
         ],
     )
     db.executemany(
-        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
         [
-            (3, "P", "user", None, None, None, "do the thing", 1000.5),
-            (5, "P", "tool", "terminal", None, None, '{"output":"Sat","exit_code":0}', 1002.0),
-            (7, "P", "tool", "delegate_task", None, None, '{"status":"dispatched","count":1}', 1006.0),
-            (9, "C", "assistant", None, None, None, "", 1009.0),
-            (10, "C", "tool", "read_file", None, None, '{"content":"Sat Jul 18"}', 1010.0),
+            (3, "P", "user", None, None, None, "do the thing", 1000.5, None),
+            (5, "P", "tool", "terminal", None, None, '{"output":"Sat","exit_code":0}', 1002.0, None),
+            (7, "P", "tool", "delegate_task", None, None, '{"status":"dispatched","count":1}', 1006.0, None),
+            (9, "C", "assistant", None, None, None, "", 1009.0, "tool_calls"),
+            (10, "C", "tool", "read_file", None, None, '{"content":"Sat Jul 18"}', 1010.0, None),
         ],
     )
     db.executemany(

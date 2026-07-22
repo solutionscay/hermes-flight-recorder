@@ -109,12 +109,14 @@ Invocation hooks remain the immediate metadata source. Hermes truncates the
 message and response values it supplies to hooks, so the installed spooler
 removes those previews before writing the spool. The next `state.db` poll
 captures complete content-bearing user/assistant rows, encrypts them, and
-attributes them to the hook invocation window. Empty assistant rows that only
-carry tool-call structure are skipped; their tool results are captured through
-the `tool` role. On the first poll after upgrading to this capture model, a
-versioned cursor performs a one-time message-table backfill. Existing tool
-events deduplicate by their stable keys; user/assistant rows gain their
-encrypted durable record.
+attributes them to the hook invocation window. A final assistant row becomes
+`invocation.completed`; non-empty assistant text attached to a tool-call step
+becomes `model.call_succeeded`, so the text is retained without ending the
+invocation early. Empty assistant rows that only carry tool-call structure are
+skipped; their tool results are captured through the `tool` role. On the first
+poll after upgrading to this capture model, a versioned cursor performs a
+one-time message-table backfill. Existing tool events deduplicate by their
+stable keys; user/assistant rows gain their encrypted durable record.
 
 Retention is off by default, preserving the unbounded local history. When enabled,
 `hermes-flight-recorder prune` removes events older than `max_age_days` or,

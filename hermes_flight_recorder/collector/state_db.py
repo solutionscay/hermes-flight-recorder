@@ -207,10 +207,10 @@ def _poll_messages(
         placeholders = ",".join("?" for _ in supported_roles)
         rows = conn.execute(
             "SELECT id, session_id, role, tool_name, tool_call_id, "
-            "effect_disposition, content, timestamp FROM messages "
+            "effect_disposition, content, timestamp, finish_reason FROM messages "
             f"WHERE id > ? AND role IN ({placeholders}) ORDER BY id",
             (cursor, *supported_roles),
-        ).fetchall()
+        )
     else:
         rows = []
 
@@ -233,16 +233,29 @@ def _poll_messages(
         )
 
         if role in ("user", "assistant"):
+            is_intermediate = (
+                role == "assistant" and r["finish_reason"] == "tool_calls"
+            )
             payload = {
                 "message_row_id": r["id"],
                 "message_role": role,
                 **content_metadata,
             }
+            if role == "assistant":
+                payload["message_phase"] = (
+                    "intermediate" if is_intermediate else "final"
+                )
+                if r["finish_reason"] is not None:
+                    payload["finish_reason"] = r["finish_reason"]
             if invocation_id is not None:
                 payload["invocation_attribution"] = "inferred_from_session_window"
             record = build_record(
                 event_type=(
-                    "invocation.started" if role == "user" else "invocation.completed"
+                    "invocation.started"
+                    if role == "user"
+                    else "model.call_succeeded"
+                    if is_intermediate
+                    else "invocation.completed"
                 ),
                 occurred_at=r["timestamp"] or 0.0,
                 source="state.db:messages",
@@ -495,21 +508,16 @@ def _infer_message_invocation(
     user row may also bind to the nearest following start within a small,
     measured skew allowance.
     """
-    invocation_id = _infer_invocation(windows, sid, occurred_at)
-    if invocation_id is not None or role != "user" or not sid:
-        return invocation_id
-
     timestamp = _number(occurred_at)
-    if timestamp <= 0:
-        return None
-    for window in windows.get(sid, ()):
-        skew = window.started_at - timestamp
-        if skew < 0:
-            continue
-        if skew <= _USER_START_SKEW_SECONDS:
-            return window.invocation_id
-        break
-    return None
+    if role == "user" and sid and timestamp > 0:
+        for window in windows.get(sid, ()):
+            skew = window.started_at - timestamp
+            if skew < 0:
+                continue
+            if skew <= _USER_START_SKEW_SECONDS:
+                return window.invocation_id
+            break
+    return _infer_invocation(windows, sid, timestamp)
 
 
 def _limit_content(

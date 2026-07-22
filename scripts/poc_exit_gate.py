@@ -64,7 +64,8 @@ def build_state_db(home: Path) -> None:
             estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
             profile_name TEXT, expiry_finalized INT);
         CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT, timestamp REAL);
+            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
+            timestamp REAL, finish_reason TEXT);
         CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
             api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
             reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
@@ -82,12 +83,12 @@ def build_state_db(home: Path) -> None:
         ],
     )
     db.executemany(
-        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
         [
-            (3, "root", "user", None, None, None, "do the thing", NOW - 299),
-            (5, "root", "tool", "terminal", None, None, '{"output":"ok","exit_code":0}', NOW - 280),
-            (7, "root", "tool", "delegate_task", None, None, '{"status":"dispatched","count":1}', NOW - 255),
-            (10, "sub", "tool", "read_file", None, None, '{"content":"data"}', NOW - 230),
+            (3, "root", "user", None, None, None, "do the thing", NOW - 299, None),
+            (5, "root", "tool", "terminal", None, None, '{"output":"ok","exit_code":0}', NOW - 280, None),
+            (7, "root", "tool", "delegate_task", None, None, '{"status":"dispatched","count":1}', NOW - 255, None),
+            (10, "sub", "tool", "read_file", None, None, '{"content":"data"}', NOW - 230, None),
         ],
     )
     db.executemany(

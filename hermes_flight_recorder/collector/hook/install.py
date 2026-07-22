@@ -65,9 +65,9 @@ def _metadata_context(event_type, context):
     if not isinstance(context, dict):
         return context
     metadata = dict(context)
-    if event_type == "agent:start":
+    if event_type in ("agent:start", "agent:end"):
         metadata.pop("message", None)
-    elif event_type == "agent:end":
+    if event_type == "agent:end":
         metadata.pop("response", None)
     return metadata
 
