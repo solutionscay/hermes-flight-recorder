@@ -62,9 +62,17 @@ def poll(
     recorded = 0
     seen: set[str] = set()
     for artifact_id, kind, name, category, files in _iter_artifacts(home):
+        # Mark seen BEFORE the read so a transient I/O error on one artifact does
+        # not make it look deleted (which would record a spurious tombstone).
         seen.add(artifact_id)
-        if _capture(outbox, config, artifact_id, kind, name, category, files):
-            recorded += 1
+        try:
+            if _capture(outbox, config, artifact_id, kind, name, category, files):
+                recorded += 1
+        except OSError:
+            # A live file can vanish or become unreadable between listing and
+            # reading (TOCTOU), or hit a permission error. Isolate it: one bad
+            # artifact must not sink the rest of the pass. The next tick re-scans.
+            continue
     recorded += _tombstone_vanished(outbox, config, seen)
 
     return {VERSIONS_RECORDED: recorded} if recorded else {}

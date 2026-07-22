@@ -10,6 +10,7 @@ losing history, and content round-trips through encryption.
 from __future__ import annotations
 
 import json
+import os
 
 from hermes_flight_recorder.collector import knowledge_store
 from hermes_flight_recorder.collector.outbox import Outbox
@@ -174,6 +175,26 @@ def test_version_restores_byte_for_byte(tmp_path):
     restored = {e["path"]: ob.get_blob(e["blob_hash"]).decode("utf-8") for e in manifest}
 
     assert restored == {"SKILL.md": body, "references/how.md": ref}
+
+
+def test_unreadable_artifact_is_isolated_not_fatal(tmp_path):
+    home = tmp_path / "hermes"
+    skills = home / "skills"
+    write_skill(skills, "good", "# good\n")
+    bad = write_skill(skills, "bad", "# bad\n")  # sorts before 'good'
+    os.chmod(bad / "SKILL.md", 0)  # unreadable -> read_bytes raises PermissionError
+    ob = new_outbox(tmp_path)
+    try:
+        counts = knowledge_store.poll(ob, home)  # must not raise
+    finally:
+        os.chmod(bad / "SKILL.md", 0o644)
+
+    # The good skill (processed after the bad one) is still captured; the bad one
+    # is skipped, not fatal, and not spuriously tombstoned.
+    assert "skill:good" in ob.knowledge_artifact_ids()
+    assert "skill:bad" not in ob.knowledge_artifact_ids()
+    assert ob.latest_knowledge_version("skill:bad") is None
+    assert counts == {knowledge_store.VERSIONS_RECORDED: 1}
 
 
 def test_max_versions_caps_the_chain(tmp_path):

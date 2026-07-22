@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync Hermes Flight Recorder events to DBaaS every 15 seconds
+
+[Timer]
+# Offset 7s from the capture schedule so the two processes do not hit the shared
+# outbox at the same instant (fires at :07/:22/:37/:52).
+OnCalendar=*:*:07/15
+Persistent=true
+AccuracySec=1s
+Unit=hermes-flight-recorder-sync.service
+
+[Install]
+WantedBy=timers.target

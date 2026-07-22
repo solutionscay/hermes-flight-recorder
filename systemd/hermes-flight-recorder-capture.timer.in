@@ -1,0 +1,16 @@
+[Unit]
+Description=Capture Hermes events every 15 seconds
+
+[Timer]
+# Realtime anchor (fires at :00/:15/:30/:45). Unlike the monotonic
+# OnBootSec+OnUnitInactiveSec design it replaced, a realtime schedule always has
+# a finite next elapse, so the timer can never deadlock to NextElapse=infinity
+# after a daemon-reload or a boot anchor that has already passed. Persistent=true
+# now meaningfully fires one catch-up run after downtime.
+OnCalendar=*:*:00/15
+Persistent=true
+AccuracySec=1s
+Unit=hermes-flight-recorder-capture.service
+
+[Install]
+WantedBy=timers.target

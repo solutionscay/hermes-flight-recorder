@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync Hermes Flight Recorder events to DBaaS
+
+[Service]
+Type=oneshot
+UMask=0077
+TimeoutStartSec=120
+ExecStart=@RT@ sync --flight-recorder-home @FR_HOME@
