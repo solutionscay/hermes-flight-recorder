@@ -19,6 +19,7 @@ from pathlib import Path
 
 from hermes_flight_recorder import cli
 from hermes_flight_recorder.collector import CAPTURE_HEARTBEAT_KEY
+from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig
 
@@ -71,6 +72,53 @@ def test_status_no_heartbeat_exits_1(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert "NO SUCCESS RECORDED" in out
+
+
+def _append_events(bridge: Path, n: int) -> None:
+    """Append ``n`` valid events without syncing, so pending == n."""
+    ob = Outbox.open(bridge)
+    try:
+        for _ in range(n):
+            ob.append(
+                build_record(
+                    event_type="session.created",
+                    occurred_at=1784415000.0,
+                    source="test",
+                    capture_method="test",
+                    runtime={"kind": "cli", "engine": "standard"},
+                    correlation_id="corr",
+                    payload={},
+                )
+            )
+    finally:
+        ob.close()
+
+
+def test_status_reports_pending_backlog(tmp_path, capsys):
+    bridge = init_home(tmp_path / "b", heartbeat=time.time() - 10.0)
+    _append_events(bridge, 3)  # never synced -> delivery cursor 0, pending 3
+
+    code = run_status(bridge)
+    out = capsys.readouterr().out
+
+    assert "producer high-water 3" in out
+    assert "delivery cursor 0" in out
+    assert "pending 3" in out
+
+
+def test_status_backlog_alone_does_not_flip_exit_code(tmp_path, capsys):
+    """A pending backlog (e.g. the network is down and the outbox is buffering)
+    is not a capture failure — only a stale/absent heartbeat flips the exit
+    code. Capture liveness and delivery lag are distinct signals."""
+    bridge = init_home(tmp_path / "b", heartbeat=time.time() - 10.0)
+    _append_events(bridge, 500)
+
+    code = run_status(bridge)
+    out = capsys.readouterr().out
+
+    assert code == 0  # fresh capture heartbeat -> healthy despite the backlog
+    assert "pending 500" in out
+    assert "OK" in out
 
 
 def test_status_unreadable_heartbeat_exits_1(tmp_path, capsys):

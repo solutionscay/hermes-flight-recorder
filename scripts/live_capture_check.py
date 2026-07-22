@@ -32,9 +32,12 @@ from pathlib import Path
 # Runnable standalone and spec-loadable: put the sibling _gate module on the path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import time
+
 from _gate import run_gate
 from hermes_flight_recorder import observe
-from hermes_flight_recorder.collector import run_pass, state_db
+from hermes_flight_recorder.collector import CAPTURE_HEARTBEAT_KEY, run_pass, state_db
+from hermes_flight_recorder.collector.reconcile import ReconcileConfig
 from hermes_flight_recorder.collector._common import (
     executions_db_path,
     gateway_state_path,
@@ -257,12 +260,71 @@ def check_envelope_and_observe(home: Path, tmp: Path) -> list[str]:
     return fails
 
 
+def check_capture_heartbeat(home: Path, tmp: Path) -> list[str]:
+    """The capture heartbeat advances on a real pass; the stale detector fires
+    only when it freezes.
+
+    ``run_pass`` stamps ``capture:last_success_at`` every completed pass, and
+    the reconciler's ``reconcile.capture_stale`` is the instant-alert for a
+    stalled capture loop — the class of failure behind the 3h20m silent
+    blackout. Proven here against the live pipeline: a brand-new outbox has no
+    heartbeat and raises no alert; a real pass stamps a recent one; a fresh
+    heartbeat raises nothing; a frozen heartbeat raises exactly one finding.
+    """
+    fails: list[str] = []
+    cfg = ReconcileConfig()
+    ob = _new_outbox(tmp / "heartbeat")
+    try:
+        def stale_findings() -> list[dict]:
+            return [
+                e for e in ob.iter_events()
+                if e["payload"]["event_type"] == "reconcile.capture_stale"
+            ]
+
+        # (a) No baseline yet: absent heartbeat raises no false alert.
+        if ob.get_meta(CAPTURE_HEARTBEAT_KEY) is not None:
+            fails.append("heartbeat: a fresh outbox already carries a heartbeat")
+        reconcile(ob, home, config=cfg)
+        if stale_findings():
+            fails.append("heartbeat: stale finding raised with no heartbeat baseline")
+
+        # (b) A real capture pass against the live home stamps a recent heartbeat.
+        run_pass(ob, home, on_source_error=lambda label, exc: None)
+        raw = ob.get_meta(CAPTURE_HEARTBEAT_KEY)
+        if raw is None:
+            fails.append("heartbeat: run_pass did not stamp capture:last_success_at")
+            return fails
+        stamped = float(raw)
+        age = time.time() - stamped
+        if not (-5.0 <= age <= 120.0):  # tolerate small clock slop, generous ceiling
+            fails.append(f"heartbeat: stamp is not recent (age {age:.1f}s)")
+
+        # (c) A fresh heartbeat raises nothing.
+        reconcile(ob, home, config=cfg)
+        if stale_findings():
+            fails.append(f"heartbeat: {len(stale_findings())} stale finding(s) against a fresh heartbeat")
+
+        # (d) A frozen heartbeat, well past the window, raises exactly one.
+        ob.set_meta(CAPTURE_HEARTBEAT_KEY, repr(stamped - cfg.capture_stale_after - 3600.0))
+        reconcile(ob, home, config=cfg)
+        found = stale_findings()
+        if len(found) != 1:
+            fails.append(f"heartbeat: frozen heartbeat -> {len(found)} stale finding(s), want 1")
+        else:
+            validate(found[0])
+        _log(f"heartbeat: stamped {age:.1f}s ago; fresh raised 0, frozen raised 1")
+    finally:
+        ob.close()
+    return fails
+
+
 CHECKS = [
     ("read-only against the Hermes home", check_read_only),
     ("#16 home_mode on every poll event", check_home_mode),
     ("#14 surface on session events", check_surface),
     ("#15 gateway channels + gateway_id", check_gateway_channels),
     ("#13 gateway start-failure detection", check_gateway_start_failed),
+    ("capture heartbeat + stale-capture alert", check_capture_heartbeat),
     ("envelope validity + observe report", check_envelope_and_observe),
 ]
 
