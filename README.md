@@ -10,7 +10,7 @@ Hermes Flight Recorder captures Hermes activity into a durable, append-ordered e
 
 It is useful on its own: capture, inspect, reconcile, and keep the data local.
 
-For a shared fleet view, it can sync encrypted event envelopes to **Hermes DBaaS**, the hosted control plane at `hermesdbass.com`. The ingestion protocol is open, so you can also run your own compatible backend.
+For a shared fleet view, it can sync encrypted event envelopes to **Hermes DBaaS**, the hosted control plane at `hermesdbaas.com`. The ingestion protocol is open, so you can also run your own compatible backend.
 
 ```text
 Hermes → local encrypted event log → Hermes DBaaS or your backend

@@ -88,6 +88,7 @@ def coverage_gaps(ob, subject_type: str | None = None):
 
 # Small, explicit windows — never wall-clock defaults.
 CFG = ReconcileConfig(
+    coverage_grace=0.0,
     session_terminal_timeout=100.0,
     subagent_terminal_timeout=100.0,
     invocation_terminal_timeout=100.0,

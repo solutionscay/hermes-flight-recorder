@@ -210,11 +210,15 @@ def _poll_messages(
             "effect_disposition, content, timestamp, finish_reason FROM messages "
             f"WHERE id > ? AND role IN ({placeholders}) ORDER BY id",
             (cursor, *supported_roles),
-        )
+        ).fetchall()
     else:
         rows = []
 
+    last_seen_id = cursor
     for r in rows:
+        # Advance only through this query's snapshot. A separate MAX(id)
+        # query can see a row inserted after the snapshot and skip it forever.
+        last_seen_id = max(last_seen_id, int(r["id"]))
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
         role = r["role"]
@@ -308,8 +312,7 @@ def _poll_messages(
             dedup_key=f"state.db:tool:{r['id']}",
         )
 
-    max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-    outbox.set_cursor(_MESSAGE_CURSOR, max_id)
+    outbox.set_cursor(_MESSAGE_CURSOR, last_seen_id)
 
 
 def _poll_model_usage(

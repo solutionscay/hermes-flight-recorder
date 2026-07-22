@@ -99,7 +99,7 @@ def test_durable_row_with_no_captured_event_is_uncaptured(tmp_path):
     db.commit(); db.close()
     ob = new_outbox(tmp_path)
 
-    reconcile(ob, hh, now=B)
+    reconcile(ob, hh, now=B, config=ReconcileConfig(coverage_grace=0.0))
 
     cover = [
         e for e in findings(ob, "reconcile.gap_detected")

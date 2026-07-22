@@ -112,3 +112,23 @@ def test_incremental_drain_across_calls(tmp_path: Path) -> None:
     assert drain(ob) == {"session.created": 1}
     assert ob.count() == 2
     ob.close()
+
+
+def test_compaction_reuses_offsets_without_dropping_new_events(tmp_path: Path) -> None:
+    spool = tmp_path / SPOOL_FILENAME
+    ob = new_outbox(tmp_path)
+
+    spool.write_text(line("gateway:startup", {"platforms": []}, 1.0) + "\n")
+    assert drain(ob) == {"runtime.gateway_started": 1}
+
+    # A no-work pass compacts the fully consumed generation and resets offset 0.
+    assert drain(ob) == {}
+    spool.write_text(
+        line("session:start", {"session_id": "s1", "session_key": "k1"}, 2.0)
+        + "\n"
+    )
+
+    assert drain(ob) == {"session.created": 1}
+    assert ob.count() == 2
+    assert int(ob.get_cursor(CURSOR_NAME)) == spool.stat().st_size
+    ob.close()

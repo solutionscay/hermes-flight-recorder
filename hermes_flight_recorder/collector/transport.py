@@ -190,6 +190,7 @@ class PushOutcome:
     ok: bool
     reason: str
     result: SyncResult | None
+    detail: str | None = None
 
 
 def push(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOutcome:
@@ -203,10 +204,14 @@ def push(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOutcome:
     """
     try:
         result = sync(outbox, transport, **sync_kwargs)
-    except RetryableTransportError:
-        return PushOutcome(ok=False, reason="offline", result=None)
-    except AuthError:
-        return PushOutcome(ok=False, reason="auth", result=None)
+    except RetryableTransportError as exc:
+        return PushOutcome(
+            ok=False, reason="offline", result=None, detail=str(exc)
+        )
+    except AuthError as exc:
+        return PushOutcome(
+            ok=False, reason="auth", result=None, detail=str(exc)
+        )
     return PushOutcome(ok=True, reason="ok", result=result)
 
 

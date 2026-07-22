@@ -194,7 +194,9 @@ def test_sync_once_offline_exits_unreachable(tmp_path, capsys):
     code = cli._sync_once(outbox, _FakeTransport(RetryableTransportError("down")))
 
     assert code == 1
-    assert "unreachable" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "unreachable" in error
+    assert "down" in error
     assert delivery_cursor(outbox) == before  # cursor untouched
     outbox.close()
 
@@ -204,7 +206,9 @@ def test_sync_once_auth_exits_three(tmp_path, capsys):
     outbox.append(base_record())
     code = cli._sync_once(outbox, _FakeTransport(AuthError("403")))
     assert code == 3
-    assert "service token" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "service token" in error
+    assert "403" in error
     outbox.close()
 
 

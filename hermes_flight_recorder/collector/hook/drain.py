@@ -8,13 +8,10 @@ key. Invocation hooks are metadata-only; complete user/assistant content is
 captured later from ``state.db``.
 
 Durability model (issue #4): at-least-once with dedup at the drain. The read
-cursor is a byte offset stored in the outbox meta. On a Flight Recorder stop between
-an append and the cursor commit, the next drain re-reads the same lines at
-the same byte offsets; the dedup key is the line's offset, so re-processing
-is idempotent (no duplicate row, no consumed sequence). A partial trailing
-line (the gateway died mid-write) is left for the next drain. The hook is
-lossy by design; a lost or dropped line is caught by the reconciler against
-``state.db``.
+cursor is a byte offset stored in the outbox meta. A spool generation makes
+the byte offset unique after compaction. On a Flight Recorder stop between an
+append and the cursor commit, the next drain re-reads the same generation and
+deduplicates it. A partial trailing line stays for the next drain.
 
 Fields the hook context does not carry are synthesized here, best-effort:
 ``invocation_id`` (minted on ``agent:start`` from the line offset, then
@@ -30,12 +27,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from .._common import append_and_count, build_record, gateway_runtime_stamp, runtime_stamp
 from . import CURSOR_NAME, SPOOL_FILENAME
+
+_GENERATION_META = "hook-spool:generation"
+_SEGMENT_PREFIX = f"{SPOOL_FILENAME}.segment."
 
 
 def drain(outbox: Any, flight_recorder_home: str | Path | None = None) -> dict[str, int]:
@@ -47,26 +48,48 @@ def drain(outbox: Any, flight_recorder_home: str | Path | None = None) -> dict[s
     """
     home = Path(flight_recorder_home) if flight_recorder_home else Path(outbox.path).parent
     spool = home / SPOOL_FILENAME
+    counts: dict[str, int] = defaultdict(int)
+    session_ids: dict[str, str] = {}
+    _drain_segments(outbox, home, counts, session_ids)
     if not spool.exists():
-        return {}
+        return dict(counts)
 
     cursor = int(outbox.get_cursor(CURSOR_NAME) or 0)
     size = spool.stat().st_size
     if size < cursor:
         cursor = 0  # spool was truncated or rotated; restart from the top
     elif size == cursor:
-        return {}
+        if size:
+            _rotate_consumed_spool(outbox, spool, cursor)
+        return dict(counts)
 
-    counts: dict[str, int] = defaultdict(int)
-    session_ids: dict[str, str] = {}
+    generation = outbox.get_meta(_GENERATION_META) or "legacy"
+    consumed, _complete = _drain_path(
+        outbox, spool, cursor, generation, counts, session_ids
+    )
+    outbox.set_cursor(CURSOR_NAME, cursor + consumed)
+    return dict(counts)
+
+
+def _drain_path(
+    outbox: Any,
+    path: Path,
+    cursor: int,
+    generation: str,
+    counts: dict[str, int],
+    session_ids: dict[str, str],
+) -> tuple[int, bool]:
+    """Drain complete lines from one stable spool generation."""
     consumed = 0
+    complete = True
     # Stream line by line, so a large backlog never sits in memory whole. A
     # line without a trailing newline (only possible at EOF) is a partial
     # write; leave it for the next drain.
-    with open(spool, "rb") as fh:
+    with open(path, "rb") as fh:
         fh.seek(cursor)
         for raw in fh:
             if not raw.endswith(b"\n"):
+                complete = False
                 break
             line_offset = cursor + consumed
             consumed += len(raw)
@@ -81,13 +104,48 @@ def drain(outbox: Any, flight_recorder_home: str | Path | None = None) -> dict[s
             if mapped is None:
                 continue
             record, content = mapped
+            dedup_key = (
+                f"hook-spool:{line_offset}"
+                if generation == "legacy"
+                else f"hook-spool:{generation}:{line_offset}"
+            )
             append_and_count(
                 outbox, counts, record, content=content,
-                dedup_key=f"hook-spool:{line_offset}",
+                dedup_key=dedup_key,
             )
+    return consumed, complete
 
-    outbox.set_cursor(CURSOR_NAME, cursor + consumed)
-    return dict(counts)
+
+def _rotate_consumed_spool(outbox: Any, spool: Path, cursor: int) -> None:
+    """Move a consumed spool aside and start a new offset generation."""
+    generation = outbox.get_meta(_GENERATION_META) or "legacy"
+    segment = spool.with_name(
+        f"{_SEGMENT_PREFIX}{generation}.{cursor}.{uuid.uuid4().hex}"
+    )
+    spool.replace(segment)
+    outbox.set_meta(_GENERATION_META, uuid.uuid4().hex)
+    outbox.set_cursor(CURSOR_NAME, 0)
+
+
+def _drain_segments(
+    outbox: Any,
+    home: Path,
+    counts: dict[str, int],
+    session_ids: dict[str, str],
+) -> None:
+    """Finish and remove spool generations that compaction moved aside."""
+    for segment in sorted(home.glob(f"{_SEGMENT_PREFIX}*")):
+        suffix = segment.name[len(_SEGMENT_PREFIX):]
+        try:
+            generation, cursor_text, _nonce = suffix.split(".", 2)
+            cursor = int(cursor_text)
+        except (TypeError, ValueError):
+            continue
+        _consumed, complete = _drain_path(
+            outbox, segment, cursor, generation, counts, session_ids
+        )
+        if complete:
+            segment.unlink()
 
 
 def _clean(payload: dict[str, Any]) -> dict[str, Any]:
@@ -95,7 +153,7 @@ def _clean(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in payload.items() if v is not None}
 
 
-def _gateway_id(outbox: Any, occurred_at: float, offset: int) -> str:
+def _gateway_id(outbox: Any, occurred_at: float, offset: Any) -> str:
     """A stable, token-free per-boot gateway id.
 
     Hermes' authoritative process identity (pid, /proc start-time) is not
@@ -110,7 +168,7 @@ def _gateway_id(outbox: Any, occurred_at: float, offset: int) -> str:
     return "gw-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
 
 
-def _pair_invocation_id(outbox: Any, sid: str | None, offset: int, is_start: bool) -> str:
+def _pair_invocation_id(outbox: Any, sid: str | None, offset: Any, is_start: bool) -> str:
     """Pair an ``agent:start`` with its ``agent:end`` via outbox meta.
 
     A new id is minted on start and stashed under a session-scoped meta key;
@@ -135,7 +193,7 @@ def _pair_invocation_id(outbox: Any, sid: str | None, offset: int, is_start: boo
 
 
 def _map_event(
-    obj: dict[str, Any], offset: int, session_ids: dict[str, str], outbox: Any
+    obj: dict[str, Any], offset: Any, session_ids: dict[str, str], outbox: Any
 ) -> tuple[dict[str, Any], str | None] | None:
     """Map one raw spool record to (envelope_record, content) or None.
 

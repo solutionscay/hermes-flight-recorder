@@ -112,6 +112,16 @@ def test_config_load_from_file(tmp_path):
     }
 
 
+def test_config_replaces_retired_hosted_domain_on_load_and_save(tmp_path):
+    retired = "https://app.hermesdbass.com/ingest"
+    current = "https://app.hermesdbaas.com/ingest"
+
+    path = sync_config.save(SyncConfig(retired, "cid", "csecret"), tmp_path)
+
+    assert json.loads(path.read_text())["ingest_url"] == current
+    assert sync_config.load(tmp_path).ingest_url == current
+
+
 def test_config_env_overrides_file(tmp_path, monkeypatch):
     sync_config.save(SyncConfig("https://file/ingest", "fid", "fsecret"), tmp_path)
     monkeypatch.setenv("HFR_INGEST_URL", "https://env/ingest")
@@ -120,6 +130,17 @@ def test_config_env_overrides_file(tmp_path, monkeypatch):
     assert cfg.ingest_url == "https://env/ingest"
     assert cfg.cf_access_client_id == "fid"  # not overridden
     assert cfg.cf_access_client_secret == "envsecret"
+
+
+def test_config_replaces_retired_hosted_domain_from_environment(
+    tmp_path, monkeypatch
+):
+    sync_config.save(SyncConfig("https://file/ingest", "fid", "fsecret"), tmp_path)
+    monkeypatch.setenv(
+        "HFR_INGEST_URL", "https://app.hermesdbass.com/ingest"
+    )
+
+    assert sync_config.load(tmp_path).ingest_url == sync_config.HOSTED_INGEST_URL
 
 
 def test_config_incomplete_raises(tmp_path):

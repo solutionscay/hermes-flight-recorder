@@ -219,8 +219,27 @@ def test_cron_missed_step_range_field_collapses(tmp_path):
     assert len(runs) == 1
     first_at, count, is_tail = runs[0]
     assert first_at == utc_epoch(2026, 1, 8, 9, 10, 0)  # first slot after creation
-    assert count == 4  # 9:10, 9:20, 9:30, 10:00
+    assert count == 3  # 9:10, 9:20, 9:30; 10:00 is inside its grace window
     assert is_tail is True
+
+
+def test_cron_fire_is_not_missed_until_its_slack_expires():
+    created = utc_epoch(2026, 1, 8, 10, 0, 0)
+    cfg = ReconcileConfig(cron_match_slack=30.0)
+
+    within_slack = _cron_missed(
+        "1 * * * *", [], created,
+        utc_epoch(2026, 1, 8, 10, 1, 20), cfg,
+        tz=datetime.timezone.utc,
+    )
+    after_slack = _cron_missed(
+        "1 * * * *", [], created,
+        utc_epoch(2026, 1, 8, 10, 1, 31), cfg,
+        tz=datetime.timezone.utc,
+    )
+
+    assert within_slack == []
+    assert after_slack == [(utc_epoch(2026, 1, 8, 10, 1, 0), 1, True)]
 
 
 # --- end-to-end: list of specific minutes, no execution at all -----------
@@ -245,7 +264,8 @@ def test_cron_missed_list_minutes_no_execution_collapses_via_reconcile(tmp_path)
     assert len(missed) == 1
     m = missed[0]
     assert m["payload"]["expected_fire_at"] == expected_first
-    assert m["payload"]["missed_count"] == 12  # 10:15 .. 13:00 every 15 min inclusive
+    # 13:00 is still inside its grace window.
+    assert m["payload"]["missed_count"] == 11  # 10:15 through 12:45
     assert m["payload"]["catch_up"] is True
     assert m["payload"]["schedule_kind"] == "cron"
     assert m["correlation_id"] == "cE1"

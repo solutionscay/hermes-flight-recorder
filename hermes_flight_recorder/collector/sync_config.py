@@ -28,6 +28,13 @@ from ._common import default_flight_recorder_home
 
 CONFIG_FILENAME = "sync-config.json"
 
+# The hosted DBaaS service moved from the misspelled ``hermesdbass.com``
+# domain to ``hermesdbaas.com``. Normalize the retired hostname at the config
+# boundary so an old file or environment value cannot stop delivery again.
+HOSTED_INGEST_URL = "https://app.hermesdbaas.com/ingest"
+_LEGACY_HOSTED_PREFIX = "https://app.hermesdbass.com"
+_HOSTED_PREFIX = "https://app.hermesdbaas.com"
+
 _ENV_INGEST_URL = "HFR_INGEST_URL"
 _ENV_CLIENT_ID = "HFR_CF_ACCESS_CLIENT_ID"
 _ENV_CLIENT_SECRET = "HFR_CF_ACCESS_CLIENT_SECRET"
@@ -75,6 +82,17 @@ def _read_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def _normalize_ingest_url(value: Any) -> Any:
+    """Map the retired hosted DBaaS hostname to its permanent hostname."""
+    if not isinstance(value, str):
+        return value
+    if value == _LEGACY_HOSTED_PREFIX or value.startswith(
+        _LEGACY_HOSTED_PREFIX + "/"
+    ):
+        return _HOSTED_PREFIX + value[len(_LEGACY_HOSTED_PREFIX):]
+    return value
+
+
 def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> SyncConfig:
     """Load the sync config, with the environment overriding the file.
 
@@ -83,7 +101,9 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> SyncConf
     """
     data = _read_file(config_path(flight_recorder_home))
 
-    ingest_url = os.environ.get(_ENV_INGEST_URL) or data.get("ingest_url")
+    ingest_url = _normalize_ingest_url(
+        os.environ.get(_ENV_INGEST_URL) or data.get("ingest_url")
+    )
     client_id = os.environ.get(_ENV_CLIENT_ID) or data.get("cf_access_client_id")
     client_secret = os.environ.get(_ENV_CLIENT_SECRET) or data.get(
         "cf_access_client_secret"
@@ -121,7 +141,7 @@ def save(
     path = config_path(flight_recorder_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "ingest_url": config.ingest_url,
+        "ingest_url": _normalize_ingest_url(config.ingest_url),
         "cf_access_client_id": config.cf_access_client_id,
         "cf_access_client_secret": config.cf_access_client_secret,
     }
@@ -140,6 +160,7 @@ __all__ = [
     "CF_ACCESS_CLIENT_ID_HEADER",
     "CF_ACCESS_CLIENT_SECRET_HEADER",
     "CONFIG_FILENAME",
+    "HOSTED_INGEST_URL",
     "SyncConfig",
     "SyncConfigError",
     "config_path",

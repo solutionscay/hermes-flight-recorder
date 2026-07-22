@@ -17,8 +17,8 @@ from pathlib import Path
 
 from . import ERRLOG_FILENAME, HOOK_DIR_NAME, HOOK_EVENTS, SPOOL_FILENAME
 
-# Soft cap on the spool. Past it the handler drops the new event rather than
-# block the gateway; the reconciler still catches the loss against state.db.
+# Retained for installed-handler compatibility. The handler no longer drops
+# events at this size. The drain compacts fully consumed spool generations.
 MAX_SPOOL_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 _MANIFEST = (
@@ -39,6 +39,7 @@ _HANDLER_TEMPLATE = '''\
 import json
 import os
 import time
+import uuid
 
 _BAKED_SC_HERMES_FLIGHT_RECORDER_HOME = @@BAKED@@
 _SPOOL_FILENAME = @@SPOOL@@
@@ -78,14 +79,9 @@ def handle(event_type, context):
     try:
         home = _flight_recorder_home()
         spool = os.path.join(home, _SPOOL_FILENAME)
-        try:
-            if os.path.getsize(spool) > _MAX_SPOOL_BYTES:
-                _log_error("spool over cap; dropped %s" % event_type)
-                return
-        except OSError:
-            pass  # spool does not exist yet
         line = json.dumps(
             {
+                "spool_event_id": uuid.uuid4().hex,
                 "event_type": event_type,
                 "context": _metadata_context(event_type, context),
                 "captured_at": time.time(),

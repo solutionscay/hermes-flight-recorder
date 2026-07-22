@@ -32,6 +32,7 @@ TZ = datetime.timezone(datetime.timedelta(hours=-5))
 # Small explicit thresholds so every detector fires deterministically and
 # stays fired across a +300s "now" advance (see module docstring above).
 CFG = ReconcileConfig(
+    coverage_grace=0.0,
     session_terminal_timeout=100.0,
     subagent_terminal_timeout=100.0,
     invocation_terminal_timeout=100.0,

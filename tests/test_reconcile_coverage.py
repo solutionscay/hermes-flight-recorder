@@ -108,6 +108,7 @@ def make_executions_db(cron_dir, rows):
 
 # Small, explicit, deterministic windows — never wall-clock defaults.
 CFG = ReconcileConfig(
+    coverage_grace=0.0,
     session_terminal_timeout=100.0,
     subagent_terminal_timeout=100.0,
     invocation_terminal_timeout=100.0,
@@ -342,6 +343,47 @@ def test_uncaptured_execution_surfaces_once_as_coverage_gap(tmp_path):
     assert g["payload"]["source_table"] == "cron:executions.db"
     assert g["correlation_id"] == "j1"
     assert g.get("session_id") is None  # execution gaps carry no session_id
+
+
+def test_new_execution_is_not_a_gap_if_capture_gets_it_on_next_tick(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    cron = hh / "cron"
+    cron.mkdir()
+    make_executions_db(
+        cron, [("e1", "j1", "completed", iso(B), iso(B), iso(B + 2))]
+    )
+    ob = new_outbox(tmp_path)
+    cfg = ReconcileConfig(coverage_grace=30.0)
+
+    first = reconcile(ob, hh, now=B, config=cfg)
+    assert "reconcile.gap_detected" not in first
+
+    append_event(
+        ob, "cron.run_claimed", correlation_id="j1",
+        payload={"execution_id": "e1"},
+    )
+    second = reconcile(ob, hh, now=B + 60, config=cfg)
+
+    assert "reconcile.gap_detected" not in second
+    assert coverage_gaps(ob, "execution") == []
+
+
+def test_execution_still_absent_after_grace_surfaces(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    cron = hh / "cron"
+    cron.mkdir()
+    make_executions_db(
+        cron, [("e1", "j1", "completed", iso(B), iso(B), iso(B + 2))]
+    )
+    ob = new_outbox(tmp_path)
+    cfg = ReconcileConfig(coverage_grace=30.0)
+
+    reconcile(ob, hh, now=B, config=cfg)
+    reconcile(ob, hh, now=B + 31, config=cfg)
+
+    assert len(coverage_gaps(ob, "execution")) == 1
 
 
 def test_captured_execution_does_not_surface(tmp_path):

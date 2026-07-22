@@ -356,9 +356,15 @@ def _sync_once(
     if outcome.ok:
         return _SYNC_OK
     if outcome.reason == "auth":
-        print("sync failed: the edge rejected the service token", file=sys.stderr)
+        message = "sync failed: the edge rejected the service token"
+        if outcome.detail:
+            message += f": {outcome.detail}"
+        print(message, file=sys.stderr)
         return _SYNC_AUTH
-    print("sync failed: the ingestion service is unreachable", file=sys.stderr)
+    message = "sync failed: the ingestion service is unreachable"
+    if outcome.detail:
+        message += f": {outcome.detail}"
+    print(message, file=sys.stderr)
     return _SYNC_UNREACHABLE
 
 

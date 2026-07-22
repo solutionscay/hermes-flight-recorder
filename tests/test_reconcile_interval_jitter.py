@@ -166,7 +166,8 @@ def test_trailing_gap_reported_when_ticker_is_fresh(tmp_path):
     assert len(missed) == 1
     m = missed[0]
     assert m["payload"]["expected_fire_at"] == B + 120
-    assert m["payload"]["missed_count"] == 9
+    # B+600 is still inside the B+600 slot's grace window.
+    assert m["payload"]["missed_count"] == 8
     assert m["payload"]["catch_up"] is True
 
 
@@ -213,7 +214,8 @@ def test_never_fired_job_past_first_due_instant(tmp_path):
     assert len(missed) == 1
     m = missed[0]
     assert m["payload"]["expected_fire_at"] == B + 60
-    assert m["payload"]["missed_count"] == 3
+    # The B+180 slot is still inside its grace window at B+200.
+    assert m["payload"]["missed_count"] == 2
 
 
 # --- startup gap is not a miss --------------------------------------------
@@ -226,6 +228,21 @@ def test_startup_gap_before_first_fire_is_not_a_miss(tmp_path):
     _executions_db(cron, [])  # never fired yet — and shouldn't have
     _jobs_json(cron, [_interval_job("j1", minutes=1, created=B)])
     now = B + 10  # well before created_at + 60s (minus slack)
+    _heartbeat(cron, now)
+    ob = new_outbox(tmp_path)
+
+    cfg = ReconcileConfig(cron_match_slack=45.0, ticker_stale_after=300.0)
+    counts = reconcile(ob, hh, now=now, config=cfg)
+
+    assert "cron.run_missed" not in counts
+    assert findings(ob, "cron.run_missed") == []
+
+
+def test_first_fire_is_not_missed_until_its_slack_expires(tmp_path):
+    hh, cron = _setup(tmp_path)
+    _executions_db(cron, [])
+    _jobs_json(cron, [_interval_job("j1", minutes=1, created=B)])
+    now = B + 40
     _heartbeat(cron, now)
     ob = new_outbox(tmp_path)
 

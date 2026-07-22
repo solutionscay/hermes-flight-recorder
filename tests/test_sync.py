@@ -181,16 +181,18 @@ def test_batches_are_bounded_by_serialized_byte_size(tmp_path):
     outbox.close()
 
 
-def test_oversized_record_is_not_sent_or_skipped(tmp_path):
+def test_record_larger_than_batch_target_is_sent_alone(tmp_path):
     outbox = new_outbox(tmp_path)
     append_n(outbox, 1)
     transport = InMemoryTransport()
 
-    with pytest.raises(SyncError, match="exceeds"):
-        sync(outbox, transport, max_bytes=1)
+    result = sync(outbox, transport, max_bytes=1)
 
-    assert transport.batches == []
-    assert delivery_cursor(outbox) == 0
+    assert len(transport.batches) == 1
+    assert len(transport.batches[0]["records"]) == 1
+    assert len(serialize_batch(transport.batches[0])) > 1
+    assert result.records_sent == 1
+    assert delivery_cursor(outbox) == 1
     outbox.close()
 
 

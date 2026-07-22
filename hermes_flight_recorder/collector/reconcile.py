@@ -85,6 +85,10 @@ class ReconcileConfig:
     subagent_terminal_timeout: float = 30 * 60.0
     invocation_terminal_timeout: float = 60 * 60.0
     cron_run_terminal_timeout: float = 15 * 60.0
+    # A durable row must remain absent from the captured stream through more
+    # than one capture tick before it is a coverage gap. Reconcile and capture
+    # can start at the same second, so an immediate diff creates false alerts.
+    coverage_grace: float = 30.0
     # An open task claim whose lease lapsed by more than this grace, with a
     # heartbeat older than the staleness window, is judged a dead attempt. The
     # grace lets Hermes's own reclaim run first (its defer grace is ~120 s); the
@@ -143,7 +147,7 @@ def reconcile(
 
     _detect_sequence_gaps(outbox, events, installation_id, counts, when)
     session_rows, parent_map = _detect_coverage_gaps(
-        outbox, events, home, exec_rows, counts, when, capture
+        outbox, events, home, exec_rows, counts, when, cfg, capture
     )
     _detect_missing_terminals(
         outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map
@@ -180,7 +184,7 @@ def _detect_sequence_gaps(outbox, events, installation_id, counts, when) -> None
 
 # --- coverage gaps ------------------------------------------------------
 def _detect_coverage_gaps(
-    outbox, events, home, exec_rows, counts, when, capture_config
+    outbox, events, home, exec_rows, counts, when, config, capture_config
 ):
     """A durable row with no captured event proves a dropped capture."""
     captured = _captured_subjects(events)
@@ -197,7 +201,7 @@ def _detect_coverage_gaps(
             ).fetchall()
             parent_map = {r["id"]: r["parent_session_id"] for r in session_rows}
             _coverage_sessions(
-                outbox, session_rows, parent_map, captured, counts, when
+                outbox, session_rows, parent_map, captured, counts, when, config
             )
             _coverage_messages(
                 outbox,
@@ -206,28 +210,36 @@ def _detect_coverage_gaps(
                 captured,
                 counts,
                 when,
+                config,
                 capture_config,
             )
-            _coverage_model_usage(outbox, conn, parent_map, captured, counts, when)
+            _coverage_model_usage(
+                outbox, conn, parent_map, captured, counts, when, config
+            )
         finally:
             conn.close()
 
     for r in exec_rows:
         if r["id"] in captured["executions"]:
+            _clear_coverage_pending(outbox, "execution", r["id"])
             continue
         _emit_coverage(
             outbox, counts, when,
             subject_type="execution", subject_id=r["id"],
             source_table="cron:executions.db", correlation_id=r["job_id"],
+            grace=config.coverage_grace,
         )
-    _coverage_kanban(outbox, home, captured, counts, when)
+    _coverage_kanban(outbox, home, captured, counts, when, config)
     return session_rows, parent_map
 
 
-def _coverage_sessions(outbox, rows, parent_map, captured, counts, when) -> None:
+def _coverage_sessions(
+    outbox, rows, parent_map, captured, counts, when, config
+) -> None:
     for r in rows:
         sid = r["id"]
         if sid in captured["sessions"]:
+            _clear_coverage_pending(outbox, "session", sid)
             continue
         corr = root_session(sid, parent_map) or sid
         _emit_coverage(
@@ -235,11 +247,12 @@ def _coverage_sessions(outbox, rows, parent_map, captured, counts, when) -> None
             subject_type="session", subject_id=sid,
             source_table="state.db:sessions", correlation_id=corr,
             session_id=sid, parent_session_id=r["parent_session_id"],
+            grace=config.coverage_grace,
         )
 
 
 def _coverage_messages(
-    outbox, conn, parent_map, captured, counts, when, capture_config
+    outbox, conn, parent_map, captured, counts, when, config, capture_config
 ) -> None:
     roles = tuple(
         role
@@ -269,6 +282,7 @@ def _coverage_messages(
     ).fetchall()
     for r in rows:
         if r["id"] in captured["messages"]:
+            _clear_coverage_pending(outbox, "message", str(r["id"]))
             continue
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
@@ -276,27 +290,33 @@ def _coverage_messages(
             outbox, counts, when,
             subject_type="message", subject_id=str(r["id"]),
             source_table="state.db:messages", correlation_id=corr, session_id=sid,
+            grace=config.coverage_grace,
         )
 
 
-def _coverage_model_usage(outbox, conn, parent_map, captured, counts, when) -> None:
+def _coverage_model_usage(
+    outbox, conn, parent_map, captured, counts, when, config
+) -> None:
     rows = conn.execute(
         "SELECT session_id, model, task FROM session_model_usage"
     ).fetchall()
     for r in rows:
         key = (r["session_id"], r["model"], r["task"])
+        subject_id = f"{r['session_id']}:{r['model']}:{r['task']}"
         if key in captured["model_usage"]:
+            _clear_coverage_pending(outbox, "model_usage", subject_id)
             continue
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
         _emit_coverage(
             outbox, counts, when,
-            subject_type="model_usage", subject_id=f"{sid}:{r['model']}:{r['task']}",
+            subject_type="model_usage", subject_id=subject_id,
             source_table="state.db:session_model_usage", correlation_id=corr, session_id=sid,
+            grace=config.coverage_grace,
         )
 
 
-def _coverage_kanban(outbox, home, captured, counts, when) -> None:
+def _coverage_kanban(outbox, home, captured, counts, when, config) -> None:
     """A durable Kanban task/run with no captured ``task.*`` event.
 
     The Kanban analog of the session/execution coverage diff: every board's
@@ -326,20 +346,24 @@ def _coverage_kanban(outbox, home, captured, counts, when) -> None:
             conn.close()
         for r in tasks:
             if (board, r["id"]) in captured["tasks"]:
+                _clear_coverage_pending(outbox, "task", f"{board}:{r['id']}")
                 continue
             _emit_coverage(
                 outbox, counts, when,
                 subject_type="task", subject_id=f"{board}:{r['id']}",
                 source_table=f"kanban:{board}:tasks", correlation_id=r["id"],
                 session_id=r["session_id"],
+                grace=config.coverage_grace,
             )
         for r in runs:
             if (board, r["id"]) in captured["task_runs"]:
+                _clear_coverage_pending(outbox, "task_run", f"{board}:{r['id']}")
                 continue
             _emit_coverage(
                 outbox, counts, when,
                 subject_type="task_run", subject_id=f"{board}:{r['id']}",
                 source_table=f"kanban:{board}:task_runs", correlation_id=r["task_id"],
+                grace=config.coverage_grace,
             )
 
 
@@ -388,8 +412,10 @@ def _captured_subjects(events) -> dict[str, set]:
 
 def _emit_coverage(
     outbox, counts, when, *, subject_type, subject_id, source_table, correlation_id,
-    session_id=None, parent_session_id=None,
+    grace, session_id=None, parent_session_id=None,
 ) -> None:
+    if not _coverage_ready(outbox, subject_type, subject_id, when, grace):
+        return
     _emit(
         outbox, counts,
         event_type="reconcile.gap_detected",
@@ -406,6 +432,33 @@ def _emit_coverage(
         },
         dedup_key=f"reconcile:cover:{subject_type}:{subject_id}",
     )
+
+
+def _coverage_pending_key(subject_type: str, subject_id: Any) -> str:
+    return f"reconcile:coverage_pending:{subject_type}:{subject_id}"
+
+
+def _clear_coverage_pending(outbox, subject_type: str, subject_id: Any) -> None:
+    outbox.delete_meta(_coverage_pending_key(subject_type, subject_id))
+
+
+def _coverage_ready(
+    outbox, subject_type: str, subject_id: Any, when: float, grace: float
+) -> bool:
+    """Wait through a capture tick before an absent durable row is a gap."""
+    if grace <= 0:
+        return True
+    key = _coverage_pending_key(subject_type, subject_id)
+    raw = outbox.get_meta(key)
+    if raw is None:
+        outbox.set_meta(key, repr(when))
+        return False
+    try:
+        first_seen = float(raw)
+    except (TypeError, ValueError):
+        outbox.set_meta(key, repr(when))
+        return False
+    return when - first_seen >= grace
 
 
 # --- missing terminals --------------------------------------------------
@@ -738,9 +791,10 @@ def _interval_missed(execs, created, step, now, slack):
         if created is None:
             return runs
         first = created + step
-        if now < first - slack:
+        deadline = now - slack
+        if deadline < first:
             return runs  # not due yet
-        count = max(1, int((now - created) // step))
+        count = max(1, int((deadline - created) // step))
         return [(first, count, True)]
 
     i = 0
@@ -748,6 +802,7 @@ def _interval_missed(execs, created, step, now, slack):
     expected = execs[0] + step
     run_first: float | None = None
     run_count = 0
+    deadline = now - slack
     while expected <= now + slack:
         while i < n and execs[i] < expected - slack:
             i += 1
@@ -757,11 +812,13 @@ def _interval_missed(execs, created, step, now, slack):
                 run_first, run_count = None, 0
             expected = execs[i] + step
             i += 1
-        else:
+        elif expected <= deadline:
             if run_count == 0:
                 run_first = expected
             run_count += 1
             expected += step
+        else:
+            break
     if run_count:
         runs.append((run_first, run_count, True))  # open-ended tail to now
     return runs
@@ -782,6 +839,7 @@ def _cron_missed(expr, execs, created, now, cfg, tz=None):
     lower = max(anchor, now - cfg.cron_lookback)
     expected = expected_instants(expr, lower, now, tz)
     slack = cfg.cron_match_slack
+    deadline = now - slack
     runs: list[tuple[float, int, bool]] = []
     run_first: float | None = None
     run_count = 0
@@ -790,7 +848,7 @@ def _cron_missed(expr, execs, created, now, cfg, tz=None):
             if run_count:
                 runs.append((run_first, run_count, False))
                 run_first, run_count = None, 0
-        else:
+        elif inst <= deadline:
             if run_count == 0:
                 run_first = inst
             run_count += 1

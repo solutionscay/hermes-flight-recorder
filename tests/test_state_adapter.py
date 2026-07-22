@@ -179,6 +179,41 @@ def test_state_repoll_is_idempotent(tmp_path):
     assert second.get("tool.call_completed", 0) == 0  # cursor honored: no re-scan of messages
 
 
+def test_message_insert_during_poll_is_captured_on_next_pass(tmp_path):
+    hh = tmp_path / "hermes"; hh.mkdir()
+    make_state_db(hh)
+    writer = sqlite3.connect(hh / "state.db")
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("DELETE FROM messages")
+    writer.execute(
+        "INSERT INTO messages VALUES (1,'P','user',NULL,NULL,NULL,'first',1000.0,NULL)"
+    )
+    writer.commit()
+    ob = new_outbox(tmp_path)
+    original_append = ob.append_if_new
+    inserted = False
+
+    def append_with_concurrent_insert(record, **kwargs):
+        nonlocal inserted
+        if record.get("payload", {}).get("message_row_id") == 1 and not inserted:
+            writer.execute(
+                "INSERT INTO messages VALUES "
+                "(2,'P','assistant',NULL,NULL,NULL,'second',1001.0,'stop')"
+            )
+            writer.commit()
+            inserted = True
+        return original_append(record, **kwargs)
+
+    ob.append_if_new = append_with_concurrent_insert
+    first = state_db.poll(ob, hh)
+    second = state_db.poll(ob, hh)
+    writer.close()
+
+    assert first.get("invocation.started") == 1
+    assert second.get("invocation.completed") == 1
+    assert ob.get_cursor("state.db:messages:v2") == "2"
+
+
 def test_adapter_never_writes_state_db(tmp_path):
     hh = tmp_path / "hermes"; hh.mkdir()
     make_state_db(hh)

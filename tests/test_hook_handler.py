@@ -102,7 +102,7 @@ def test_handle_never_raises_when_spool_path_unwritable(tmp_path: Path, monkeypa
     assert errlog.exists() and "handler error" in errlog.read_text()
 
 
-def test_over_cap_drops_event_and_logs(tmp_path: Path, monkeypatch) -> None:
+def test_over_cap_still_appends_event(tmp_path: Path, monkeypatch) -> None:
     bridge = tmp_path / "bridge"
     bridge.mkdir()
     spool = bridge / SPOOL_FILENAME
@@ -110,9 +110,8 @@ def test_over_cap_drops_event_and_logs(tmp_path: Path, monkeypatch) -> None:
     handler = load_handler(tmp_path, monkeypatch, bridge)
     monkeypatch.setattr(handler, "_MAX_SPOOL_BYTES", 1024)
     handler.handle("agent:start", {"session_id": "s1", "message": "hi"})
-    # Nothing appended (still just the pre-fill), and the drop is logged.
-    assert spool.read_bytes() == b"x" * 4096
-    assert "dropped agent:start" in (bridge / ERRLOG_FILENAME).read_text()
+    assert spool.stat().st_size > 4096
+    assert b'"event_type":"agent:start"' in spool.read_bytes()
 
 
 def test_runtime_flight_recorder_home_env_overrides_baked(tmp_path: Path, monkeypatch) -> None:

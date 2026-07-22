@@ -52,7 +52,8 @@ the server does not depend on them, but the ledger and the reconciler do.
 **Batch size.** The client bounds a batch by record count and by byte size.
 The recommended limits are 500 records or 1 MiB, whichever comes first. A
 larger set becomes more than one batch, each a contiguous `producer_sequence`
-range.
+range. A single indivisible record that exceeds the byte target is sent alone.
+The target must not block that record and every later sequence.
 
 ## Response
 

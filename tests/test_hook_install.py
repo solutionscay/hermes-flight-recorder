@@ -57,7 +57,7 @@ def test_handler_is_stdlib_only(tmp_path: Path) -> None:
             imported.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
-    assert imported == {"json", "os", "time"}
+    assert imported == {"json", "os", "time", "uuid"}
     assert "hermes_flight_recorder" not in imported
     assert "cryptography" not in imported
 

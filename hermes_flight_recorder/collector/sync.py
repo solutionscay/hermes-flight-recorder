@@ -124,10 +124,11 @@ def build_batches(
     max_records: int = DEFAULT_MAX_RECORDS,
     max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> Iterator[Batch]:
-    """Yield valid protocol batches within both configured limits.
+    """Yield valid protocol batches within the configured target limits.
 
-    A record that cannot fit in a batch by itself is a terminal local error.
-    The caller must not skip that record or advance past it.
+    A single record can exceed ``max_bytes`` because records are indivisible.
+    Yield it alone so a local batch target cannot block the ordered queue.
+    The ingestion service remains the authority for its hard request limit.
     """
     if max_records < 1:
         raise ValueError("max_records must be at least 1")
@@ -157,12 +158,6 @@ def build_batches(
         # each record plus one comma between records, so the limit check
         # never re-serializes the accumulated batch.
         single_bytes = len(serialize_batch(_batch([record])))
-        if single_bytes > max_bytes:
-            raise SyncError(
-                f"record at producer_sequence {sequence} exceeds the "
-                f"{max_bytes}-byte batch limit"
-            )
-
         grown_bytes = current_bytes + (single_bytes - envelope_bytes) + 1
         if current and (len(current) >= max_records or grown_bytes > max_bytes):
             yield _batch(current)

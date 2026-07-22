@@ -37,7 +37,11 @@ TZ = datetime.timezone(datetime.timedelta(hours=-5))
 
 # Reconcile thresholds small enough that B + 250 already crosses them, so
 # the whole pipeline is deterministic with no wall-clock dependency.
-CFG = ReconcileConfig(subagent_terminal_timeout=100.0, cron_run_terminal_timeout=100.0)
+CFG = ReconcileConfig(
+    coverage_grace=0.0,
+    subagent_terminal_timeout=100.0,
+    cron_run_terminal_timeout=100.0,
+)
 NOW = B + 250  # subagent C (started B+5) is 245s old; the j1 cron gap sits at B+120
 
 

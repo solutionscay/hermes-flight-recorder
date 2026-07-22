@@ -12,8 +12,8 @@ to the real wall clock inside ``reconcile.py``. So, unlike the direct
 reconciler unit tests, these cases are built to be robust to *when* the test
 happens to run rather than pinned to a fixed epoch:
 
-- Sequence-gap and coverage-gap detection never consult ``now`` at all, so
-  they are fully deterministic regardless of wall-clock.
+- Sequence-gap detection does not consult ``now``. Coverage-gap detection
+  uses a short confirmation window, which these tests drive in two passes.
 - The one scenario that does depend on an age window (a stale open session)
   anchors ``started_at`` using the real ``time.time()`` offset by a margin
   safely past (or under) the default ``ReconcileConfig`` threshold, so the
@@ -217,6 +217,20 @@ def test_reconcile_reports_coverage_gap_for_uncaptured_session(tmp_path, capsys)
     captured = capsys.readouterr()
 
     assert code == 0
+    assert "reconciled 0 new finding(s)" in captured.out
+
+    outbox = Outbox.open(bridge)
+    outbox.set_meta(
+        "reconcile:coverage_pending:session:S",
+        repr(time.time() - ReconcileConfig().coverage_grace - 1),
+    )
+    outbox.close()
+    code = cli.main(
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
     assert "reconciled 1 new finding(s)" in captured.out
     assert "  reconcile.gap_detected: 1" in captured.out
     assert "reconcile.terminal_missing" not in captured.out
@@ -240,10 +254,23 @@ def test_reconcile_reports_terminal_missing_for_stale_session(tmp_path, capsys):
     captured = capsys.readouterr()
 
     assert code == 0
-    # The same never-captured row is both an uncaptured-row coverage gap
-    # AND (being past its lifetime with ended_at still NULL) a missing
-    # terminal — two distinct findings with two distinct dedup keys
-    # (reconcile:cover:session:S vs reconcile:terminal:session:S).
-    assert "reconciled 2 new finding(s)" in captured.out
-    assert "  reconcile.gap_detected: 1" in captured.out
+    # Terminal detection is immediate. Coverage detection waits through the
+    # capture grace and reports the same durable row on the next pass.
+    assert "reconciled 1 new finding(s)" in captured.out
     assert "  reconcile.terminal_missing: 1" in captured.out
+
+    outbox = Outbox.open(bridge)
+    outbox.set_meta(
+        "reconcile:coverage_pending:session:S",
+        repr(time.time() - ReconcileConfig().coverage_grace - 1),
+    )
+    outbox.close()
+    code = cli.main(
+        ["reconcile", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes_home)]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "reconciled 1 new finding(s)" in captured.out
+    assert "  reconcile.gap_detected: 1" in captured.out
+    assert "reconcile.terminal_missing" not in captured.out
