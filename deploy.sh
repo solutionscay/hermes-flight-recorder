@@ -27,10 +27,12 @@ SC_HERMES_FLIGHT_RECORDER_HOME="${SC_HERMES_FLIGHT_RECORDER_HOME:-$HOME/.hermes-
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 UNIT_DIR="$HOME/.config/systemd/user"
 
-# All three unit pairs are managed (rendered) here. capture+sync run continuously;
-# reconcile ships disabled and its enabled/active state is preserved across deploys.
+# All three unit pairs are managed (rendered) here and all three run continuously.
+# reconcile runs once a minute, independent of capture, so it detects a stalled
+# capture loop (capture:last_success_at frozen -> reconcile.capture_stale) and the
+# other coverage/terminal/missed-cron gaps. It is network-free and read-only.
 ALL_UNITS=(capture sync reconcile)
-ACTIVE_TIMERS=(capture sync)
+ACTIVE_TIMERS=(capture sync reconcile)
 
 [ -x "$PY" ] || { echo "ERROR: runtime venv not found at $VENV" >&2; exit 1; }
 

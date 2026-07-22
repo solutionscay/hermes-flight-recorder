@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import sqlite3
 
-from hermes_flight_recorder.collector import cron_db, run_pass
+from hermes_flight_recorder.collector import (
+    CAPTURE_HEARTBEAT_KEY,
+    cron_db,
+    run_pass,
+)
 from hermes_flight_recorder.collector.outbox import Outbox
 
 
@@ -55,3 +59,41 @@ def test_run_pass_still_propagates_when_no_error_handler(tmp_path, monkeypatch):
     except (OSError, sqlite3.Error):
         raised = True
     assert raised
+
+
+def test_completed_pass_stamps_the_capture_heartbeat(tmp_path):
+    """A pass that completes (even with every source degraded to a skip) stamps
+    ``capture:last_success_at`` — the liveness proof the reconciler reads."""
+    import time
+
+    ob = Outbox.open(tmp_path / "bridge")
+    ob.initialize()
+
+    before = time.time()
+    # No Hermes home, so every durable source skips; the pass still completes.
+    run_pass(ob, tmp_path / "no-such-hermes-home", on_source_error=lambda *_: None)
+    after = time.time()
+
+    raw = ob.get_meta(CAPTURE_HEARTBEAT_KEY)
+    assert raw is not None
+    stamped = float(raw)
+    assert before <= stamped <= after
+
+
+def test_crashing_pass_does_not_stamp_the_heartbeat(tmp_path, monkeypatch):
+    """A pass that raises (no error handler) is not a success and must leave the
+    heartbeat untouched, so the reconciler still sees the loop as stalled."""
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cron_db, "poll", boom)
+
+    ob = Outbox.open(tmp_path / "bridge")
+    ob.initialize()
+
+    try:
+        run_pass(ob, tmp_path / "no-such-hermes-home")
+    except (OSError, sqlite3.Error):
+        pass
+
+    assert ob.get_meta(CAPTURE_HEARTBEAT_KEY) is None

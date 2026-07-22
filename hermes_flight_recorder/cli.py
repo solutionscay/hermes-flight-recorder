@@ -241,6 +241,64 @@ def _cmd_prune(args: argparse.Namespace) -> int:
         outbox.close()
 
 
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Print a health readout from the outbox and return non-zero if unhealthy.
+
+    On-demand answer to "is capture alive and is the server caught up?" — the
+    human counterpart to the ``reconcile.capture_stale`` alert. Store-only (no
+    Hermes home, no network), so it is safe to run any time and a cron/monitor
+    can gate on the exit code: 0 healthy, 1 unhealthy (capture stale or never
+    recorded a success).
+    """
+    from .collector import CAPTURE_HEARTBEAT_KEY
+    from .collector.outbox import Outbox
+    from .collector.reconcile import ReconcileConfig
+    from .collector.sync import delivery_cursor
+
+    threshold = ReconcileConfig().capture_stale_after
+    now = time.time()
+
+    outbox = Outbox.open(args.flight_recorder_home)
+    try:
+        if not _check_initialized(outbox):
+            return 2
+
+        print(f"installation:    {outbox.installation_id}")
+
+        high_water = outbox.high_water()
+        cursor = delivery_cursor(outbox)
+        pending = high_water - cursor
+        print(
+            f"outbox:          producer high-water {high_water}, "
+            f"delivery cursor {cursor}, pending {pending}"
+        )
+
+        raw = outbox.get_meta(CAPTURE_HEARTBEAT_KEY)
+        healthy = True
+        if raw is None:
+            print("capture:         NO SUCCESS RECORDED (capture has never run)")
+            healthy = False
+        else:
+            try:
+                last = float(raw)
+            except (TypeError, ValueError):
+                print(f"capture:         UNREADABLE heartbeat ({raw!r})")
+                healthy = False
+            else:
+                age = now - last
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last))
+                verdict = "OK" if age <= threshold else "STALE"
+                if age > threshold:
+                    healthy = False
+                print(
+                    f"capture:         {verdict} — last success {stamp} "
+                    f"({int(age)}s ago, threshold {int(threshold)}s)"
+                )
+    finally:
+        outbox.close()
+    return 0 if healthy else 1
+
+
 def _sync_summary(outbox, before_cursor: int) -> tuple[int, int, int]:
     """Return ``(acked_this_pass, delivery_cursor, pending)`` from outbox state.
 
@@ -427,6 +485,13 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[_home_options()],
     )
     p_prune.set_defaults(func=_cmd_prune)
+
+    p_status = sub.add_parser(
+        "status",
+        help="Print capture freshness and outbox delivery lag; exits non-zero when capture is stale.",
+        parents=[_home_options()],
+    )
+    p_status.set_defaults(func=_cmd_status)
 
     p_sync = sub.add_parser(
         "sync",

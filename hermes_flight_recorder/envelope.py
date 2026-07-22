@@ -54,6 +54,7 @@ P0_POC_EVENT_TYPES = frozenset(
         "cron.run_missed",
         "reconcile.gap_detected",
         "reconcile.terminal_missing",
+        "reconcile.capture_stale",
     }
 )
 
@@ -121,6 +122,7 @@ TASK_TERMINAL_TYPES = ("task.completed", "task.blocked", "task.failed_terminal")
 RECONCILE_FINDING_TYPES = (
     "reconcile.gap_detected",
     "reconcile.terminal_missing",
+    "reconcile.capture_stale",
     "cron.run_missed",
     "runtime.gateway_start_failed",
 )
