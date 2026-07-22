@@ -42,6 +42,7 @@ class RetentionConfig:
     max_age_days: int | None = 30
     max_bytes: int | None = None
     require_delivered: bool = True
+    vacuum: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,11 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 _value("HFR_RETENTION_REQUIRE_DELIVERED", retention, "require_delivered", True),
                 "retention.require_delivered",
             ),
+            vacuum=_choice(
+                _value("HFR_RETENTION_VACUUM", retention, "vacuum", "auto"),
+                "retention.vacuum",
+                {"auto"},
+            ),
         ),
         sync=SyncRuntimeConfig(
             interval_seconds=_optional_positive_float(
@@ -146,6 +152,7 @@ def save(
             "max_age_days": config.retention.max_age_days,
             "max_bytes": config.retention.max_bytes,
             "require_delivered": config.retention.require_delivered,
+            "vacuum": config.retention.vacuum,
         },
         "sync": {
             "interval_seconds": config.sync.interval_seconds,
@@ -225,6 +232,13 @@ def _boolean(value: Any, name: str) -> bool:
     if isinstance(value, str) and value.lower() in {"true", "false"}:
         return value.lower() == "true"
     raise RecorderConfigError(f"{name} must be true or false")
+
+
+def _choice(value: Any, name: str, choices: set[str]) -> str:
+    if not isinstance(value, str) or value not in choices:
+        expected = ", ".join(sorted(repr(choice) for choice in choices))
+        raise RecorderConfigError(f"{name} must be one of: {expected}")
+    return value
 
 
 def _roles(value: Any) -> tuple[str, ...]:

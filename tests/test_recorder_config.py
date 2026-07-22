@@ -19,6 +19,7 @@ def test_missing_or_partial_config_uses_current_defaults(tmp_path):
     assert missing.capture.max_content_bytes == 65_536
     assert missing.capture.message_roles == ("user", "assistant", "tool")
     assert missing.retention.enabled is False
+    assert missing.retention.vacuum == "auto"
     assert missing.sync.interval_seconds is None
     assert missing.sync.max_records == 500
     assert missing.sync.max_bytes == 1024 * 1024
@@ -41,6 +42,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("HFR_CAPTURE_MAX_CONTENT_BYTES", "20")
     monkeypatch.setenv("HFR_RETENTION_ENABLED", "true")
+    monkeypatch.setenv("HFR_RETENTION_VACUUM", "auto")
     monkeypatch.setenv("HFR_SYNC_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("HFR_SYNC_MAX_RECORDS", "50")
     monkeypatch.setenv("HFR_CAPTURE_MESSAGE_ROLES", '["assistant", "tool"]')
@@ -60,6 +62,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     [
         ({"capture": {"max_content_bytes": 0}}, "capture.max_content_bytes"),
         ({"retention": {"enabled": "yes"}}, "retention.enabled"),
+        ({"retention": {"vacuum": "never"}}, "retention.vacuum"),
         ({"sync": {"max_records": 1.5}}, "sync.max_records"),
         ({"capture": {"message_roles": "user"}}, "message_roles"),
         ({"capture": {"sources": {"hook": "yes"}}}, "capture.sources"),

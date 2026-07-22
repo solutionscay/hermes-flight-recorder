@@ -123,6 +123,38 @@ def test_sync_uses_batch_limits_from_recorder_config(tmp_path, ingest_server, ca
     capsys.readouterr()
 
 
+def test_sync_automatically_prunes_only_after_delivery_ack(
+    tmp_path, ingest_server, capsys
+):
+    home = prepared_home(tmp_path, ingest_server.url, n_events=3)
+    (home / "recorder-config.json").write_text(
+        json.dumps(
+            {
+                "retention": {
+                    "enabled": True,
+                    "max_age_days": None,
+                    "max_bytes": 1,
+                    "require_delivered": True,
+                    "vacuum": "auto",
+                }
+            }
+        )
+    )
+
+    code = cli.main(
+        ["sync", "--flight-recorder-home", str(home), "--allow-insecure-url"]
+    )
+
+    assert code == 0
+    assert len(ingest_server.ledger) == 3
+    outbox = Outbox.open(home)
+    assert delivery_cursor(outbox) == 3
+    assert outbox.high_water() == 3
+    assert outbox.count() == 0
+    outbox.close()
+    assert "automatic retention: pruned 3 delivered event" in capsys.readouterr().out
+
+
 def test_sync_uninitialized_outbox_is_config_error(tmp_path, capsys):
     code = cli.main(["sync", "--flight-recorder-home", str(tmp_path)])
     assert code == 2

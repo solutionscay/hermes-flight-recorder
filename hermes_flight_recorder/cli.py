@@ -38,6 +38,38 @@ def _check_initialized(outbox) -> bool:
     return True
 
 
+def _print_prune_result(result, *, automatic: bool = False) -> None:
+    """Print an auditable summary for a retention pass."""
+    prefix = "automatic retention: " if automatic else ""
+    if result.pruned_count == 0:
+        if not automatic:
+            print(
+                f"{prefix}pruned 0 events (delivery cursor "
+                f"{result.delivery_cursor}; retained event bytes "
+                f"{result.event_bytes_after})"
+            )
+        return
+    print(
+        f"{prefix}pruned {result.pruned_count} delivered event(s), "
+        f"sequences {result.oldest_sequence}-{result.newest_sequence}; "
+        f"removed {result.event_bytes_removed} event bytes and reclaimed "
+        f"{result.database_bytes_reclaimed} database bytes"
+    )
+
+
+def _automatic_prune(outbox, config) -> None:
+    """Run throttled retention without making capture or sync less durable."""
+    from .collector.retention import RetentionError, maybe_prune
+
+    try:
+        result = maybe_prune(outbox, config)
+    except RetentionError as exc:
+        print(f"automatic retention skipped: {exc}", file=sys.stderr)
+        return
+    if result is not None:
+        _print_prune_result(result, automatic=True)
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     # Imported lazily so `hermes-flight-recorder --version` needs no heavy deps.
     from .collector._common import resolve_hermes_home
@@ -63,12 +95,18 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    from .collector import run_pass
+    from .collector import recorder_config, run_pass
     from .collector.outbox import Outbox
 
     outbox = Outbox.open(args.flight_recorder_home)
     try:
         if not _check_initialized(outbox):
+            return 2
+
+        try:
+            runtime_config = recorder_config.load(args.flight_recorder_home)
+        except recorder_config.RecorderConfigError as exc:
+            print(f"run not configured: {exc}", file=sys.stderr)
             return 2
 
         totals = run_pass(
@@ -81,6 +119,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"polled {sum(totals.values())} events into {outbox.path}:")
         for event_type in sorted(totals):
             print(f"  {event_type}: {totals[event_type]}")
+        _automatic_prune(outbox, runtime_config.retention)
     finally:
         outbox.close()
     return 0
@@ -156,6 +195,35 @@ def _cmd_observe(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _cmd_prune(args: argparse.Namespace) -> int:
+    from .collector import recorder_config
+    from .collector.outbox import Outbox
+    from .collector.retention import RetentionError, prune
+
+    outbox = Outbox.open(args.flight_recorder_home)
+    try:
+        if not _check_initialized(outbox):
+            return 2
+        try:
+            config = recorder_config.load(args.flight_recorder_home).retention
+        except recorder_config.RecorderConfigError as exc:
+            print(f"prune not configured: {exc}", file=sys.stderr)
+            return 2
+
+        try:
+            result = prune(outbox, config)
+        except RetentionError as exc:
+            print(f"prune refused: {exc}", file=sys.stderr)
+            return 2
+        if result is None:
+            print("retention disabled; no events pruned")
+            return 0
+        _print_prune_result(result)
+        return 0
+    finally:
+        outbox.close()
+
+
 def _sync_summary(outbox, before_cursor: int) -> tuple[int, int, int]:
     """Return ``(acked_this_pass, delivery_cursor, pending)`` from outbox state.
 
@@ -178,6 +246,7 @@ def _sync_once(
     *,
     max_records: int = 500,
     max_bytes: int = 1024 * 1024,
+    retention_config=None,
 ) -> int:
     """One sync pass. Print the summary and return a sync exit code."""
     from .collector.sync import delivery_cursor
@@ -196,6 +265,8 @@ def _sync_once(
         f"shipped {acked} / acked {acked} / pending {pending}  "
         f"(delivery cursor {cursor}, producer high-water {cursor + pending})"
     )
+    if retention_config is not None:
+        _automatic_prune(outbox, retention_config)
     if outcome.ok:
         return _SYNC_OK
     if outcome.reason == "auth":
@@ -239,6 +310,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         sync_kwargs = {
             "max_records": runtime_config.sync.max_records,
             "max_bytes": runtime_config.sync.max_bytes,
+            "retention_config": runtime_config.retention,
         }
         if interval is None:
             return _sync_once(outbox, transport, **sync_kwargs)
@@ -331,6 +403,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_obs.add_argument("--session", default=None, help="Filter to one session/operation id.")
     p_obs.add_argument("--since", default=None, help="Keep events at/after an epoch or ISO timestamp.")
     p_obs.set_defaults(func=_cmd_observe)
+
+    p_prune = sub.add_parser(
+        "prune",
+        help="Prune delivered outbox events according to retention configuration.",
+        parents=[_home_options()],
+    )
+    p_prune.set_defaults(func=_cmd_prune)
 
     p_sync = sub.add_parser(
         "sync",

@@ -1,6 +1,6 @@
 """Durable local outbox.
 
-The outbox is the append-only local SQLite store and the single
+The outbox is the local SQLite store and the single
 ``producer_sequence`` authority per installation. Every producer (the
 hook and the state adapter) appends through it, so one monotonic sequence
 covers the whole event stream and makes gaps detectable.
@@ -16,6 +16,8 @@ Key properties:
   appending twice, and does not consume a sequence number.
 - Content is encrypted before write with a local dev key (POC only; real
   key custody is deferred).
+- Retention can remove acknowledged event rows, but never sequence or meta
+  state. The independent high-water mark therefore remains authoritative.
 
 The outbox database must never live under ``HERMES_HOME``.
 """
@@ -28,6 +30,7 @@ import os
 import sqlite3
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -36,7 +39,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from ..envelope import SCHEMA_VERSION, parse, serialize, validate
 from ._common import default_flight_recorder_home, resolve_hermes_home
 
-__all__ = ["OUTBOX_SCHEMA_VERSION", "Outbox", "OutboxError", "default_flight_recorder_home"]
+__all__ = [
+    "OUTBOX_SCHEMA_VERSION",
+    "Outbox",
+    "OutboxError",
+    "PruneResult",
+    "default_flight_recorder_home",
+]
 
 OUTBOX_SCHEMA_VERSION = "1"
 _KEY_VERSION = "aesgcm256:dev"
@@ -67,8 +76,22 @@ class OutboxError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class PruneResult:
+    """Summary of one acknowledged-event prune."""
+
+    pruned_count: int
+    oldest_sequence: int | None
+    newest_sequence: int | None
+    event_bytes_removed: int
+    event_bytes_before: int
+    event_bytes_after: int
+    database_bytes_reclaimed: int
+    delivery_cursor: int
+
+
 class Outbox:
-    """Append-only local event store and sequence authority."""
+    """Local event store and append-only sequence authority."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -316,6 +339,145 @@ class Outbox:
 
     def count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    def prune_delivered(
+        self,
+        delivery_cursor: int,
+        *,
+        older_than: float | None = None,
+        max_bytes: int | None = None,
+        vacuum: bool = True,
+    ) -> PruneResult:
+        """Remove delivered events selected by age or a byte budget.
+
+        ``delivery_cursor`` is a hard upper bound: rows with a greater
+        sequence are never candidates. ``max_bytes`` measures the UTF-8
+        bytes of stored envelope JSON, which keeps the policy independent of
+        SQLite page size. When that budget is exceeded, acknowledged rows
+        are removed oldest-first until the retained event bytes fit or no
+        acknowledged rows remain.
+
+        Sequence authority and every meta value are deliberately untouched.
+        A vacuum runs only when rows were deleted.
+        """
+        if delivery_cursor < 0:
+            raise ValueError("delivery_cursor cannot be negative")
+        if max_bytes is not None and max_bytes < 1:
+            raise ValueError("max_bytes must be at least 1")
+
+        inst = self.installation_id
+        conn = self._conn
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS retention_prune ("
+            "rowid_pk INTEGER PRIMARY KEY, "
+            "producer_sequence INTEGER NOT NULL, "
+            "event_bytes INTEGER NOT NULL)"
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM retention_prune")
+            database_bytes_before = self._allocated_bytes()
+            event_bytes_before = conn.execute(
+                "SELECT COALESCE(SUM(length(CAST(envelope_json AS BLOB))), 0) "
+                "FROM events WHERE installation_id=?",
+                (inst,),
+            ).fetchone()[0]
+
+            if older_than is not None:
+                conn.execute(
+                    "INSERT INTO retention_prune "
+                    "(rowid_pk, producer_sequence, event_bytes) "
+                    "SELECT rowid_pk, producer_sequence, "
+                    "length(CAST(envelope_json AS BLOB)) "
+                    "FROM events WHERE installation_id=? "
+                    "AND producer_sequence<=? AND recorded_at<?",
+                    (inst, delivery_cursor, older_than),
+                )
+
+            selected_bytes = conn.execute(
+                "SELECT COALESCE(SUM(event_bytes), 0) FROM retention_prune"
+            ).fetchone()[0]
+            remaining_bytes = event_bytes_before - selected_bytes
+            if max_bytes is not None and remaining_bytes > max_bytes:
+                age_complement = (
+                    "AND recorded_at>=? " if older_than is not None else ""
+                )
+                candidate_params = (
+                    (inst, delivery_cursor, older_than)
+                    if older_than is not None
+                    else (inst, delivery_cursor)
+                )
+                size_candidates = conn.execute(
+                    "SELECT rowid_pk, producer_sequence, "
+                    "length(CAST(envelope_json AS BLOB)) "
+                    "FROM events WHERE installation_id=? "
+                    "AND producer_sequence<=? "
+                    + age_complement
+                    + "ORDER BY producer_sequence",
+                    candidate_params,
+                )
+                batch: list[tuple[int, int, int]] = []
+                try:
+                    for rowid_pk, sequence, event_bytes in size_candidates:
+                        batch.append((rowid_pk, sequence, event_bytes))
+                        selected_bytes += event_bytes
+                        remaining_bytes -= event_bytes
+                        if len(batch) == 1_000 or remaining_bytes <= max_bytes:
+                            conn.executemany(
+                                "INSERT INTO retention_prune VALUES (?, ?, ?)",
+                                batch,
+                            )
+                            batch.clear()
+                        if remaining_bytes <= max_bytes:
+                            break
+                    if batch:
+                        conn.executemany(
+                            "INSERT INTO retention_prune VALUES (?, ?, ?)",
+                            batch,
+                        )
+                finally:
+                    size_candidates.close()
+
+            pruned_count, oldest_sequence, newest_sequence = conn.execute(
+                "SELECT COUNT(*), MIN(producer_sequence), MAX(producer_sequence) "
+                "FROM retention_prune"
+            ).fetchone()
+            if pruned_count:
+                conn.execute(
+                    "DELETE FROM events WHERE rowid_pk IN "
+                    "(SELECT rowid_pk FROM retention_prune)"
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        if pruned_count and vacuum:
+            conn.execute("VACUUM")
+            # VACUUM rebuilds the logical database. In WAL mode, checkpoint
+            # that rebuild and truncate the log so the reclaimed pages also
+            # become free filesystem space promptly.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+
+        database_bytes_after = self._allocated_bytes()
+        return PruneResult(
+            pruned_count=pruned_count,
+            oldest_sequence=oldest_sequence,
+            newest_sequence=newest_sequence,
+            event_bytes_removed=selected_bytes,
+            event_bytes_before=event_bytes_before,
+            event_bytes_after=event_bytes_before - selected_bytes,
+            database_bytes_reclaimed=max(
+                0, database_bytes_before - database_bytes_after
+            ),
+            delivery_cursor=delivery_cursor,
+        )
+
+    def _allocated_bytes(self) -> int:
+        """Return bytes allocated to the SQLite database's pages."""
+        page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+        page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        return page_size * page_count
 
     def iter_events(
         self,
