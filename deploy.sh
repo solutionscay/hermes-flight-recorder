@@ -27,10 +27,12 @@ SC_HERMES_FLIGHT_RECORDER_HOME="${SC_HERMES_FLIGHT_RECORDER_HOME:-$HOME/.hermes-
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 UNIT_DIR="$HOME/.config/systemd/user"
 
-# All three unit pairs are managed (rendered) here. capture+sync run continuously;
-# reconcile ships disabled and its enabled/active state is preserved across deploys.
+# All three unit pairs are managed (rendered) here and all three run continuously.
+# reconcile runs once a minute, independent of capture, so it detects a stalled
+# capture loop (capture:last_success_at frozen -> reconcile.capture_stale) and the
+# other coverage/terminal/missed-cron gaps. It is network-free and read-only.
 ALL_UNITS=(capture sync reconcile)
-ACTIVE_TIMERS=(capture sync)
+ACTIVE_TIMERS=(capture sync reconcile)
 
 [ -x "$PY" ] || { echo "ERROR: runtime venv not found at $VENV" >&2; exit 1; }
 
@@ -120,8 +122,19 @@ echo "==> Asserting timers armed (finite next elapse)"
 # the monotonic field is always 0 for them. A dead/un-armed timer leaves this
 # empty — the exact regression (NextElapse never resolving) that caused the
 # capture blackout, now caught at deploy time.
+#
+# One benign transient: a timer being enabled for the first time with
+# Persistent=true fires its catch-up pass the instant it starts, and while that
+# oneshot service runs, the timer's NextElapse reads empty. That is armed, not
+# dead — it repopulates the moment the pass finishes. So retry briefly, and only
+# fail if the next elapse is still unresolved after the in-flight pass settles.
 for s in "${ACTIVE_TIMERS[@]}"; do
-  ne=$(systemctl --user show "hermes-flight-recorder-$s.timer" -p NextElapseUSecRealtime --value)
+  ne=""
+  for _ in 1 2 3 4 5; do
+    ne=$(systemctl --user show "hermes-flight-recorder-$s.timer" -p NextElapseUSecRealtime --value)
+    if [ -n "$ne" ] && [ "$ne" != "0" ]; then break; fi
+    sleep 2  # let a first-enable catch-up pass finish, then re-read
+  done
   if [ -z "$ne" ] || [ "$ne" = "0" ]; then
     echo "  FAIL: $s.timer has no scheduled next elapse (NextElapseUSecRealtime='$ne')" >&2
     exit 1

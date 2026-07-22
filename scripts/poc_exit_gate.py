@@ -204,7 +204,7 @@ def scenario_happy(tmp: Path) -> list[str]:
 
     ob = Outbox.open(flight_recorder_home)
     ob.initialize()
-    run_pass(ob, hermes)
+    run_pass(ob, hermes, now=NOW)
     findings = reconcile(ob, hermes, now=NOW, config=CFG)
     show(ob, "happy")
     _, code = report_code(ob)
@@ -225,7 +225,7 @@ def scenario_dropped_capture(tmp: Path) -> list[str]:
 
     ob = Outbox.open(flight_recorder_home)
     ob.initialize()
-    run_pass(ob, hermes)
+    run_pass(ob, hermes, now=NOW)
     ob.close()
 
     # Lose one live event (the hook's invocation.completed): a middle sequence.
@@ -253,7 +253,7 @@ def scenario_missed_cron(tmp: Path) -> list[str]:
 
     ob = Outbox.open(flight_recorder_home)
     ob.initialize()
-    run_pass(ob, hermes)
+    run_pass(ob, hermes, now=NOW)
     findings = reconcile(ob, hermes, now=NOW, config=CFG)
     show(ob, "missed-cron")
     _, code = report_code(ob)
@@ -275,7 +275,7 @@ def scenario_restart(tmp: Path) -> list[str]:
 
     ob = Outbox.open(flight_recorder_home)
     ob.initialize()
-    run_pass(ob, hermes)
+    run_pass(ob, hermes, now=NOW)
     hw, n, inst = ob.high_water(), ob.count(), ob.installation_id
     ob.close()  # simulate the recorder process stopping
 

@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import CAPTURE_HEARTBEAT_KEY
 from ..envelope import SESSION_LIFECYCLE, SESSION_START_TYPES
 from ._common import (
     append_and_count,
@@ -92,6 +93,12 @@ class ReconcileConfig:
     task_heartbeat_stale_after: float = 15 * 60.0
     # A heartbeat older than this means the whole scheduler is dead.
     ticker_stale_after: float = 300.0
+    # The Flight Recorder's own capture heartbeat (``capture:last_success_at``,
+    # stamped every completed capture pass ~every 15s). Older than this and the
+    # capture loop has stopped ticking — the silent outage. 5 min = 20 missed
+    # ticks, comfortably above deploy-restart jitter yet far tighter than the
+    # 3h20m blackout that went unseen.
+    capture_stale_after: float = 300.0
     # How far an execution may sit from an expected fire and still count as
     # that fire. Absorbs ticker jitter (a "1m" job fired ~78s apart).
     cron_match_slack: float = 45.0
@@ -135,6 +142,7 @@ def reconcile(
     _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg)
     _detect_gateway_start_failed(outbox, home, counts, when)
     _detect_stale_task_leases(outbox, home, counts, when, cfg)
+    _detect_capture_stale(outbox, counts, when, cfg)
     return dict(counts)
 
 
@@ -934,6 +942,50 @@ def _ticker_is_stale(outbox, home, counts, when, cfg) -> bool:
         dedup_key=f"reconcile:ticker_stale:{int(hb)}",
     )
     return True
+
+
+# --- capture liveness ---------------------------------------------------
+def _detect_capture_stale(outbox, counts, when, cfg) -> None:
+    """The Flight Recorder watching its OWN capture loop.
+
+    ``run_pass`` stamps ``capture:last_success_at`` on every completed pass.
+    The reconciler fires on its own realtime timer, independent of capture, so
+    a capture loop that stopped ticking — a dead timer, a crash-loop, a hung
+    pass — leaves this heartbeat frozen while reconcile keeps running. That is
+    exactly the silent outage that ran ~3h20m unseen: capture reported
+    active/success while never firing.
+
+    A heartbeat older than the window emits ONE ``reconcile.capture_stale``
+    finding, keyed on the frozen heartbeat so a dead capture alerts once, not
+    once per reconcile minute. An absent heartbeat means no baseline yet (a
+    fresh install where capture never ran); it raises no alert, mirroring the
+    ticker-staleness rule. The signal is installation-wide, so it correlates on
+    the installation id like a sequence gap does.
+    """
+    raw = outbox.get_meta(CAPTURE_HEARTBEAT_KEY)
+    if raw is None:
+        return
+    try:
+        last = float(raw)
+    except (TypeError, ValueError):
+        return  # malformed heartbeat: treat as no baseline, never crash
+    staleness = when - last
+    if staleness <= cfg.capture_stale_after:
+        return
+    _emit(
+        outbox,
+        counts,
+        event_type="reconcile.capture_stale",
+        occurred_at=when,
+        correlation_id=outbox.installation_id,
+        partial=True,
+        payload={
+            "last_success_at": last,
+            "staleness_seconds": staleness,
+            "threshold_seconds": cfg.capture_stale_after,
+        },
+        dedup_key=f"reconcile:capture_stale:{int(last)}",
+    )
 
 
 # --- durable helpers ----------------------------------------------------

@@ -232,6 +232,8 @@ def test_exit_code_is_one_for_every_finding_type(tmp_path, event_type):
                                     "prev_sequence": 2, "next_sequence": 4},
         "reconcile.terminal_missing": {"subject_type": "session", "subject_id": "S",
                                         "expected_terminal_event_type": "session.ended"},
+        "reconcile.capture_stale": {"last_success_at": B, "staleness_seconds": 600.0,
+                                     "threshold_seconds": 300.0},
         "cron.run_missed": {"job_id": "j1", "expected_fire_at": B, "missed_count": 1},
         "runtime.gateway_start_failed": {"reason_class": "token_conflict",
                                           "gateway_state": "degraded", "platform": "discord"},

@@ -353,6 +353,10 @@ def _finding_detail(record: dict[str, Any]) -> str:
     if et == "runtime.gateway_start_failed":
         target = p.get("platform") or "gateway"
         return f"{target} failed to start: {p.get('reason_class')}"
+    if et == "reconcile.capture_stale":
+        age = p.get("staleness_seconds")
+        age_s = f", ~{int(age)}s stale" if age else ""
+        return f"capture loop stalled: last success {_iso(p.get('last_success_at'))}{age_s}"
     return str(p)
 
 

@@ -21,8 +21,15 @@ Components:
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
+
+# Meta key holding the wall-clock epoch of the last completed capture pass.
+# The reconciler reads it to prove the capture loop is still ticking; a frozen
+# value while reconcile keeps running is the silent-outage signal (a dead timer,
+# a crash-loop, a hung pass).
+CAPTURE_HEARTBEAT_KEY = "capture:last_success_at"
 
 # A durable-store poll may hit a transient fault that is not a missing file: the
 # Hermes DB is momentarily locked (``sqlite3.OperationalError`` while Hermes
@@ -44,6 +51,7 @@ def run_pass(
     capture_config: CaptureConfig | None = None,
     knowledge_config: KnowledgeConfig | None = None,
     on_source_error: Callable[[str, Exception], None] | None = None,
+    now: float | None = None,
 ) -> dict[str, int]:
     """One capture pass: drain the hook spool, then poll the durable stores.
 
@@ -55,6 +63,10 @@ def run_pass(
     exception from the hook drain — a bad spool must not sink the poll pass —
     and a missing durable store from a poll). When it is None, every failure
     propagates instead.
+
+    ``now`` overrides the wall clock stamped into the capture heartbeat; it
+    exists for deterministic fixtures (the exit gate) that reconcile against a
+    fixed synthetic clock. Production leaves it None and uses ``time.time()``.
     """
     from collections import Counter
 
@@ -91,4 +103,12 @@ def run_pass(
             if on_source_error is None:
                 raise
             on_source_error(label, exc)
+
+    # Stamp the capture heartbeat once the pass completes. A pass that reached
+    # here is a live capture loop even if a source degraded to a skip (the next
+    # tick re-scans); the heartbeat proves the loop ran, not that every source
+    # succeeded. If a source raised uncaught (on_source_error is None), we never
+    # reach this — a crashing pass is not a success.
+    stamped = time.time() if now is None else float(now)
+    outbox.set_meta(CAPTURE_HEARTBEAT_KEY, repr(stamped))
     return dict(totals)
