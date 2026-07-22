@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
-    from .recorder_config import CaptureConfig
+    from .recorder_config import CaptureConfig, KnowledgeConfig
 
 
 def run_pass(
@@ -32,6 +32,7 @@ def run_pass(
     hermes_home: str | Path | None = None,
     *,
     capture_config: CaptureConfig | None = None,
+    knowledge_config: KnowledgeConfig | None = None,
     on_source_error: Callable[[str, Exception], None] | None = None,
 ) -> dict[str, int]:
     """One capture pass: drain the hook spool, then poll the durable stores.
@@ -47,7 +48,7 @@ def run_pass(
     """
     from collections import Counter
 
-    from . import cron_db, gateway_log, kanban_db, state_db
+    from . import cron_db, gateway_log, kanban_db, knowledge_store, state_db
     from .hook import drain as drain_hook_spool
 
     totals: Counter[str] = Counter()
@@ -63,6 +64,13 @@ def run_pass(
         ("cron", lambda: cron_db.poll(outbox, hermes_home), FileNotFoundError),
         ("kanban", lambda: kanban_db.poll(outbox, hermes_home), FileNotFoundError),
         ("gateway log", lambda: gateway_log.poll(outbox, hermes_home), FileNotFoundError),
+        (
+            "knowledge",
+            lambda: knowledge_store.poll(
+                outbox, hermes_home, knowledge_config=knowledge_config
+            ),
+            FileNotFoundError,
+        ),
     )
     for label, poll, tolerated in sources:
         try:

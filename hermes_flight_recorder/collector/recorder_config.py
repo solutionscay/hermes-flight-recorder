@@ -46,6 +46,16 @@ class RetentionConfig:
 
 
 @dataclass(frozen=True)
+class KnowledgeConfig:
+    # History depth for the content-addressed knowledge store. ``full`` keeps
+    # every version (cheap — unchanged files deduplicate); ``latest_only`` keeps
+    # only current content and hashes, for a home already versioned in its own
+    # git. ``max_versions`` caps the chain under ``full``; None keeps all.
+    history: str = "full"
+    max_versions: int | None = None
+
+
+@dataclass(frozen=True)
 class SyncRuntimeConfig:
     # None preserves the existing CLI's one-pass default.  An explicit value
     # enables the same continuous mode as ``sync --interval``.
@@ -58,6 +68,7 @@ class SyncRuntimeConfig:
 class RecorderConfig:
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
+    knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     sync: SyncRuntimeConfig = field(default_factory=SyncRuntimeConfig)
 
 
@@ -72,6 +83,7 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
     data = _read_file(config_path(flight_recorder_home))
     capture = _section(data, "capture")
     retention = _section(data, "retention")
+    knowledge = _section(data, "knowledge")
     sync = _section(data, "sync")
 
     return RecorderConfig(
@@ -118,6 +130,17 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 {"auto"},
             ),
         ),
+        knowledge=KnowledgeConfig(
+            history=_choice(
+                _value("HFR_KNOWLEDGE_HISTORY", knowledge, "history", "full"),
+                "knowledge.history",
+                {"full", "latest_only"},
+            ),
+            max_versions=_optional_positive_int(
+                _value("HFR_KNOWLEDGE_MAX_VERSIONS", knowledge, "max_versions", None),
+                "knowledge.max_versions",
+            ),
+        ),
         sync=SyncRuntimeConfig(
             interval_seconds=_optional_positive_float(
                 _value("HFR_SYNC_INTERVAL_SECONDS", sync, "interval_seconds", None),
@@ -153,6 +176,10 @@ def save(
             "max_bytes": config.retention.max_bytes,
             "require_delivered": config.retention.require_delivered,
             "vacuum": config.retention.vacuum,
+        },
+        "knowledge": {
+            "history": config.knowledge.history,
+            "max_versions": config.knowledge.max_versions,
         },
         "sync": {
             "interval_seconds": config.sync.interval_seconds,
@@ -273,6 +300,7 @@ __all__ = [
     "CONFIG_FILENAME",
     "CaptureConfig",
     "DEFAULT_MAX_CONTENT_BYTES",
+    "KnowledgeConfig",
     "RecorderConfig",
     "RecorderConfigError",
     "RetentionConfig",

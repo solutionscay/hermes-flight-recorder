@@ -81,6 +81,32 @@ CREATE TABLE IF NOT EXISTS retention_tombstones (
     summary_json      TEXT NOT NULL,
     PRIMARY KEY (installation_id, producer_sequence)
 );
+CREATE TABLE IF NOT EXISTS knowledge_blob (
+    content_hash       TEXT PRIMARY KEY,
+    content_ciphertext TEXT NOT NULL,
+    content_nonce      TEXT NOT NULL,
+    key_version        TEXT NOT NULL,
+    byte_len           INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS knowledge_artifact (
+    artifact_id TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    category    TEXT,
+    provenance  TEXT NOT NULL,
+    first_seen  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS knowledge_version (
+    artifact_id     TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    manifest_json   TEXT NOT NULL,
+    manifest_hash   TEXT NOT NULL,
+    occurred_at     REAL NOT NULL,
+    origin          TEXT NOT NULL,
+    linked_event_id TEXT,
+    is_tombstone    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (artifact_id, seq)
+);
 """
 
 
@@ -240,6 +266,200 @@ class Outbox:
         return self._cipher().decrypt(
             base64.b64decode(nonce), base64.b64decode(ct), None
         )
+
+    # --- knowledge store ------------------------------------------------
+    # A content-addressed store for Hermes-created skills and built-in
+    # memories (Phase 3). It shares the outbox's cipher and connection but
+    # its own tables, so event retention never touches knowledge state and
+    # knowledge retention never touches events.
+    @staticmethod
+    def _content_hash(raw: bytes) -> str:
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _manifest_hash(manifest: list[dict[str, str]]) -> str:
+        canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def put_blob(self, content: str | bytes) -> str:
+        """Store one file's content, encrypted, deduplicated by plaintext hash.
+
+        Returns the content hash. Identical plaintext is stored once, so a
+        multi-file skill that changes one file adds a single new blob.
+        """
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        digest = self._content_hash(raw)
+        if self._conn.execute(
+            "SELECT 1 FROM knowledge_blob WHERE content_hash=?", (digest,)
+        ).fetchone() is not None:
+            return digest
+        fields = self._encrypt_content(raw)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO knowledge_blob("
+            "content_hash, content_ciphertext, content_nonce, key_version, byte_len) "
+            "VALUES(?,?,?,?,?)",
+            (
+                digest,
+                fields["content_ciphertext"],
+                fields["content_nonce"],
+                fields["key_version"],
+                len(raw),
+            ),
+        )
+        return digest
+
+    def get_blob(self, content_hash: str) -> bytes:
+        """Decrypt and return a stored blob. For restore and tests."""
+        row = self._conn.execute(
+            "SELECT content_ciphertext, content_nonce FROM knowledge_blob "
+            "WHERE content_hash=?",
+            (content_hash,),
+        ).fetchone()
+        if row is None:
+            raise OutboxError(f"no knowledge blob for {content_hash}")
+        return self._cipher().decrypt(
+            base64.b64decode(row[1]), base64.b64decode(row[0]), None
+        )
+
+    def upsert_knowledge_artifact(
+        self,
+        artifact_id: str,
+        *,
+        kind: str,
+        name: str,
+        category: str | None,
+        provenance: str,
+        first_seen: float,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO knowledge_artifact("
+            "artifact_id, kind, name, category, provenance, first_seen) "
+            "VALUES(?,?,?,?,?,?)",
+            (artifact_id, kind, name, category, provenance, float(first_seen)),
+        )
+
+    def knowledge_artifact_ids(self) -> list[str]:
+        return [
+            row[0]
+            for row in self._conn.execute(
+                "SELECT artifact_id FROM knowledge_artifact ORDER BY artifact_id"
+            )
+        ]
+
+    @staticmethod
+    def _version_row(row: Any) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "artifact_id": row[0],
+            "seq": row[1],
+            "manifest": json.loads(row[2]),
+            "manifest_hash": row[3],
+            "occurred_at": row[4],
+            "origin": row[5],
+            "linked_event_id": row[6],
+            "is_tombstone": bool(row[7]),
+        }
+
+    _VERSION_COLUMNS = (
+        "artifact_id, seq, manifest_json, manifest_hash, occurred_at, origin, "
+        "linked_event_id, is_tombstone"
+    )
+
+    def latest_knowledge_version(self, artifact_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            f"SELECT {self._VERSION_COLUMNS} FROM knowledge_version "
+            "WHERE artifact_id=? ORDER BY seq DESC LIMIT 1",
+            (artifact_id,),
+        ).fetchone()
+        return self._version_row(row)
+
+    def knowledge_versions(self, artifact_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            f"SELECT {self._VERSION_COLUMNS} FROM knowledge_version "
+            "WHERE artifact_id=? ORDER BY seq",
+            (artifact_id,),
+        ).fetchall()
+        return [v for v in (self._version_row(r) for r in rows) if v is not None]
+
+    def append_knowledge_version(
+        self,
+        artifact_id: str,
+        *,
+        manifest: list[dict[str, str]],
+        occurred_at: float,
+        origin: str,
+        linked_event_id: str | None = None,
+        is_tombstone: bool = False,
+    ) -> tuple[int, bool]:
+        """Append a version unless the manifest equals the artifact's latest.
+
+        Returns ``(seq, created)``. Idempotent against the *latest* version, so
+        a re-scan of unchanged content writes nothing, while a revert to an
+        earlier state is a genuine new version (it differs from the latest).
+        """
+        manifest_hash = self._manifest_hash(manifest)
+        latest = self.latest_knowledge_version(artifact_id)
+        if latest is not None and latest["manifest_hash"] == manifest_hash:
+            return latest["seq"], False
+        seq = latest["seq"] + 1 if latest is not None else 1
+        self._conn.execute(
+            "INSERT INTO knowledge_version("
+            "artifact_id, seq, manifest_json, manifest_hash, occurred_at, origin, "
+            "linked_event_id, is_tombstone) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                artifact_id,
+                seq,
+                json.dumps(manifest, separators=(",", ":")),
+                manifest_hash,
+                float(occurred_at),
+                origin,
+                linked_event_id,
+                1 if is_tombstone else 0,
+            ),
+        )
+        return seq, True
+
+    def prune_knowledge_versions(self, artifact_id: str, *, keep: int) -> int:
+        """Keep the newest ``keep`` versions of an artifact; delete older ones.
+
+        Always keeps at least the latest version. Returns the count deleted.
+        Blobs are not reclaimed here — call :meth:`gc_orphan_blobs` after.
+        """
+        keep = max(1, keep)
+        doomed = [
+            row[0]
+            for row in self._conn.execute(
+                "SELECT seq FROM knowledge_version WHERE artifact_id=? "
+                "ORDER BY seq DESC",
+                (artifact_id,),
+            ).fetchall()[keep:]
+        ]
+        for seq in doomed:
+            self._conn.execute(
+                "DELETE FROM knowledge_version WHERE artifact_id=? AND seq=?",
+                (artifact_id, seq),
+            )
+        return len(doomed)
+
+    def gc_orphan_blobs(self) -> int:
+        """Delete blobs no surviving version manifest references."""
+        referenced: set[str] = set()
+        for (manifest_json,) in self._conn.execute(
+            "SELECT manifest_json FROM knowledge_version"
+        ):
+            for entry in json.loads(manifest_json):
+                referenced.add(entry["blob_hash"])
+        orphans = [
+            row[0]
+            for row in self._conn.execute("SELECT content_hash FROM knowledge_blob")
+            if row[0] not in referenced
+        ]
+        for content_hash in orphans:
+            self._conn.execute(
+                "DELETE FROM knowledge_blob WHERE content_hash=?", (content_hash,)
+            )
+        return len(orphans)
 
     # --- append ---------------------------------------------------------
     def append(

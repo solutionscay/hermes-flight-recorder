@@ -119,6 +119,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             outbox,
             args.hermes_home,
             capture_config=runtime_config.capture,
+            knowledge_config=runtime_config.knowledge,
             on_source_error=lambda label, exc: print(
                 f"  ({label}: {exc})", file=sys.stderr
             ),
