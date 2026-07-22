@@ -253,9 +253,15 @@ def append_and_count(
 
 
 def open_sqlite_read_only(path: Path) -> sqlite3.Connection:
-    """Open a SQLite database read-only and return rows keyed by column."""
+    """Open a SQLite database read-only and return rows keyed by column.
+
+    A ``busy_timeout`` lets a momentary writer lock (Hermes checkpointing its own
+    store) wait briefly instead of instantly raising ``SQLITE_BUSY``, which would
+    otherwise surface as an ``OperationalError`` mid-poll.
+    """
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 

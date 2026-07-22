@@ -3,15 +3,18 @@
 # Deploy Hermes Flight Recorder into its systemd runtime venv.
 #
 # The runtime venv uses an EDITABLE install pointing at this repo, so ordinary
-# .py edits are already live on the next ~15s service tick. Run this script:
+# .py edits are already live on the next service tick. Run this script:
 #   - after changing dependencies (pyproject.toml) or the console entry point,
+#   - after changing a CLI flag or a systemd unit template,
 #   - after pulling / restructuring code,
 #   - or any time you want a guaranteed-clean restart + verification.
 #
-# It is idempotent and safe to run repeatedly. It fails loudly (non-zero) if the
-# deployed code does not import from this repo or is missing the gateway_log
-# collector -- the exact failure mode that silently dropped model.call_failed
-# events (a stale duplicate install shadowing the repo).
+# It is idempotent and safe to run repeatedly. It owns the systemd units: the
+# .service/.timer files are rendered from the committed templates in systemd/*.in
+# on every deploy, so a CLI-flag rename can never leave a stale flag baked into a
+# unit's ExecStart (the failure that crash-looped capture on --bridge-home). It
+# fails loudly (non-zero) if the deployed code does not import from this repo, is
+# missing the gateway_log collector, or if a unit's real ExecStart does not run.
 #
 set -euo pipefail
 
@@ -22,12 +25,26 @@ PIP="$VENV/bin/pip"
 RT="$VENV/bin/hermes-flight-recorder"
 SC_HERMES_FLIGHT_RECORDER_HOME="${SC_HERMES_FLIGHT_RECORDER_HOME:-$HOME/.hermes-flight-recorder}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-SERVICES=(hermes-flight-recorder-capture hermes-flight-recorder-sync)
+UNIT_DIR="$HOME/.config/systemd/user"
+
+# All three unit pairs are managed (rendered) here. capture+sync run continuously;
+# reconcile ships disabled and its enabled/active state is preserved across deploys.
+ALL_UNITS=(capture sync reconcile)
+ACTIVE_TIMERS=(capture sync)
 
 [ -x "$PY" ] || { echo "ERROR: runtime venv not found at $VENV" >&2; exit 1; }
 
 echo "==> Pausing timers"
-for s in "${SERVICES[@]}"; do systemctl --user stop "$s.timer" 2>/dev/null || true; done
+for s in "${ACTIVE_TIMERS[@]}"; do systemctl --user stop "hermes-flight-recorder-$s.timer" 2>/dev/null || true; done
+
+# Guarantee the timers come back on ANY exit path (set -e abort, a failed verify,
+# a broken pip install) so a partial deploy can never leave capture/sync stopped.
+restart_active_timers() {
+  for s in "${ACTIVE_TIMERS[@]}"; do
+    systemctl --user start "hermes-flight-recorder-$s.timer" 2>/dev/null || true
+  done
+}
+trap restart_active_timers EXIT
 
 echo "==> Clearing stale bytecode in the repo"
 find "$REPO/hermes_flight_recorder" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
@@ -41,6 +58,20 @@ done
 
 echo "==> Installing latest (editable) from $REPO"
 "$PIP" install -e "$REPO" --quiet
+
+echo "==> Rendering systemd units from templates"
+# Render every unit from its committed template, substituting the same paths the
+# CLI is invoked with. This is what keeps ExecStart in lockstep with the CLI.
+mkdir -p "$UNIT_DIR"
+for tpl in "$REPO"/systemd/*.in; do
+  dest="$UNIT_DIR/$(basename "${tpl%.in}")"
+  sed -e "s|@RT@|$RT|g" \
+      -e "s|@FR_HOME@|$SC_HERMES_FLIGHT_RECORDER_HOME|g" \
+      -e "s|@HERMES_HOME@|$HERMES_HOME|g" \
+      "$tpl" > "$dest"
+  echo "  rendered $(basename "$dest")"
+done
+systemctl --user daemon-reload
 
 echo "==> Verifying deployed code"
 "$PY" - <<'PYEOF'
@@ -60,13 +91,42 @@ else:
 sys.exit(0 if ok else 1)
 PYEOF
 
-echo "==> Smoke capture (one pass)"
-"$RT" run --flight-recorder-home "$SC_HERMES_FLIGHT_RECORDER_HOME" --hermes-home "$HERMES_HOME"
+echo "==> Verifying each unit's real ExecStart"
+# oneshot `start` blocks and propagates ExecStart's exit code, so a stale/renamed
+# flag (the --bridge-home failure) aborts the deploy here instead of crash-looping
+# in production. capture and reconcile are network-free and must pass. sync can
+# legitimately exit non-zero when the ingest endpoint is unreachable (an
+# operational/config issue, not code drift), so it is verified leniently — a flag
+# rename would still be caught by capture, which shares the same flag surface.
+for s in capture reconcile; do
+  systemctl --user start "hermes-flight-recorder-$s.service"
+  echo "  ok: $s.service ran cleanly"
+done
+if systemctl --user start "hermes-flight-recorder-sync.service"; then
+  echo "  ok: sync.service ran cleanly"
+else
+  echo "  WARN: sync.service exited non-zero — likely an unreachable ingest endpoint;" >&2
+  echo "        check ingest_url in $SC_HERMES_FLIGHT_RECORDER_HOME/sync-config.json" >&2
+fi
 
-echo "==> Restarting timers"
-for s in "${SERVICES[@]}"; do
-  systemctl --user start "$s.timer"
-  systemctl --user is-active "$s.timer" >/dev/null 2>&1 && echo "  $s.timer active"
+echo "==> Starting active timers"
+for s in "${ACTIVE_TIMERS[@]}"; do
+  systemctl --user enable "hermes-flight-recorder-$s.timer" >/dev/null 2>&1 || true
+  systemctl --user start "hermes-flight-recorder-$s.timer"
+done
+
+echo "==> Asserting timers armed (finite next elapse)"
+# OnCalendar (realtime) timers report their next fire in NextElapseUSecRealtime;
+# the monotonic field is always 0 for them. A dead/un-armed timer leaves this
+# empty — the exact regression (NextElapse never resolving) that caused the
+# capture blackout, now caught at deploy time.
+for s in "${ACTIVE_TIMERS[@]}"; do
+  ne=$(systemctl --user show "hermes-flight-recorder-$s.timer" -p NextElapseUSecRealtime --value)
+  if [ -z "$ne" ] || [ "$ne" = "0" ]; then
+    echo "  FAIL: $s.timer has no scheduled next elapse (NextElapseUSecRealtime='$ne')" >&2
+    exit 1
+  fi
+  echo "  ok: $s.timer armed (next: $ne)"
 done
 
 echo "==> Deployed: $("$RT" --version) from $REPO"

@@ -1,0 +1,8 @@
+[Unit]
+Description=Reconcile Hermes durable state with the Flight Recorder outbox
+
+[Service]
+Type=oneshot
+UMask=0077
+TimeoutStartSec=120
+ExecStart=@RT@ reconcile --flight-recorder-home @FR_HOME@ --hermes-home @HERMES_HOME@

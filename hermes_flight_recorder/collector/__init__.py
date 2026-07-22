@@ -20,8 +20,18 @@ Components:
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
+
+# A durable-store poll may hit a transient fault that is not a missing file: the
+# Hermes DB is momentarily locked (``sqlite3.OperationalError`` while Hermes
+# checkpoints), unreadable (``PermissionError``), or malformed mid-write. These
+# must degrade to a skipped source for this tick (the next tick re-scans, and
+# dedup is the backstop), never crash the whole pass and drop every later source.
+# ``FileNotFoundError`` is an ``OSError`` subclass, so missing-store handling is
+# preserved.
+_DURABLE_STORE_ERRORS: tuple[type[Exception], ...] = (OSError, sqlite3.Error)
 
 if TYPE_CHECKING:
     from .recorder_config import CaptureConfig, KnowledgeConfig
@@ -52,24 +62,26 @@ def run_pass(
     from .hook import drain as drain_hook_spool
 
     totals: Counter[str] = Counter()
-    sources: tuple[tuple[str, Callable[[], dict[str, int]], type[Exception]], ...] = (
-        ("hook drain", lambda: drain_hook_spool(outbox), Exception),
+    sources: tuple[
+        tuple[str, Callable[[], dict[str, int]], tuple[type[Exception], ...]], ...
+    ] = (
+        ("hook drain", lambda: drain_hook_spool(outbox), (Exception,)),
         (
             "state.db",
             lambda: state_db.poll(
                 outbox, hermes_home, capture_config=capture_config
             ),
-            FileNotFoundError,
+            _DURABLE_STORE_ERRORS,
         ),
-        ("cron", lambda: cron_db.poll(outbox, hermes_home), FileNotFoundError),
-        ("kanban", lambda: kanban_db.poll(outbox, hermes_home), FileNotFoundError),
-        ("gateway log", lambda: gateway_log.poll(outbox, hermes_home), FileNotFoundError),
+        ("cron", lambda: cron_db.poll(outbox, hermes_home), _DURABLE_STORE_ERRORS),
+        ("kanban", lambda: kanban_db.poll(outbox, hermes_home), _DURABLE_STORE_ERRORS),
+        ("gateway log", lambda: gateway_log.poll(outbox, hermes_home), _DURABLE_STORE_ERRORS),
         (
             "knowledge",
             lambda: knowledge_store.poll(
                 outbox, hermes_home, knowledge_config=knowledge_config
             ),
-            FileNotFoundError,
+            _DURABLE_STORE_ERRORS,
         ),
     )
     for label, poll, tolerated in sources:
