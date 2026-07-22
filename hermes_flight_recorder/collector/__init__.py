@@ -21,13 +21,17 @@ Components:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from .recorder_config import CaptureConfig
 
 
 def run_pass(
     outbox: Any,
     hermes_home: str | Path | None = None,
     *,
+    capture_config: CaptureConfig | None = None,
     on_source_error: Callable[[str, Exception], None] | None = None,
 ) -> dict[str, int]:
     """One capture pass: drain the hook spool, then poll the durable stores.
@@ -49,7 +53,13 @@ def run_pass(
     totals: Counter[str] = Counter()
     sources: tuple[tuple[str, Callable[[], dict[str, int]], type[Exception]], ...] = (
         ("hook drain", lambda: drain_hook_spool(outbox), Exception),
-        ("state.db", lambda: state_db.poll(outbox, hermes_home), FileNotFoundError),
+        (
+            "state.db",
+            lambda: state_db.poll(
+                outbox, hermes_home, capture_config=capture_config
+            ),
+            FileNotFoundError,
+        ),
         ("cron", lambda: cron_db.poll(outbox, hermes_home), FileNotFoundError),
         ("kanban", lambda: kanban_db.poll(outbox, hermes_home), FileNotFoundError),
         ("gateway log", lambda: gateway_log.poll(outbox, hermes_home), FileNotFoundError),

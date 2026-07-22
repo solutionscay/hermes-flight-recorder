@@ -31,7 +31,8 @@ def _sessions_db(hh, rows) -> None:
             estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
             profile_name TEXT, expiry_finalized INT);
         CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT, timestamp REAL);
+            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
+            timestamp REAL, finish_reason TEXT);
         CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
             api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
             reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);

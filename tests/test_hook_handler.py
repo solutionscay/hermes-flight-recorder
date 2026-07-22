@@ -46,7 +46,29 @@ def test_handle_appends_one_json_line_per_event(tmp_path: Path, monkeypatch) -> 
     records = read_spool(bridge)
     assert [r["event_type"] for r in records] == ["session:start", "agent:start"]
     assert records[0]["context"] == {"session_id": "s1", "session_key": "k1"}
+    assert records[1]["context"] == {"session_id": "s1"}
     assert isinstance(records[1]["captured_at"], (int, float))
+
+
+def test_agent_previews_are_removed_before_the_spool(tmp_path: Path, monkeypatch) -> None:
+    bridge = tmp_path / "bridge"
+    handler = load_handler(tmp_path, monkeypatch, bridge)
+    handler.handle(
+        "agent:start", {"session_id": "s1", "message": "truncated prompt"}
+    )
+    handler.handle(
+        "agent:end",
+        {
+            "session_id": "s1",
+            "message": "truncated prompt",
+            "response": "truncated response",
+        },
+    )
+
+    started, completed = read_spool(bridge)
+    assert "message" not in started["context"]
+    assert "message" not in completed["context"]
+    assert "response" not in completed["context"]
 
 
 def test_spool_lines_are_newline_terminated(tmp_path: Path, monkeypatch) -> None:

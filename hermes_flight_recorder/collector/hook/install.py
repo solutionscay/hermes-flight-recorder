@@ -58,6 +58,20 @@ def _log_error(message):
         pass
 
 
+def _metadata_context(event_type, context):
+    # Hermes truncates agent message/response bodies before hooks see them.
+    # Do not persist that misleading preview in the spool; state.db is the
+    # encrypted, durable content source on the Flight Recorder side.
+    if not isinstance(context, dict):
+        return context
+    metadata = dict(context)
+    if event_type in ("agent:start", "agent:end"):
+        metadata.pop("message", None)
+    if event_type == "agent:end":
+        metadata.pop("response", None)
+    return metadata
+
+
 def handle(event_type, context):
     # Never raise into Hermes. The gateway swallows handler errors, but we also
     # want a Flight Recorder-side record when capture fails.
@@ -71,7 +85,11 @@ def handle(event_type, context):
         except OSError:
             pass  # spool does not exist yet
         line = json.dumps(
-            {"event_type": event_type, "context": context, "captured_at": time.time()},
+            {
+                "event_type": event_type,
+                "context": _metadata_context(event_type, context),
+                "captured_at": time.time(),
+            },
             ensure_ascii=False, separators=(",", ":"), default=str,
         )
         os.makedirs(home, exist_ok=True)

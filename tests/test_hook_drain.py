@@ -3,8 +3,8 @@
 The drain reads raw spool lines and produces canonical envelope v1 records.
 These write spool lines directly (independent of the in-gateway handler) and
 assert the per-event mapping: the event_type/capture_method/source, the
-``partial`` flags the acceptance criteria require, content encryption +
-``content_hash`` on agent turns, ``occurred_at`` taken from ``captured_at``,
+``partial`` flags the acceptance criteria require, metadata-only agent turns,
+``occurred_at`` taken from ``captured_at``,
 best-effort ``correlation_id``/``invocation_id`` synthesis, ``session_id``
 recovery on session-end from the in-drain ``session_key`` map, and that an
 unmapped event type is ignored.
@@ -80,7 +80,7 @@ def test_session_start_maps_to_session_created(tmp_path: Path) -> None:
     assert rec["correlation_id"] == "s1"
 
 
-def test_agent_start_end_are_partial_with_encrypted_content(tmp_path: Path) -> None:
+def test_agent_start_end_are_partial_metadata_only(tmp_path: Path) -> None:
     write_spool(
         tmp_path,
         [
@@ -96,9 +96,10 @@ def test_agent_start_end_are_partial_with_encrypted_content(tmp_path: Path) -> N
         assert rec["capture_method"] == method
         assert rec["correlation_id"] == "s1"
         assert rec["invocation_id"].startswith("s1:hook:")
-        # Content is encrypted with an integrity hash; plaintext never leaks
-        # into the payload.
-        assert "content_ciphertext" in rec and rec["content_hash"].startswith("sha256:")
+        # Hermes supplies only a truncated preview here. The complete content
+        # is captured from state.db instead, so hooks carry no content fields.
+        assert "content_ciphertext" not in rec
+        assert "content_hash" not in rec
         assert "message" not in rec["payload"] and "response" not in rec["payload"]
 
 
@@ -149,12 +150,12 @@ def test_agent_start_without_end_gets_a_fresh_id_next_time(tmp_path: Path) -> No
     assert starts[1]["invocation_id"] != first_start["invocation_id"]
 
 
-def test_agent_content_is_actually_the_text(tmp_path: Path) -> None:
+def test_legacy_spool_agent_content_is_not_persisted_to_outbox(tmp_path: Path) -> None:
     write_spool(tmp_path, [("agent:start", {"session_id": "s1", "message": "hello"}, 6.0)])
     ob = new_outbox(tmp_path)
     drain(ob)
     rec = next(ob.iter_events())
-    assert ob.decrypt_content(rec) == b"hello"
+    assert "content_ciphertext" not in rec
     ob.close()
 
 

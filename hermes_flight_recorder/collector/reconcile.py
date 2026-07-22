@@ -65,6 +65,7 @@ from ._common import (
     to_epoch,
 )
 from .cron_schedule import expected_instants
+from .recorder_config import CaptureConfig
 
 _SOURCE = "reconciler"
 _CAPTURE = "derive:reconciler"
@@ -105,9 +106,11 @@ def reconcile(
     *,
     now: float | None = None,
     config: ReconcileConfig | None = None,
+    capture_config: CaptureConfig | None = None,
 ) -> dict[str, int]:
     """One reconcile pass. Returns per-event-type counts of new findings."""
     cfg = config or ReconcileConfig()
+    capture = capture_config or CaptureConfig()
     when = float(now) if now is not None else time.time()
     home = resolve_hermes_home(hermes_home)
     installation_id = outbox.installation_id
@@ -124,7 +127,7 @@ def reconcile(
 
     _detect_sequence_gaps(outbox, events, installation_id, counts, when)
     session_rows, parent_map = _detect_coverage_gaps(
-        outbox, events, home, exec_rows, counts, when
+        outbox, events, home, exec_rows, counts, when, capture
     )
     _detect_missing_terminals(
         outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map
@@ -158,7 +161,9 @@ def _detect_sequence_gaps(outbox, events, installation_id, counts, when) -> None
 
 
 # --- coverage gaps ------------------------------------------------------
-def _detect_coverage_gaps(outbox, events, home, exec_rows, counts, when):
+def _detect_coverage_gaps(
+    outbox, events, home, exec_rows, counts, when, capture_config
+):
     """A durable row with no captured event proves a dropped capture."""
     captured = _captured_subjects(events)
     session_rows = []
@@ -176,7 +181,15 @@ def _detect_coverage_gaps(outbox, events, home, exec_rows, counts, when):
             _coverage_sessions(
                 outbox, session_rows, parent_map, captured, counts, when
             )
-            _coverage_tool_messages(outbox, conn, parent_map, captured, counts, when)
+            _coverage_messages(
+                outbox,
+                conn,
+                parent_map,
+                captured,
+                counts,
+                when,
+                capture_config,
+            )
             _coverage_model_usage(outbox, conn, parent_map, captured, counts, when)
         finally:
             conn.close()
@@ -207,12 +220,37 @@ def _coverage_sessions(outbox, rows, parent_map, captured, counts, when) -> None
         )
 
 
-def _coverage_tool_messages(outbox, conn, parent_map, captured, counts, when) -> None:
+def _coverage_messages(
+    outbox, conn, parent_map, captured, counts, when, capture_config
+) -> None:
+    roles = tuple(
+        role
+        for role in ("user", "assistant", "tool")
+        if role in capture_config.message_roles
+    )
+    if not roles:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    # Some narrow synthetic/legacy schemas do not expose content. In that
+    # case only tool rows can be proven capture-worthy; user/assistant rows
+    # need content to distinguish real text from empty tool-call scaffolding.
+    if "content" not in columns:
+        roles = tuple(role for role in roles if role == "tool")
+        if not roles:
+            return
+    placeholders = ",".join("?" for _ in roles)
+    content_predicate = (
+        " AND (role='tool' OR (content IS NOT NULL AND length(content) > 0))"
+        if "content" in columns
+        else ""
+    )
     rows = conn.execute(
-        "SELECT id, session_id FROM messages WHERE role='tool'"
+        "SELECT id, session_id FROM messages "
+        f"WHERE role IN ({placeholders}){content_predicate}",
+        roles,
     ).fetchall()
     for r in rows:
-        if r["id"] in captured["tool_messages"]:
+        if r["id"] in captured["messages"]:
             continue
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
@@ -290,7 +328,7 @@ def _coverage_kanban(outbox, home, captured, counts, when) -> None:
 def _captured_subjects(events) -> dict[str, set]:
     """Index the captured stream by the durable subject each event covers."""
     sessions: set[str] = set()
-    tool_messages: set[int] = set()
+    messages: set[int] = set()
     model_usage: set[tuple] = set()
     executions: set[str] = set()
     tasks: set[tuple] = set()
@@ -301,11 +339,10 @@ def _captured_subjects(events) -> dict[str, set]:
         if et in SESSION_START_TYPES:
             if e.get("session_id") is not None:
                 sessions.add(e["session_id"])
-        elif et == "tool.call_completed":
-            mid = pl.get("message_row_id")
-            if mid is not None:
-                tool_messages.add(mid)
-        elif et == "model.usage_recorded":
+        mid = pl.get("message_row_id")
+        if mid is not None:
+            messages.add(mid)
+        if et == "model.usage_recorded":
             model_usage.add((e.get("session_id"), pl.get("model"), pl.get("task")))
         elif et == "cron.run_claimed":
             exid = pl.get("execution_id")
@@ -323,7 +360,7 @@ def _captured_subjects(events) -> dict[str, set]:
                 task_runs.add((board, run_id))
     return {
         "sessions": sessions,
-        "tool_messages": tool_messages,
+        "messages": messages,
         "model_usage": model_usage,
         "executions": executions,
         "tasks": tasks,

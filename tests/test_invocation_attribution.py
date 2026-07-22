@@ -7,8 +7,10 @@ import sqlite3
 from pathlib import Path
 
 from hermes_flight_recorder.collector import state_db
+from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.hook import SPOOL_FILENAME, drain
 from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.recorder_config import CaptureConfig
 
 
 def new_outbox(tmp_path: Path) -> Outbox:
@@ -27,7 +29,7 @@ def make_state_db(home: Path, sessions: list[tuple] | None = None) -> sqlite3.Co
             profile_name TEXT, expiry_finalized INT);
         CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
             tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
-            timestamp REAL);
+            timestamp REAL, finish_reason TEXT);
         CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
             api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
             reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
@@ -67,7 +69,7 @@ def test_back_to_back_turns_keep_activity_separate_and_outside_activity_unattrib
     hermes.mkdir()
     db = make_state_db(hermes)
     db.executemany(
-        "INSERT INTO messages VALUES (?, 'root', 'tool', 'terminal', NULL, NULL, '{}', ?)",
+        "INSERT INTO messages VALUES (?, 'root', 'tool', 'terminal', NULL, NULL, '{}', ?, NULL)",
         [(1, 105.0), (2, 115.0), (3, 125.0)],
     )
     db.commit()
@@ -94,12 +96,210 @@ def test_back_to_back_turns_keep_activity_separate_and_outside_activity_unattrib
     assert "invocation_attribution" not in tools[1]["payload"]
 
 
+def test_full_user_and_assistant_content_reuses_hook_invocation(tmp_path):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    db = make_state_db(hermes)
+    prompt = "full prompt " * 900
+    response = "full response " * 700
+    db.executemany(
+        "INSERT INTO messages VALUES (?, 'root', ?, NULL, NULL, NULL, ?, ?, ?)",
+        [
+            (1, "user", prompt, 98.0, None),
+            (2, "assistant", "", 103.0, "tool_calls"),  # content-free scaffold
+            (3, "assistant", response, 109.0, "stop"),
+        ],
+    )
+    db.commit()
+    db.close()
+
+    outbox = new_outbox(tmp_path)
+    append_spool(tmp_path / "bridge", [
+        ("agent:start", "root", 100.0),
+        ("agent:end", "root", 110.0),
+    ])
+    drain(outbox)
+    hook_events = [
+        event for event in outbox.iter_events()
+        if event["capture_method"].startswith("hook:agent:")
+    ]
+    assert all("content_ciphertext" not in event for event in hook_events)
+    invocation_id = events_of(outbox, "invocation.started")[0]["invocation_id"]
+
+    state_db.poll(outbox, hermes)
+    durable = [
+        event for event in outbox.iter_events()
+        if event["source"] == "state.db:messages"
+    ]
+    assert [event["payload"]["message_role"] for event in durable] == [
+        "user", "assistant"
+    ]
+    assert all(event["invocation_id"] == invocation_id for event in durable)
+    assert all(event["partial"] is False for event in durable)
+    assert outbox.decrypt_content(durable[0]).decode() == prompt
+    assert outbox.decrypt_content(durable[1]).decode() == response
+
+
+def test_intermediate_assistant_content_is_preserved_without_completing_invocation(
+    tmp_path,
+):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    db = make_state_db(hermes)
+    db.executemany(
+        "INSERT INTO messages VALUES (?, 'root', 'assistant', NULL, NULL, NULL, ?, ?, ?)",
+        [
+            (1, "I will inspect that first.", 103.0, "tool_calls"),
+            (2, "The work is complete.", 109.0, "stop"),
+        ],
+    )
+    db.commit()
+    db.close()
+
+    outbox = new_outbox(tmp_path)
+    append_spool(
+        tmp_path / "bridge",
+        [("agent:start", "root", 100.0), ("agent:end", "root", 110.0)],
+    )
+    drain(outbox)
+    state_db.poll(outbox, hermes)
+
+    intermediate = events_of(outbox, "model.call_succeeded")
+    durable_completed = [
+        event
+        for event in events_of(outbox, "invocation.completed")
+        if event["source"] == "state.db:messages"
+    ]
+    assert len(intermediate) == 1
+    assert intermediate[0]["payload"]["message_phase"] == "intermediate"
+    assert intermediate[0]["payload"]["finish_reason"] == "tool_calls"
+    assert outbox.decrypt_content(intermediate[0]) == b"I will inspect that first."
+    assert len(durable_completed) == 1
+    assert durable_completed[0]["payload"]["message_phase"] == "final"
+    assert outbox.decrypt_content(durable_completed[0]) == b"The work is complete."
+
+
+def test_content_limit_is_utf8_safe_explicit_and_applies_to_tools(tmp_path):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    db = make_state_db(hermes)
+    db.executemany(
+        "INSERT INTO messages VALUES (?, 'root', ?, ?, NULL, NULL, ?, ?, NULL)",
+        [
+            (1, "user", None, "ééé", 98.0),
+            (2, "tool", "terminal", '{"exit_code":0,"padding":"123"}', 105.0),
+        ],
+    )
+    db.commit()
+    db.close()
+
+    outbox = new_outbox(tmp_path)
+    append_spool(tmp_path / "bridge", [("agent:start", "root", 100.0)])
+    drain(outbox)
+    state_db.poll(
+        outbox,
+        hermes,
+        capture_config=CaptureConfig(max_content_bytes=5),
+    )
+
+    durable = {
+        event["payload"]["message_row_id"]: event
+        for event in outbox.iter_events()
+        if event["source"] == "state.db:messages"
+    }
+    user = durable[1]
+    assert outbox.decrypt_content(user) == "éé".encode()
+    assert user["payload"]["content_original_bytes"] == 6
+    assert user["payload"]["content_captured_bytes"] == 4
+    assert user["payload"]["content_truncated"] is True
+    assert user["partial"] is True
+
+    tool = durable[2]
+    assert outbox.decrypt_content(tool) == b'{"exi'
+    assert tool["payload"]["status"] == "ok"  # derived before truncation
+    assert tool["payload"]["content_truncated"] is True
+    assert tool["partial"] is True
+
+
+def test_message_role_configuration_filters_state_capture(tmp_path):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    db = make_state_db(hermes)
+    db.executemany(
+        "INSERT INTO messages VALUES (?, 'root', ?, ?, NULL, NULL, ?, ?, NULL)",
+        [
+            (1, "user", None, "prompt", 98.0),
+            (2, "assistant", None, "response", 109.0),
+            (3, "tool", "terminal", "{}", 105.0),
+        ],
+    )
+    db.commit()
+    db.close()
+
+    outbox = new_outbox(tmp_path)
+    counts = state_db.poll(
+        outbox,
+        hermes,
+        capture_config=CaptureConfig(message_roles=("user",)),
+    )
+
+    assert counts.get("invocation.started") == 1
+    assert "invocation.completed" not in counts
+    assert "tool.call_completed" not in counts
+
+
+def test_versioned_message_cursor_backfills_rows_skipped_by_tool_only_releases(tmp_path):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    db = make_state_db(hermes)
+    db.executemany(
+        "INSERT INTO messages VALUES (?, 'root', ?, ?, NULL, NULL, ?, ?, ?)",
+        [
+            (1, "user", None, "historical prompt", 98.0, None),
+            (2, "tool", "terminal", "{}", 105.0, None),
+            (3, "assistant", None, "historical response", 109.0, "stop"),
+        ],
+    )
+    db.commit()
+    db.close()
+
+    outbox = new_outbox(tmp_path)
+    # Older recorder versions advanced this cursor to the table high-water
+    # while capturing only tools.
+    outbox.append(
+        build_record(
+            event_type="tool.call_completed",
+            occurred_at=105.0,
+            source="state.db:messages",
+            capture_method="poll:state.db:messages",
+            runtime={"kind": "tool", "engine": "standard"},
+            correlation_id="root",
+            session_id="root",
+            payload={"message_row_id": 2},
+        ),
+        content="{}",
+        dedup_key="state.db:tool:2",
+    )
+    outbox.set_cursor("state.db:messages", 3)
+
+    counts = state_db.poll(outbox, hermes)
+
+    assert counts["invocation.started"] == 1
+    assert counts["invocation.completed"] == 1
+    assert "tool.call_completed" not in counts
+    assert outbox.get_cursor("state.db:messages") == "3"
+    assert outbox.get_cursor("state.db:messages:v2") == "3"
+    count_after_backfill = outbox.count()
+    assert state_db.poll(outbox, hermes).get("invocation.started", 0) == 0
+    assert outbox.count() == count_after_backfill
+
+
 def test_polling_before_and_after_terminal_hook_keeps_one_attribution(tmp_path):
     hermes = tmp_path / "hermes"
     hermes.mkdir()
     db = make_state_db(hermes)
     db.execute(
-        "INSERT INTO messages VALUES (1, 'root', 'tool', 'terminal', NULL, NULL, '{}', 205.0)"
+        "INSERT INTO messages VALUES (1, 'root', 'tool', 'terminal', NULL, NULL, '{}', 205.0, NULL)"
     )
     db.commit()
 
@@ -113,7 +313,7 @@ def test_polling_before_and_after_terminal_hook_keeps_one_attribution(tmp_path):
     append_spool(tmp_path / "bridge", [("agent:end", "root", 210.0)])
     drain(outbox)
     db.execute(
-        "INSERT INTO messages VALUES (2, 'root', 'tool', 'terminal', NULL, NULL, '{}', 206.0)"
+        "INSERT INTO messages VALUES (2, 'root', 'tool', 'terminal', NULL, NULL, '{}', 206.0, NULL)"
     )
     db.commit()
     db.close()
@@ -133,7 +333,7 @@ def test_child_activity_is_not_attached_to_overlapping_root_turn(tmp_path):
     ]
     db = make_state_db(hermes, sessions)
     db.executemany(
-        "INSERT INTO messages VALUES (?, ?, 'tool', 'terminal', NULL, NULL, '{}', ?)",
+        "INSERT INTO messages VALUES (?, ?, 'tool', 'terminal', NULL, NULL, '{}', ?, NULL)",
         [(1, "root", 310.0), (2, "child", 311.0)],
     )
     db.execute(
@@ -165,7 +365,7 @@ def test_later_start_caps_incomplete_turn_without_guessing_before_it(tmp_path):
     hermes.mkdir()
     db = make_state_db(hermes)
     db.executemany(
-        "INSERT INTO messages VALUES (?, 'root', 'tool', 'terminal', NULL, NULL, '{}', ?)",
+        "INSERT INTO messages VALUES (?, 'root', 'tool', 'terminal', NULL, NULL, '{}', ?, NULL)",
         [(1, 395.0), (2, 405.0), (3, 425.0)],
     )
     db.commit()
@@ -186,6 +386,38 @@ def test_later_start_caps_incomplete_turn_without_guessing_before_it(tmp_path):
         starts[0]["invocation_id"],
         starts[1]["invocation_id"],
     ]
+
+
+def test_user_before_later_start_does_not_attach_to_incomplete_prior_turn(tmp_path):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    db = make_state_db(hermes)
+    db.execute(
+        "INSERT INTO messages VALUES "
+        "(1, 'root', 'user', NULL, NULL, NULL, 'next prompt', 418.0, NULL)"
+    )
+    db.commit()
+    db.close()
+
+    outbox = new_outbox(tmp_path)
+    append_spool(
+        tmp_path / "bridge",
+        [
+            ("agent:start", "root", 400.0),
+            ("agent:start", "root", 420.0),
+        ],
+    )
+    drain(outbox)
+    starts = events_of(outbox, "invocation.started")
+
+    state_db.poll(outbox, hermes)
+
+    durable_start = next(
+        event
+        for event in events_of(outbox, "invocation.started")
+        if event["source"] == "state.db:messages"
+    )
+    assert durable_start["invocation_id"] == starts[1]["invocation_id"]
 
 
 def test_model_usage_emits_idempotent_deltas_and_tracks_updates(tmp_path):
