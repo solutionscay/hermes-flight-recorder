@@ -87,6 +87,63 @@ def poll(
     return {KNOWLEDGE_EVENT: emitted} if emitted else {}
 
 
+def iter_disk_artifacts(
+    home: Path,
+) -> Iterator[tuple[str, str, str, str | None, list[tuple[str, Path]]]]:
+    """Public read-only view of the tracked artifacts on disk.
+
+    The reconciler (#79) walks the same surface as the scanner to diff disk
+    against the store, so both apply the identical Hermes-created filter and can
+    never disagree on what is tracked.
+    """
+    return _iter_artifacts(home)
+
+
+def read_manifest(
+    outbox: Any, files: list[tuple[str, Path]]
+) -> tuple[list[dict[str, str]], float]:
+    """The manifest and newest mtime for a file set, computed read-only.
+
+    Hashes each file's plaintext exactly as ``put_blob`` would, but stores
+    nothing — so the reconciler can compute an artifact's on-disk manifest hash
+    and compare it to the store's latest version without writing a blob. The
+    result is byte-identical to what ``_capture`` would produce for the same
+    files, so a drift verdict is exact, not approximate.
+    """
+    manifest: list[dict[str, str]] = []
+    occurred_at = 0.0
+    for rel_path, path in files:
+        manifest.append({"path": rel_path, "blob_hash": outbox._content_hash(path.read_bytes())})
+        occurred_at = max(occurred_at, path.stat().st_mtime)
+    manifest.sort(key=lambda entry: entry["path"])
+    return manifest, occurred_at
+
+
+def heal_artifact(
+    outbox: Any,
+    config: Any,
+    home_mode: str,
+    artifact_id: str,
+    kind: str,
+    name: str,
+    category: str | None,
+    files: list[tuple[str, Path]],
+) -> bool:
+    """Capture a version the scanner missed, and emit its event.
+
+    The reconciler's drift repair (#79): when disk has drifted from the store,
+    record the missed version through the same ``_capture`` path the scanner
+    uses, then emit its ``knowledge.record_written`` so the healed version does
+    not immediately read as an un-emitted store→event gap. Returns whether a new
+    version landed.
+    """
+    created = _capture(outbox, config, artifact_id, kind, name, category, files)
+    if created:
+        runtime = runtime_stamp("knowledge", home_mode=home_mode)
+        _emit_artifact_events(outbox, runtime, artifact_id)
+    return created
+
+
 def _iter_artifacts(
     home: Path,
 ) -> Iterator[tuple[str, str, str, str | None, list[tuple[str, Path]]]]:
@@ -203,17 +260,29 @@ def _emit_pending_events(outbox: Any, home_mode: str) -> int:
     runtime = runtime_stamp("knowledge", home_mode=home_mode)
     emitted = 0
     for artifact_id in outbox.knowledge_artifact_ids():
-        artifact = outbox.knowledge_artifact(artifact_id)
-        if artifact is None:
+        emitted += _emit_artifact_events(outbox, runtime, artifact_id)
+    return emitted
+
+
+def _emit_artifact_events(outbox: Any, runtime: dict[str, Any], artifact_id: str) -> int:
+    """Emit every not-yet-shipped version of one artifact; return the count.
+
+    Drives the per-artifact ``knowledge:emitted:<id>`` cursor so the emit is
+    idempotent across restarts and shared by both the scanner's bulk pass and
+    the reconciler's targeted heal.
+    """
+    artifact = outbox.knowledge_artifact(artifact_id)
+    if artifact is None:
+        return 0
+    cursor_key = f"knowledge:emitted:{artifact_id}"
+    last_emitted = int(outbox.get_meta(cursor_key) or 0)
+    emitted = 0
+    for version in outbox.knowledge_versions(artifact_id):
+        if version["seq"] <= last_emitted:
             continue
-        cursor_key = f"knowledge:emitted:{artifact_id}"
-        last_emitted = int(outbox.get_meta(cursor_key) or 0)
-        for version in outbox.knowledge_versions(artifact_id):
-            if version["seq"] <= last_emitted:
-                continue
-            if _emit_version_event(outbox, runtime, artifact, version):
-                emitted += 1
-            outbox.set_meta(cursor_key, str(version["seq"]))
+        if _emit_version_event(outbox, runtime, artifact, version):
+            emitted += 1
+        outbox.set_meta(cursor_key, str(version["seq"]))
     return emitted
 
 
