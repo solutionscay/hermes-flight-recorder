@@ -245,6 +245,28 @@ def test_exit_code_is_one_for_every_finding_type(tmp_path, event_type):
     assert code == 1
 
 
+def test_capture_stale_renders_a_readable_detail_line(tmp_path):
+    """The capture-stale finding renders its own detail line, not the payload
+    fallback — the operator reads why capture is being flagged, not a dict."""
+    ob = new_outbox(tmp_path)
+    add(
+        ob,
+        "reconcile.capture_stale",
+        correlation_id="inst",
+        payload={"last_success_at": B, "staleness_seconds": 600.0, "threshold_seconds": 300.0},
+        partial=True,
+    )
+
+    lines, code = observe.render_report(observe.load(ob))
+    body = "\n".join(lines)
+
+    assert code == 1
+    assert "reconcile.capture_stale" in body
+    assert "capture loop stalled" in body
+    assert "~600s stale" in body
+    assert "'last_success_at'" not in body  # the dict fallback (str(payload)) never rendered
+
+
 # --- CLI + real reconciler integration ---------------------------------------
 def test_report_reflects_a_real_reconciler_terminal_missing_finding(tmp_path):
     hh = tmp_path / "hermes"
