@@ -120,7 +120,7 @@ def test_reconcile_not_initialized_exits_2_with_stderr_hint(tmp_path, capsys):
 
     assert code == 2
     assert captured.out == ""
-    assert "init" in captured.err
+    assert "install" in captured.err
     assert "not initialized" in captured.err.lower()
 
 

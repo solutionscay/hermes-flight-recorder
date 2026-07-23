@@ -5,9 +5,9 @@ token (a client id and a client secret). Ingestion protocol v1 authenticates
 at the edge with these two headers, not with a field in the request body.
 
 The credential lives in the **Flight Recorder** home, next to the outbox and the
-content key, and never under the Hermes home. A process may also supply any
-field from the environment, which takes priority over the file so an operator
-can inject a secret without writing it to disk:
+content key — by default ``$HERMES_HOME/flight-recorder`` — with mode ``0600``.
+A process may also supply any field from the environment, which takes priority
+over the file so an operator can inject a secret without writing it to disk:
 
 - ``HFR_INGEST_URL``
 - ``HFR_CF_ACCESS_CLIENT_ID``
@@ -156,6 +156,52 @@ def save(
     return path
 
 
+def configure(
+    flight_recorder_home: str | os.PathLike[str] | None = None,
+    *,
+    ingest_url: str | None = None,
+    cf_access_client_id: str | None = None,
+    cf_access_client_secret: str | None = None,
+) -> SyncConfig:
+    """Merge the given fields over any existing file and write it privately.
+
+    Idempotent and partial: a field left as ``None`` keeps its current file
+    value, so the endpoint can change without re-entering the credential. When
+    neither a value nor a file supplies the ingest URL, it defaults to the
+    hosted endpoint. Raises :class:`SyncConfigError` if a required field is
+    still missing after the merge; that config is never written. The
+    environment is deliberately ignored here — this edits the file on disk.
+    """
+    existing = _read_file(config_path(flight_recorder_home))
+    merged_url = _normalize_ingest_url(
+        ingest_url or existing.get("ingest_url") or HOSTED_INGEST_URL
+    )
+    merged_id = cf_access_client_id or existing.get("cf_access_client_id")
+    merged_secret = cf_access_client_secret or existing.get("cf_access_client_secret")
+
+    missing = [
+        name
+        for name, value in (
+            ("ingest_url", merged_url),
+            ("cf_access_client_id", merged_id),
+            ("cf_access_client_secret", merged_secret),
+        )
+        if not value
+    ]
+    if missing:
+        raise SyncConfigError(
+            "sync config is incomplete; missing " + ", ".join(missing)
+        )
+
+    config = SyncConfig(
+        ingest_url=merged_url,
+        cf_access_client_id=merged_id,
+        cf_access_client_secret=merged_secret,
+    )
+    save(config, flight_recorder_home)
+    return config
+
+
 __all__ = [
     "CF_ACCESS_CLIENT_ID_HEADER",
     "CF_ACCESS_CLIENT_SECRET_HEADER",
@@ -164,6 +210,7 @@ __all__ = [
     "SyncConfig",
     "SyncConfigError",
     "config_path",
+    "configure",
     "load",
     "save",
 ]

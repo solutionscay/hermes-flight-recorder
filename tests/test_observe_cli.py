@@ -45,7 +45,7 @@ def test_observe_not_initialized_exits_2_with_stderr_hint(tmp_path, capsys):
     code = main(["observe", "--flight-recorder-home", bridge])
     captured = capsys.readouterr()
     assert code == 2
-    assert "hermes-flight-recorder init" in captured.err
+    assert "hermes-flight-recorder install" in captured.err
     assert captured.out == ""
 
 

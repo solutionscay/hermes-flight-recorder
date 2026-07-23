@@ -32,6 +32,8 @@ keys/
 *.sqlite
 *.sqlite3
 outbox.sqlite*
+runtime.lock
+flight-recorder/
 .hermes-dev/
 .hermes/
 

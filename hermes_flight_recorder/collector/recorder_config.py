@@ -23,6 +23,10 @@ from .sync import DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS
 CONFIG_FILENAME = "recorder-config.json"
 DEFAULT_MAX_CONTENT_BYTES = 65_536
 DEFAULT_MESSAGE_ROLES = ("user", "assistant", "tool")
+# Foreground `serve` cadences. Capture polls the fast path often; reconcile
+# diffs the durable stores less often. These match the retired systemd timers.
+DEFAULT_CAPTURE_INTERVAL_SECONDS = 15.0
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 60.0
 
 
 class RecorderConfigError(RuntimeError):
@@ -34,6 +38,15 @@ class CaptureConfig:
     max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES
     message_roles: tuple[str, ...] = DEFAULT_MESSAGE_ROLES
     sources: dict[str, bool] = field(default_factory=dict)
+    # How often `serve` runs a capture pass. One-shot `run` ignores this.
+    interval_seconds: float = DEFAULT_CAPTURE_INTERVAL_SECONDS
+
+
+@dataclass(frozen=True)
+class ReconcileRuntimeConfig:
+    # How often `serve` runs a reconcile pass — independent of capture so it
+    # can flag capture staleness even when the capture pass is broken.
+    interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS
 
 
 @dataclass(frozen=True)
@@ -70,6 +83,7 @@ class RecorderConfig:
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     sync: SyncRuntimeConfig = field(default_factory=SyncRuntimeConfig)
+    reconcile: ReconcileRuntimeConfig = field(default_factory=ReconcileRuntimeConfig)
 
 
 def config_path(flight_recorder_home: str | os.PathLike[str] | None = None) -> Path:
@@ -85,6 +99,7 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
     retention = _section(data, "retention")
     knowledge = _section(data, "knowledge")
     sync = _section(data, "sync")
+    reconcile = _section(data, "reconcile")
 
     return RecorderConfig(
         capture=CaptureConfig(
@@ -106,6 +121,15 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 )
             ),
             sources=_sources(_value("HFR_CAPTURE_SOURCES", capture, "sources", {})),
+            interval_seconds=_positive_float(
+                _value(
+                    "HFR_CAPTURE_INTERVAL_SECONDS",
+                    capture,
+                    "interval_seconds",
+                    DEFAULT_CAPTURE_INTERVAL_SECONDS,
+                ),
+                "capture.interval_seconds",
+            ),
         ),
         retention=RetentionConfig(
             enabled=_boolean(
@@ -155,6 +179,17 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 "sync.max_bytes",
             ),
         ),
+        reconcile=ReconcileRuntimeConfig(
+            interval_seconds=_positive_float(
+                _value(
+                    "HFR_RECONCILE_INTERVAL_SECONDS",
+                    reconcile,
+                    "interval_seconds",
+                    DEFAULT_RECONCILE_INTERVAL_SECONDS,
+                ),
+                "reconcile.interval_seconds",
+            ),
+        ),
     )
 
 
@@ -169,6 +204,7 @@ def save(
             "max_content_bytes": config.capture.max_content_bytes,
             "message_roles": list(config.capture.message_roles),
             "sources": config.capture.sources,
+            "interval_seconds": config.capture.interval_seconds,
         },
         "retention": {
             "enabled": config.retention.enabled,
@@ -185,6 +221,9 @@ def save(
             "interval_seconds": config.sync.interval_seconds,
             "max_records": config.sync.max_records,
             "max_bytes": config.sync.max_bytes,
+        },
+        "reconcile": {
+            "interval_seconds": config.reconcile.interval_seconds,
         },
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
@@ -253,6 +292,18 @@ def _optional_positive_float(value: Any, name: str) -> float | None:
     return result
 
 
+def _positive_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise RecorderConfigError(f"{name} must be a positive number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RecorderConfigError(f"{name} must be a positive number") from exc
+    if result <= 0:
+        raise RecorderConfigError(f"{name} must be a positive number")
+    return result
+
+
 def _boolean(value: Any, name: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -299,8 +350,11 @@ def _sources(value: Any) -> dict[str, bool]:
 __all__ = [
     "CONFIG_FILENAME",
     "CaptureConfig",
+    "DEFAULT_CAPTURE_INTERVAL_SECONDS",
     "DEFAULT_MAX_CONTENT_BYTES",
+    "DEFAULT_RECONCILE_INTERVAL_SECONDS",
     "KnowledgeConfig",
+    "ReconcileRuntimeConfig",
     "RecorderConfig",
     "RecorderConfigError",
     "RetentionConfig",
