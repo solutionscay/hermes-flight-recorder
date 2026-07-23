@@ -67,11 +67,20 @@ Before you start, make sure of these three things:
 
 ### Step 1 — Install the package
 
-Install the program with `pipx` (or `pip`):
+Install the program from the public repository with `pipx`:
 
 ```bash
-pipx install hermes-flight-recorder
+pipx install "git+https://github.com/solutionscay/hermes-flight-recorder"
 ```
+
+You can also use `pip` in a virtual environment:
+
+```bash
+pip install "git+https://github.com/solutionscay/hermes-flight-recorder"
+```
+
+> The package is not on PyPI yet. Install from the repository. After the first
+> release, `pipx install hermes-flight-recorder` will also work.
 
 ### Step 2 — Install into the Hermes home
 
