@@ -29,6 +29,11 @@ LEGACY_FLIGHT_RECORDER_HOME = ".hermes-flight-recorder"
 # finished (or crashed) before the recorder existed.
 INSTALLED_AT_META_KEY = "installed_at"
 
+# The outbox meta key set to ``"false"`` by ``install --no-backfill``. When off,
+# capture skips durable rows that occurred before ``installed_at``, so a fresh
+# install records from now instead of ingesting the whole Hermes history.
+CAPTURE_BACKFILL_META_KEY = "capture:backfill"
+
 
 def resolve_hermes_home(hermes_home: str | Path | None) -> Path:
     """The Hermes data root: explicit arg, then $HERMES_HOME, then ~/.hermes."""
@@ -246,6 +251,20 @@ def hermes_created_skills(home: Path) -> list[tuple[str, str | None, Path]]:
             if grandchild.is_dir() and not grandchild.name.startswith("."):
                 consider(grandchild.name, child.name, grandchild)
     return out
+
+
+def occurred_before(since: float | None, value: Any) -> bool:
+    """True when a Hermes timestamp precedes the capture horizon ``since``.
+
+    ``since`` None (backfill enabled — the default) is never "before", so this
+    is a no-op unless ``install --no-backfill`` set a horizon. A missing or
+    unparseable timestamp is treated as not-before and kept, so a schema without
+    the time column degrades to backfilling rather than silently dropping rows.
+    """
+    if since is None:
+        return False
+    epoch = to_epoch(value)
+    return epoch is not None and epoch < since
 
 
 def to_epoch(value: Any) -> float | None:

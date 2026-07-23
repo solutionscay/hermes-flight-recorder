@@ -38,8 +38,14 @@ _FAILURE = re.compile(
 _HTTP_STATUS = re.compile(r"\bHTTP\s+(\d{3})\b", re.IGNORECASE)
 
 
-def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
-    """Capture newly appended terminal provider failures from ``agent.log``."""
+def poll(
+    outbox: Any, hermes_home: str | Path | None = None, *, since: float | None = None
+) -> dict[str, int]:
+    """Capture newly appended terminal provider failures from ``agent.log``.
+
+    ``since`` is the capture horizon (``install --no-backfill``); failures logged
+    before it are skipped so history is not backfilled.
+    """
     home = resolve_hermes_home(hermes_home)
     path = home / "logs" / "agent.log"
     if not path.exists():
@@ -63,6 +69,7 @@ def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
                 line.decode("utf-8", errors="replace").rstrip("\r\n"),
                 counts,
                 home,
+                since,
             )
 
     if offset != cursor:
@@ -86,7 +93,9 @@ def _read_cursor(outbox: Any, path: Path) -> int:
     return offset
 
 
-def _capture_line(outbox: Any, line: str, counts: dict[str, int], home: Path) -> None:
+def _capture_line(
+    outbox: Any, line: str, counts: dict[str, int], home: Path, since: float | None = None
+) -> None:
     match = _FAILURE.match(line)
     if match is None:
         return
@@ -94,6 +103,8 @@ def _capture_line(outbox: Any, line: str, counts: dict[str, int], home: Path) ->
     summary = fields["summary"]
     http_status = _status(summary)
     occurred_at = _to_epoch(fields["timestamp"])
+    if since is not None and occurred_at < since:
+        return  # logged before the capture horizon (no backfill)
     payload: dict[str, Any] = {
         "provider": fields["provider"],
         "model": fields["model"],

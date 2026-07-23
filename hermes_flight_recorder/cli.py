@@ -102,7 +102,11 @@ def _cmd_install(args: argparse.Namespace) -> int:
     from .collector.lifecycle import InstallError, install
 
     try:
-        install(args.flight_recorder_home, args.hermes_home)
+        install(
+            args.flight_recorder_home,
+            args.hermes_home,
+            backfill=not args.no_backfill,
+        )
     except InstallError as exc:
         print(f"install failed: {exc}", file=sys.stderr)
         return 2
@@ -595,6 +599,11 @@ def build_parser() -> argparse.ArgumentParser:
         "install",
         help="Install (idempotently) into a Hermes home: outbox, identity, key, config, and hook.",
         parents=[_home_options()],
+    )
+    p_install.add_argument(
+        "--no-backfill",
+        action="store_true",
+        help="Capture only activity from now on; do not ingest existing Hermes history.",
     )
     p_install.set_defaults(func=_cmd_install)
 

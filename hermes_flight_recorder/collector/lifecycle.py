@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import recorder_config
 from ._common import (
+    CAPTURE_BACKFILL_META_KEY,
     INSTALLED_AT_META_KEY,
     LEGACY_FLIGHT_RECORDER_HOME,
     resolve_flight_recorder_home,
@@ -56,13 +57,15 @@ def install(
     flight_recorder_home: str | os.PathLike[str] | None,
     hermes_home: str | os.PathLike[str] | None,
     *,
+    backfill: bool = True,
     log=print,
 ) -> Path:
     """Install (or update) the Flight Recorder into ``hermes_home``.
 
     Returns the resolved Flight Recorder home. Raises :class:`InstallError` on a
     validation or verification failure. ``log`` receives human-readable progress
-    lines (default ``print``).
+    lines (default ``print``). With ``backfill=False`` capture starts from the
+    install moment instead of ingesting the whole Hermes history.
     """
     hermes = resolve_hermes_home(hermes_home)
     if not hermes.is_dir():
@@ -100,6 +103,10 @@ def install(
         # Hermes history that predates this installation (see reconcile).
         if outbox.get_meta(INSTALLED_AT_META_KEY) is None:
             outbox.set_meta(INSTALLED_AT_META_KEY, repr(time.time()))
+        # Record the backfill choice so capture honors it on every pass. Only
+        # written when disabled, so a re-install never silently flips it on.
+        if not backfill:
+            outbox.set_meta(CAPTURE_BACKFILL_META_KEY, "false")
     finally:
         outbox.close()
     log(f"flight recorder home: {fr_home}")

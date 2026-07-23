@@ -102,6 +102,13 @@ The `install` command is idempotent. You can run it again with no harm. It does
 not change the installation identity or the encryption key. It does not register
 an operating-system service.
 
+By default `install` captures the existing Hermes history on the first pass. To
+record only new activity from the install moment on, add `--no-backfill`:
+
+```bash
+hermes-flight-recorder install --hermes-home "<HERMES_HOME>" --no-backfill
+```
+
 ### Step 3 — Restart the Hermes gateway
 
 Restart the Hermes gateway. The gateway loads the hook only at start.
