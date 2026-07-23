@@ -57,6 +57,7 @@ from ._common import (
     jobs_path,
     kanban_board_dbs,
     load_json_dict,
+    occurred_before,
     open_sqlite_read_only,
     read_float,
     read_home_mode,
@@ -153,7 +154,7 @@ def reconcile(
 
     _detect_sequence_gaps(outbox, events, installation_id, counts, when)
     session_rows, parent_map = _detect_coverage_gaps(
-        outbox, events, home, exec_rows, counts, when, cfg, capture
+        outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
     )
     _detect_missing_terminals(
         outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map, horizon
@@ -176,8 +177,10 @@ def _install_horizon(outbox: Any) -> float:
     the moment it re-runs ``install``. The "should have finished by now"
     detectors (``terminal_missing``, ``cron.run_missed``) skip subjects that
     started before this, so a fresh install over a long-lived Hermes home does
-    not flag work that ended before the recorder existed. Sequence-gap and
-    capture-loss detection are unaffected.
+    not flag work that ended before the recorder existed. Coverage-gap detection
+    also ignores durable rows that predate the horizon; otherwise a no-backfill
+    install over a long-lived Hermes home immediately reports the whole historic
+    store as uncaptured.
     """
     raw = outbox.get_meta(INSTALLED_AT_META_KEY)
     if raw is not None:
@@ -212,7 +215,7 @@ def _detect_sequence_gaps(outbox, events, installation_id, counts, when) -> None
 
 # --- coverage gaps ------------------------------------------------------
 def _detect_coverage_gaps(
-    outbox, events, home, exec_rows, counts, when, config, capture_config
+    outbox, events, home, exec_rows, counts, when, config, capture_config, horizon
 ):
     """A durable row with no captured event proves a dropped capture."""
     captured = _captured_subjects(events)
@@ -239,26 +242,31 @@ def _detect_coverage_gaps(
                 f"SELECT {session_select} FROM sessions"
             ).fetchall()
             parent_map = {r["id"]: r["parent_session_id"] for r in session_rows}
+            session_started = {r["id"]: r["started_at"] for r in session_rows}
             _coverage_sessions(
-                outbox, session_rows, parent_map, captured, counts, when, config
+                outbox, session_rows, parent_map, captured, counts, when, config, horizon
             )
             _coverage_messages(
                 outbox,
                 conn,
                 parent_map,
+                session_started,
                 captured,
                 counts,
                 when,
                 config,
                 capture_config,
+                horizon,
             )
             _coverage_model_usage(
-                outbox, conn, parent_map, captured, counts, when, config
+                outbox, conn, parent_map, session_started, captured, counts, when, config, horizon
             )
         finally:
             conn.close()
 
     for r in exec_rows:
+        if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
+            continue
         if r["id"] in captured["executions"]:
             _clear_coverage_pending(outbox, "execution", r["id"])
             continue
@@ -268,14 +276,16 @@ def _detect_coverage_gaps(
             source_table="cron:executions.db", correlation_id=r["job_id"],
             grace=config.coverage_grace,
         )
-    _coverage_kanban(outbox, home, captured, counts, when, config)
+    _coverage_kanban(outbox, home, captured, counts, when, config, horizon)
     return session_rows, parent_map
 
 
 def _coverage_sessions(
-    outbox, rows, parent_map, captured, counts, when, config
+    outbox, rows, parent_map, captured, counts, when, config, horizon
 ) -> None:
     for r in rows:
+        if occurred_before(horizon, r["started_at"]):
+            continue
         sid = r["id"]
         if sid in captured["sessions"]:
             _clear_coverage_pending(outbox, "session", sid)
@@ -291,7 +301,7 @@ def _coverage_sessions(
 
 
 def _coverage_messages(
-    outbox, conn, parent_map, captured, counts, when, config, capture_config
+    outbox, conn, parent_map, session_started, captured, counts, when, config, capture_config, horizon
 ) -> None:
     roles = tuple(
         role
@@ -316,16 +326,21 @@ def _coverage_messages(
         if "content" in columns
         else ""
     )
+    timestamp_expr = sqlite_column_or_default(columns, "timestamp")
     rows = conn.execute(
-        "SELECT id, session_id FROM messages "
+        f"SELECT id, session_id, {timestamp_expr} FROM messages "
         f"WHERE role IN ({placeholders}){content_predicate}",
         roles,
     ).fetchall()
     for r in rows:
+        sid = r["session_id"]
+        if occurred_before(horizon, r["timestamp"]):
+            continue
+        if r["timestamp"] is None and occurred_before(horizon, session_started.get(sid)):
+            continue
         if r["id"] in captured["messages"]:
             _clear_coverage_pending(outbox, "message", str(r["id"]))
             continue
-        sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
         _emit_coverage(
             outbox, counts, when,
@@ -336,7 +351,7 @@ def _coverage_messages(
 
 
 def _coverage_model_usage(
-    outbox, conn, parent_map, captured, counts, when, config
+    outbox, conn, parent_map, session_started, captured, counts, when, config, horizon
 ) -> None:
     if not sqlite_table_exists(conn, "session_model_usage"):
         return
@@ -344,6 +359,8 @@ def _coverage_model_usage(
         "SELECT session_id, model, task FROM session_model_usage"
     ).fetchall()
     for r in rows:
+        if occurred_before(horizon, session_started.get(r["session_id"])):
+            continue
         key = (r["session_id"], r["model"], r["task"])
         subject_id = f"{r['session_id']}:{r['model']}:{r['task']}"
         if key in captured["model_usage"]:
@@ -359,7 +376,7 @@ def _coverage_model_usage(
         )
 
 
-def _coverage_kanban(outbox, home, captured, counts, when, config) -> None:
+def _coverage_kanban(outbox, home, captured, counts, when, config, horizon) -> None:
     """A durable Kanban task/run with no captured ``task.*`` event.
 
     The Kanban analog of the session/execution coverage diff: every board's
@@ -377,17 +394,29 @@ def _coverage_kanban(outbox, home, captured, counts, when, config) -> None:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            tasks = (
-                conn.execute("SELECT id, session_id FROM tasks").fetchall()
-                if "tasks" in present else []
-            )
-            runs = (
-                conn.execute("SELECT id, task_id FROM task_runs").fetchall()
-                if "task_runs" in present else []
-            )
+            if "tasks" in present:
+                task_cols = sqlite_table_columns(conn, "tasks")
+                tasks = conn.execute(
+                    "SELECT id, session_id, "
+                    f"{sqlite_column_or_default(task_cols, 'created_at')}, "
+                    f"{sqlite_column_or_default(task_cols, 'started_at')} FROM tasks"
+                ).fetchall()
+            else:
+                tasks = []
+            if "task_runs" in present:
+                run_cols = sqlite_table_columns(conn, "task_runs")
+                runs = conn.execute(
+                    "SELECT id, task_id, "
+                    f"{sqlite_column_or_default(run_cols, 'started_at')}, "
+                    f"{sqlite_column_or_default(run_cols, 'ended_at')} FROM task_runs"
+                ).fetchall()
+            else:
+                runs = []
         finally:
             conn.close()
         for r in tasks:
+            if occurred_before(horizon, r["created_at"] or r["started_at"]):
+                continue
             if (board, r["id"]) in captured["tasks"]:
                 _clear_coverage_pending(outbox, "task", f"{board}:{r['id']}")
                 continue
@@ -399,6 +428,8 @@ def _coverage_kanban(outbox, home, captured, counts, when, config) -> None:
                 grace=config.coverage_grace,
             )
         for r in runs:
+            if occurred_before(horizon, r["started_at"] or r["ended_at"]):
+                continue
             if (board, r["id"]) in captured["task_runs"]:
                 _clear_coverage_pending(outbox, "task_run", f"{board}:{r['id']}")
                 continue

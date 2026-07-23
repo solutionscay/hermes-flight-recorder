@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime
 import sqlite3
 
-from hermes_flight_recorder.collector._common import build_record
+from hermes_flight_recorder.collector._common import INSTALLED_AT_META_KEY, build_record
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
@@ -422,6 +422,58 @@ def test_captured_execution_does_not_surface(tmp_path):
     reconcile(ob, hh, now=B, config=CFG)
 
     assert coverage_gaps(ob, "execution") == []
+
+
+def test_no_backfill_install_horizon_suppresses_historic_state_rows(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    cron = hh / "cron"
+    cron.mkdir()
+    make_state_db(
+        hh,
+        sessions=[("old", "cli", None, B - 100, B - 50, 1, None)],
+        messages=[(30, "old", "user", "prompt")],
+        model_usage=[("old", "claude-x", "chat")],
+    )
+    make_executions_db(
+        cron,
+        [("old-ex", "job1", "completed", iso(B - 100), iso(B - 100), iso(B - 50))],
+    )
+    ob = new_outbox(tmp_path)
+    ob.set_meta(INSTALLED_AT_META_KEY, str(B))
+
+    reconcile(ob, hh, now=B + 60, config=CFG)
+
+    assert coverage_gaps(ob) == []
+
+
+def test_no_backfill_install_horizon_keeps_new_uncaptured_rows(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    cron = hh / "cron"
+    cron.mkdir()
+    make_state_db(
+        hh,
+        sessions=[("new", "cli", None, B + 10, None, 0, None)],
+        messages=[(31, "new", "assistant", "response")],
+        model_usage=[("new", "claude-x", "chat")],
+    )
+    make_executions_db(
+        cron,
+        [("new-ex", "job1", "completed", iso(B + 10), iso(B + 10), iso(B + 12))],
+    )
+    ob = new_outbox(tmp_path)
+    ob.set_meta(INSTALLED_AT_META_KEY, str(B))
+
+    reconcile(ob, hh, now=B + 60, config=CFG)
+
+    surfaced = {(g["payload"]["subject_type"], g["payload"]["subject_id"]) for g in coverage_gaps(ob)}
+    assert surfaced == {
+        ("session", "new"),
+        ("message", "31"),
+        ("model_usage", "new:claude-x:chat"),
+        ("execution", "new-ex"),
+    }
 
 
 # --- idempotency & combined scenario -----------------------------------------
