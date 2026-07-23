@@ -23,6 +23,12 @@ FLIGHT_RECORDER_DIR_NAME = "flight-recorder"
 # refuse to silently strand it; nothing writes here any more.
 LEGACY_FLIGHT_RECORDER_HOME = ".hermes-flight-recorder"
 
+# The outbox meta key holding the install epoch. It is the reconcile horizon:
+# the reconciler never judges Hermes history that started before it, so a fresh
+# install over a long-lived Hermes home does not emit findings about work that
+# finished (or crashed) before the recorder existed.
+INSTALLED_AT_META_KEY = "installed_at"
+
 
 def resolve_hermes_home(hermes_home: str | Path | None) -> Path:
     """The Hermes data root: explicit arg, then $HERMES_HOME, then ~/.hermes."""

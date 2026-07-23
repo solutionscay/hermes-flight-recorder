@@ -109,6 +109,19 @@ def _cmd_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_uninstall(args: argparse.Namespace) -> int:
+    from .collector.lifecycle import UninstallError, uninstall
+
+    try:
+        uninstall(
+            args.flight_recorder_home, args.hermes_home, purge_data=args.purge_data
+        )
+    except UninstallError as exc:
+        print(f"uninstall failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     from .collector import recorder_config, sync_config
     from .collector.runtime_lock import LOCK_FILENAME, RuntimeLock
@@ -584,6 +597,18 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[_home_options()],
     )
     p_install.set_defaults(func=_cmd_install)
+
+    p_uninstall = sub.add_parser(
+        "uninstall",
+        help="Remove the Hermes hook; preserve recorder data unless --purge-data is given.",
+        parents=[_home_options()],
+    )
+    p_uninstall.add_argument(
+        "--purge-data",
+        action="store_true",
+        help="Also delete the recorder home (outbox, key, config). Irreversible.",
+    )
+    p_uninstall.set_defaults(func=_cmd_uninstall)
 
     p_serve = sub.add_parser(
         "serve",

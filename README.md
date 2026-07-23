@@ -174,6 +174,7 @@ hermes-flight-recorder observe --hermes-home "<HERMES_HOME>" --tree
 | Command | Purpose |
 |---------|---------|
 | `install` | Set up the recorder home, identity, key, config, and hook. |
+| `uninstall` | Remove the hook; add `--purge-data` to also delete the recorder home. |
 | `serve` | Run capture, reconcile, and optional sync in one process. |
 | `configure-sync` | Write the cloud endpoint and the Cloudflare Access token. |
 | `status` | Show capture freshness and delivery lag. |

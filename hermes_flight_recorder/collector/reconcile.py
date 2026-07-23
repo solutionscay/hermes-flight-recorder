@@ -48,6 +48,7 @@ from typing import Any
 from . import CAPTURE_HEARTBEAT_KEY, knowledge_store
 from ..envelope import SESSION_LIFECYCLE, SESSION_START_TYPES
 from ._common import (
+    INSTALLED_AT_META_KEY,
     append_and_count,
     build_record,
     executions_db_path,
@@ -137,6 +138,7 @@ def reconcile(
     when = float(now) if now is not None else time.time()
     home = resolve_hermes_home(hermes_home)
     installation_id = outbox.installation_id
+    horizon = _install_horizon(outbox)
 
     # Snapshot the retained stream and compact retention summaries once,
     # before any emission, so findings appended this pass never perturb
@@ -153,14 +155,36 @@ def reconcile(
         outbox, events, home, exec_rows, counts, when, cfg, capture
     )
     _detect_missing_terminals(
-        outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map
+        outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map, horizon
     )
-    _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg)
+    _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon)
     _detect_gateway_start_failed(outbox, home, counts, when)
     _detect_stale_task_leases(outbox, home, counts, when, cfg)
     _detect_capture_stale(outbox, counts, when, cfg)
     _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
     return dict(counts)
+
+
+# --- install horizon ----------------------------------------------------
+def _install_horizon(outbox: Any) -> float:
+    """The epoch before which the reconciler ignores durable history.
+
+    The ``installed_at`` marker stamped at ``install`` (see lifecycle). Returns
+    ``0.0`` (no horizon — reconcile the full store, the pre-#109 behavior) when
+    the marker is absent, so an install that predates this marker is protected
+    the moment it re-runs ``install``. The "should have finished by now"
+    detectors (``terminal_missing``, ``cron.run_missed``) skip subjects that
+    started before this, so a fresh install over a long-lived Hermes home does
+    not flag work that ended before the recorder existed. Sequence-gap and
+    capture-loss detection are unaffected.
+    """
+    raw = outbox.get_meta(INSTALLED_AT_META_KEY)
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
 
 
 # --- sequence gaps ------------------------------------------------------
@@ -479,14 +503,14 @@ def _coverage_ready(
 
 # --- missing terminals --------------------------------------------------
 def _detect_missing_terminals(
-    outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map
+    outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map, horizon
 ) -> None:
-    _terminals_sessions(outbox, session_rows, parent_map, counts, when, cfg)
-    _terminals_cron_runs(outbox, exec_rows, counts, when, cfg)
-    _terminals_invocations(outbox, events, counts, when, cfg)
+    _terminals_sessions(outbox, session_rows, parent_map, counts, when, cfg, horizon)
+    _terminals_cron_runs(outbox, exec_rows, counts, when, cfg, horizon)
+    _terminals_invocations(outbox, events, counts, when, cfg, horizon)
 
 
-def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
+def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg, horizon) -> None:
     """A durable session/subagent row with ended_at NULL past its window.
 
     The durable row is authoritative: a live session keeps ended_at=NULL and
@@ -498,6 +522,8 @@ def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
         started = to_epoch(r["started_at"])
         if started is None:
             continue
+        if started < horizon:
+            continue  # started before the recorder existed — not our crash
         is_sub = r["source"] == "subagent"
         timeout = cfg.subagent_terminal_timeout if is_sub else cfg.session_terminal_timeout
         age = when - started
@@ -527,7 +553,7 @@ def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
         )
 
 
-def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg) -> None:
+def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg, horizon) -> None:
     """A durable execution with finished_at NULL past its window."""
     for r in exec_rows:
         if r["finished_at"] is not None:
@@ -535,6 +561,8 @@ def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg) -> None:
         claimed = r["claimed_epoch"]
         if claimed is None:
             continue
+        if claimed < horizon:
+            continue  # claimed before the recorder existed
         age = when - claimed
         if age <= cfg.cron_run_terminal_timeout:
             continue
@@ -558,7 +586,7 @@ def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg) -> None:
         )
 
 
-def _terminals_invocations(outbox, events, counts, when, cfg) -> None:
+def _terminals_invocations(outbox, events, counts, when, cfg, horizon) -> None:
     """An invocation.started with no invocation.completed, past its window.
 
     The turn_id lives only in memory, so invocations are judged from the
@@ -583,6 +611,8 @@ def _terminals_invocations(outbox, events, counts, when, cfg) -> None:
         occurred = e.get("occurred_at")
         if occurred is None or when - occurred <= cfg.invocation_terminal_timeout:
             continue
+        if occurred < horizon:
+            continue  # started before the recorder existed
         _emit_terminal_missing(
             outbox,
             counts,
@@ -730,7 +760,7 @@ def _load_open_task_runs(home: Path) -> list[dict[str, Any]]:
 
 
 # --- missed cron --------------------------------------------------------
-def _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg) -> None:
+def _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon) -> None:
     jobs = _load_jobs(jobs_path(home))
     if not jobs:
         return
@@ -744,10 +774,10 @@ def _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg) -> None:
         if r["claimed_epoch"] is not None:
             exec_by_job[r["job_id"]].append(r["claimed_epoch"])
     for job in jobs:
-        _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead)
+        _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon)
 
 
-def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead) -> None:
+def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon) -> None:
     if not _job_is_active(job):
         return  # paused, disabled, or repeat-exhausted — no fire is expected
     sched = job.get("schedule") or {}
@@ -774,6 +804,8 @@ def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead) ->
         return
 
     for first_at, count, is_tail in runs:
+        if first_at < horizon:
+            continue  # the fire was due before the recorder existed
         # A dead scheduler explains the open-ended tail; don't double-report
         # it per job — the single ticker signal already covers it.
         if is_tail and ticker_dead:

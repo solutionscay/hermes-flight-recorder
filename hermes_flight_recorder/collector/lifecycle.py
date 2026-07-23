@@ -15,20 +15,28 @@ performs the move is a separately scoped follow-up.)
 from __future__ import annotations
 
 import os
+import shutil
+import time
 from pathlib import Path
 
 from . import recorder_config
 from ._common import (
+    INSTALLED_AT_META_KEY,
     LEGACY_FLIGHT_RECORDER_HOME,
     resolve_flight_recorder_home,
     resolve_hermes_home,
 )
 from .hook import HOOK_DIR_NAME, baked_flight_recorder_home, install_hook
 from .outbox import Outbox, OutboxError
+from .runtime_lock import LOCK_FILENAME, RuntimeLock, RuntimeLockError
 
 
 class InstallError(RuntimeError):
     """The installation could not be completed or verified."""
+
+
+class UninstallError(RuntimeError):
+    """The uninstall could not be completed safely."""
 
 
 def _legacy_home() -> Path:
@@ -88,6 +96,10 @@ def install(
     outbox = Outbox.open(fr_home, hermes_home=hermes_home)
     try:
         installation_id = outbox.initialize()
+        # Stamp the reconcile horizon once, so the reconciler never judges
+        # Hermes history that predates this installation (see reconcile).
+        if outbox.get_meta(INSTALLED_AT_META_KEY) is None:
+            outbox.set_meta(INSTALLED_AT_META_KEY, repr(time.time()))
     finally:
         outbox.close()
     log(f"flight recorder home: {fr_home}")
@@ -174,4 +186,67 @@ def _require_owner_only(path: Path, label: str) -> None:
         )
 
 
-__all__ = ["InstallError", "install", "HOOK_DIR_NAME"]
+def uninstall(
+    flight_recorder_home: str | os.PathLike[str] | None,
+    hermes_home: str | os.PathLike[str] | None,
+    *,
+    purge_data: bool = False,
+    log=print,
+) -> None:
+    """Remove the Hermes hook and, with ``purge_data``, the recorder home.
+
+    Preserves all recorder data by default (only the hook and the runtime lock
+    go); ``purge_data`` also deletes the recorder home (outbox, key, config).
+    Refuses while a ``serve`` process holds the runtime lock. Idempotent and
+    never touches any other Hermes state. Raises :class:`UninstallError` only
+    when it is unsafe to proceed.
+    """
+    hermes = resolve_hermes_home(hermes_home)
+    fr_home = resolve_flight_recorder_home(flight_recorder_home, hermes_home)
+
+    _refuse_if_serving(fr_home)
+
+    hook_dir = hermes / "hooks" / HOOK_DIR_NAME
+    if hook_dir.exists():
+        shutil.rmtree(hook_dir, ignore_errors=True)
+        log(f"hook removed:     {hook_dir}")
+    else:
+        log(f"hook absent:      {hook_dir}")
+
+    if purge_data:
+        if fr_home.exists():
+            shutil.rmtree(fr_home, ignore_errors=True)
+            log(f"recorder purged:  {fr_home}")
+        else:
+            log(f"recorder absent:  {fr_home}")
+    else:
+        # Drop only the runtime lock; keep the outbox, key, and configuration.
+        lock = fr_home / LOCK_FILENAME
+        if lock.exists():
+            lock.unlink()
+        log(f"recorder data preserved at {fr_home} (use --purge-data to remove)")
+
+
+def _refuse_if_serving(fr_home: Path) -> None:
+    """Raise :class:`UninstallError` when a ``serve`` process holds the lock."""
+    if not fr_home.exists():
+        return  # nothing installed here; cannot be serving
+    lock = RuntimeLock(fr_home / LOCK_FILENAME)
+    try:
+        lock.acquire()
+    except RuntimeLockError:
+        raise UninstallError(
+            f"a Flight Recorder process is running against {fr_home}; "
+            f"stop `serve` first"
+        ) from None
+    lock.release()
+
+
+__all__ = [
+    "InstallError",
+    "UninstallError",
+    "install",
+    "uninstall",
+    "HOOK_DIR_NAME",
+    "INSTALLED_AT_META_KEY",
+]
