@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
+    occurred_before,
     append_and_count,
     build_record,
     kanban_board_dbs,
@@ -87,17 +88,23 @@ _TASK_META = (
 )
 
 
-def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
-    """One read-only poll pass over every Kanban board. Returns per-type counts."""
+def poll(
+    outbox: Any, hermes_home: str | Path | None = None, *, since: float | None = None
+) -> dict[str, int]:
+    """One read-only poll pass over every Kanban board. Returns per-type counts.
+
+    ``since`` is the capture horizon (``install --no-backfill``); task events and
+    attempts older than it are skipped so history is not backfilled.
+    """
     home = resolve_hermes_home(hermes_home)
     home_mode = read_home_mode(hermes_home)
     counts: dict[str, int] = defaultdict(int)
     for board, db_path in kanban_board_dbs(home):
-        _poll_board(outbox, board, db_path, counts, home_mode)
+        _poll_board(outbox, board, db_path, counts, home_mode, since)
     return dict(counts)
 
 
-def _poll_board(outbox, board: str, db_path: Path, counts, home_mode) -> None:
+def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None) -> None:
     conn = open_sqlite_read_only(db_path)
     try:
         task_cols = sqlite_table_columns(conn, "tasks")
@@ -135,6 +142,8 @@ def _poll_board(outbox, board: str, db_path: Path, counts, home_mode) -> None:
 
     rt = runtime_stamp("kanban", home_mode=home_mode)
     for ev in events:
+        if occurred_before(since, ev["created_at"]):
+            continue  # created before the capture horizon (no backfill)
         event_type = _KIND_EVENT.get(ev["kind"])
         if event_type is None:
             continue
@@ -161,6 +170,8 @@ def _poll_board(outbox, board: str, db_path: Path, counts, home_mode) -> None:
         run = runs[run_id]
         if run["outcome"] is None:
             continue
+        if occurred_before(since, run["ended_at"] or run["started_at"]):
+            continue  # attempt ended before the capture horizon (no backfill)
         task = tasks.get(run["task_id"])
         record = build_record(
             event_type="task.attempt_ended",
