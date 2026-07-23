@@ -25,7 +25,8 @@ from __future__ import annotations
 
 # The single installed hook lives under this directory name.
 HOOK_DIR_NAME = "hermes-flight-recorder"
-# All paths below are relative to the Flight Recorder home (never HERMES_HOME).
+# All paths below are relative to the Flight Recorder home
+# ($HERMES_HOME/flight-recorder by default).
 SPOOL_FILENAME = "hook-spool.jsonl"
 ERRLOG_FILENAME = "hook-errors.log"
 # The outbox meta cursor that records how far the drain has read.
@@ -41,11 +42,12 @@ HOOK_EVENTS = (
 )
 
 from .drain import drain  # noqa: E402  (constants above must exist first)
-from .install import install_hook  # noqa: E402
+from .install import baked_flight_recorder_home, install_hook  # noqa: E402
 
 __all__ = [
     "drain",
     "install_hook",
+    "baked_flight_recorder_home",
     "HOOK_DIR_NAME",
     "SPOOL_FILENAME",
     "ERRLOG_FILENAME",

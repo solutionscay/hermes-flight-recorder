@@ -60,16 +60,32 @@ Hermes Flight Recorder reads the Hermes home the same way Hermes does — from
 `HERMES_HOME`, and defaults to `~/.hermes`. Set it to the dev instance
 from step 1 when you run Hermes Flight Recorder commands.
 
-`hermes-flight-recorder init` creates the outbox and installs the live
-capture hook under `$HERMES_HOME/hooks/`; restart the Hermes gateway to
-load it. Then `run` drains the hook spool and polls the durable stores,
-`reconcile` diffs them for gaps, and `observe` renders the log.
+`hermes-flight-recorder install --hermes-home <path>` is idempotent: it creates
+the recorder home at `$HERMES_HOME/flight-recorder`, mints the installation
+identity and encryption key, writes configuration with mode `0600`, and installs
+(or repoints) the live capture hook under `$HERMES_HOME/hooks/`. Restart the
+Hermes gateway to load the hook. It never registers an OS service.
+
+`hermes-flight-recorder serve --hermes-home <path>` then runs one portable
+foreground process: it drains the hook spool and polls the durable stores on
+`capture.interval_seconds` (default 15s), reconciles the stores against the
+outbox on `reconcile.interval_seconds` (default 60s) — independently, so it
+flags capture staleness even when capture is broken — and syncs when a sync
+config is present. A `runtime.lock` in the recorder home enforces a single
+instance; SIGINT/SIGTERM shut it down cleanly. Native service managers (systemd,
+launchd, Windows Service) wrap this same command.
+
+`run`, `reconcile`, and `sync` remain available as one-shot passes for an
+external scheduler, and `observe` renders the log locally.
+
+The recorder home resolves by precedence: `--flight-recorder-home`, then
+`$SC_HERMES_FLIGHT_RECORDER_HOME`, then `$HERMES_HOME/flight-recorder`.
 
 ## Recorder configuration
 
-Optional non-secret operational settings live in
-`$SC_HERMES_FLIGHT_RECORDER_HOME/recorder-config.json` (or
-`~/.hermes-flight-recorder/recorder-config.json` when `SC_HERMES_FLIGHT_RECORDER_HOME` is not
+Optional non-secret operational settings live in `recorder-config.json` inside
+the recorder home — by default `$HERMES_HOME/flight-recorder/recorder-config.json`
+(or `$SC_HERMES_FLIGHT_RECORDER_HOME/recorder-config.json` when that override is
 set). Hermes Flight Recorder treats a missing file or missing key as its built-in default.
 Environment variables take precedence over file values. The file is written
 with mode `0600` by `recorder_config.save`; create it with the same mode when
@@ -80,7 +96,8 @@ managing it yourself.
   "capture": {
     "max_content_bytes": 65536,
     "message_roles": ["user", "assistant", "tool"],
-    "sources": {"hook": true}
+    "sources": {"hook": true},
+    "interval_seconds": 15
   },
   "retention": {
     "enabled": false,
@@ -93,6 +110,9 @@ managing it yourself.
     "interval_seconds": null,
     "max_records": 500,
     "max_bytes": 1048576
+  },
+  "reconcile": {
+    "interval_seconds": 60
   }
 }
 ```
@@ -131,20 +151,32 @@ reconciliation fields. Tombstones contain no encrypted body or full envelope;
 they stop durable-store polls from recreating delivered events and stop
 reconciliation from reporting intentional retention as capture loss.
 
-`sync.max_records` and `sync.max_bytes` are active now.
-`sync.interval_seconds` is `null` by default,
-preserving the current one-pass `sync` behavior; set a positive number to run
-continuously. An explicit `sync --interval` takes precedence over that value.
+`capture.interval_seconds` (default 15) and `reconcile.interval_seconds`
+(default 60) set the `serve` cadences; the one-shot `run` and `reconcile`
+commands ignore them. `sync.max_records` and `sync.max_bytes` are active now.
+`sync.interval_seconds` is `null` by default, preserving the one-pass `sync`
+behavior; under `serve`, a `null` sync interval falls back to 60s when a sync
+config is present. An explicit `sync --interval` or `serve --sync-interval`
+takes precedence over the file value.
 
 The environment equivalents are `HFR_CAPTURE_MAX_CONTENT_BYTES`,
 `HFR_CAPTURE_MESSAGE_ROLES` (a JSON array), `HFR_CAPTURE_SOURCES` (a JSON
-object), `HFR_RETENTION_ENABLED`, `HFR_RETENTION_MAX_AGE_DAYS`,
-`HFR_RETENTION_MAX_BYTES`, `HFR_RETENTION_REQUIRE_DELIVERED`,
-`HFR_RETENTION_VACUUM`,
-`HFR_SYNC_INTERVAL_SECONDS`, `HFR_SYNC_MAX_RECORDS`, and
-`HFR_SYNC_MAX_BYTES`. The ingest URL and Cloudflare Access credentials remain
+object), `HFR_CAPTURE_INTERVAL_SECONDS`, `HFR_RETENTION_ENABLED`,
+`HFR_RETENTION_MAX_AGE_DAYS`, `HFR_RETENTION_MAX_BYTES`,
+`HFR_RETENTION_REQUIRE_DELIVERED`, `HFR_RETENTION_VACUUM`,
+`HFR_RECONCILE_INTERVAL_SECONDS`, `HFR_SYNC_INTERVAL_SECONDS`,
+`HFR_SYNC_MAX_RECORDS`, and `HFR_SYNC_MAX_BYTES`. The ingest URL and Cloudflare
+Access credentials remain
 in the separate private `sync-config.json` or their existing environment
 variables, so credentials do not mix with operational configuration.
+
+`hermes-flight-recorder configure-sync` writes that `sync-config.json` (mode
+`0600`) from `--ingest-url` (default: the hosted endpoint), `--client-id`, and a
+client secret read from `--client-secret-stdin`, `$HFR_CF_ACCESS_CLIENT_SECRET`,
+or an interactive prompt — never a plain flag by default, so the secret stays
+out of shell history. It merges over any existing file, so a single flag does a
+partial update. The environment variables above still override the file at load
+time for injecting a secret without writing it to disk.
 
 ## Safety notes
 

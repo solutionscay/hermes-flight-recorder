@@ -65,16 +65,30 @@ def test_flight_recorder_home_env_overrides_default(tmp_path, monkeypatch):
     assert default_flight_recorder_home() == tmp_path
 
 
-def test_legacy_home_env_is_ignored(monkeypatch, tmp_path):
+def test_default_home_is_namespaced_child_of_hermes_home(monkeypatch, tmp_path):
     monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
-    monkeypatch.setenv("BRIDGE" + "_HOME", str(tmp_path))
-    assert default_flight_recorder_home() == Path.home() / ".hermes-flight-recorder"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert default_flight_recorder_home() == tmp_path / "flight-recorder"
 
 
-def test_refuses_path_under_hermes_home(tmp_path, monkeypatch):
+def test_default_home_falls_back_to_dot_hermes(monkeypatch):
+    monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    assert default_flight_recorder_home() == Path.home() / ".hermes" / "flight-recorder"
+
+
+def test_allows_namespaced_child_under_hermes_home(tmp_path, monkeypatch):
+    # The new default location — a child of the Hermes home — is allowed.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ob = Outbox.open(tmp_path / "flight-recorder")
+    assert ob.path == (tmp_path / "flight-recorder").resolve() / "outbox.sqlite"
+    ob.close()
+
+
+def test_refuses_hermes_root_itself(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with pytest.raises(OutboxError):
-        Outbox.open(tmp_path / "inside")
+        Outbox.open(tmp_path, hermes_home=tmp_path)
 
 
 # --- sequence -----------------------------------------------------------

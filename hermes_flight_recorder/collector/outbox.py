@@ -21,7 +21,10 @@ Key properties:
   reconciliation identity. The independent high-water mark therefore remains
   authoritative.
 
-The outbox database must never live under ``HERMES_HOME``.
+The outbox lives inside the Hermes home, under the namespaced
+``flight-recorder`` child (``$HERMES_HOME/flight-recorder``) — one Hermes
+home is one Flight Recorder installation. It may not sit at the Hermes root
+itself, which belongs to Hermes.
 """
 
 from __future__ import annotations
@@ -40,7 +43,12 @@ from typing import Any, Iterator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from ..envelope import SCHEMA_VERSION, parse, serialize, validate
-from ._common import default_flight_recorder_home, resolve_hermes_home
+from ._common import (
+    FLIGHT_RECORDER_DIR_NAME,
+    default_flight_recorder_home,
+    resolve_flight_recorder_home,
+    resolve_hermes_home,
+)
 
 __all__ = [
     "OUTBOX_SCHEMA_VERSION",
@@ -175,18 +183,26 @@ class Outbox:
 
     # --- construction ---------------------------------------------------
     @classmethod
-    def open(cls, flight_recorder_home: str | os.PathLike[str] | None = None) -> "Outbox":
-        home = Path(flight_recorder_home).expanduser() if flight_recorder_home else default_flight_recorder_home()
-        home = home.resolve()
-        path = home / "outbox.sqlite"
-        hermes = resolve_hermes_home(None).resolve()
-        if path.is_relative_to(hermes):
+    def open(
+        cls,
+        flight_recorder_home: str | os.PathLike[str] | None = None,
+        *,
+        hermes_home: str | os.PathLike[str] | None = None,
+    ) -> "Outbox":
+        home = resolve_flight_recorder_home(flight_recorder_home, hermes_home).resolve()
+        hermes = resolve_hermes_home(hermes_home).resolve()
+        if home == hermes:
             raise OutboxError(
-                f"refusing to place the outbox under HERMES_HOME ({hermes}); "
-                f"set SC_HERMES_FLIGHT_RECORDER_HOME to a directory outside the Hermes home"
+                f"refusing to use the Hermes home root ({hermes}) as the flight "
+                f"recorder home; use its namespaced '{FLIGHT_RECORDER_DIR_NAME}' "
+                f"child or set SC_HERMES_FLIGHT_RECORDER_HOME"
             )
         home.mkdir(parents=True, exist_ok=True)
-        return cls(path)
+        try:
+            os.chmod(home, 0o700)
+        except OSError:
+            pass
+        return cls(home / "outbox.sqlite")
 
     def initialize(self) -> str:
         """Create the installation identity and content key once.

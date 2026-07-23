@@ -15,6 +15,15 @@ from pathlib import Path
 from typing import Any
 
 
+# The namespaced child of a Hermes home that holds one Flight Recorder
+# installation's runtime data (outbox, key, config, spool, lock).
+FLIGHT_RECORDER_DIR_NAME = "flight-recorder"
+
+# The pre-#101 default location. Retained only so `install` can detect it and
+# refuse to silently strand it; nothing writes here any more.
+LEGACY_FLIGHT_RECORDER_HOME = ".hermes-flight-recorder"
+
+
 def resolve_hermes_home(hermes_home: str | Path | None) -> Path:
     """The Hermes data root: explicit arg, then $HERMES_HOME, then ~/.hermes."""
     if hermes_home:
@@ -23,10 +32,38 @@ def resolve_hermes_home(hermes_home: str | Path | None) -> Path:
     return Path(env).expanduser() if env else Path.home() / ".hermes"
 
 
-def default_flight_recorder_home() -> Path:
-    """The Flight Recorder-owned data directory (never under HERMES_HOME)."""
+def resolve_flight_recorder_home(
+    flight_recorder_home: str | Path | None = None,
+    hermes_home: str | Path | None = None,
+) -> Path:
+    """The Flight Recorder data directory, by descending precedence.
+
+    1. ``flight_recorder_home`` — an explicit ``--flight-recorder-home``.
+    2. ``$SC_HERMES_FLIGHT_RECORDER_HOME`` — for unusual deployments.
+    3. ``<hermes home>/flight-recorder`` — the default: one Hermes home is one
+       Flight Recorder installation. The Hermes home resolves via
+       :func:`resolve_hermes_home` (``hermes_home`` arg, then ``$HERMES_HOME``,
+       then ``~/.hermes``).
+
+    The path is expanded but not resolved, so callers control symlink and
+    relative-path resolution.
+    """
+    if flight_recorder_home:
+        return Path(flight_recorder_home).expanduser()
     env = os.environ.get("SC_HERMES_FLIGHT_RECORDER_HOME")
-    return Path(env).expanduser() if env else Path.home() / ".hermes-flight-recorder"
+    if env:
+        return Path(env).expanduser()
+    return resolve_hermes_home(hermes_home) / FLIGHT_RECORDER_DIR_NAME
+
+
+def default_flight_recorder_home() -> Path:
+    """The Flight Recorder data directory with no explicit overrides.
+
+    A thin no-arg wrapper over :func:`resolve_flight_recorder_home` for library
+    callers (config readers) that only need the default. Its value is
+    ``$SC_HERMES_FLIGHT_RECORDER_HOME`` or ``$HERMES_HOME/flight-recorder``.
+    """
+    return resolve_flight_recorder_home()
 
 
 # --- Hermes durable-store layout ----------------------------------------

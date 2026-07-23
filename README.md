@@ -29,25 +29,56 @@ Invocation hooks record timing and attribution immediately without Hermes's
 truncated previews. Complete user and assistant text is collected from
 `state.db` on the next poll and linked to the same invocation.
 
-## Try it
+## Install
+
+One Hermes home is one Flight Recorder installation. Runtime data lives under
+`$HERMES_HOME/flight-recorder`; the only change Flight Recorder makes to the
+Hermes home is the hook at `$HERMES_HOME/hooks/hermes-flight-recorder`.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+pipx install hermes-flight-recorder            # or: pip install hermes-flight-recorder
+hermes-flight-recorder install --hermes-home "$HOME/.hermes-dev"
 
-export HERMES_HOME="$HOME/.hermes-dev"
-hermes-flight-recorder init
-
-# Restart the Hermes gateway, run a session, then:
-hermes-flight-recorder run
-hermes-flight-recorder reconcile
-hermes-flight-recorder observe --tree
+# Restart the Hermes gateway to load the hook, then run the companion:
+hermes-flight-recorder serve --hermes-home "$HOME/.hermes-dev"
 ```
 
-`sync` is optional and is the only command that uses the network. Configure it with an HTTPS endpoint and credentials, then run `hermes-flight-recorder sync`.
+`install` is idempotent: it creates the recorder home, mints the installation
+identity and encryption key, writes configuration with restrictive permissions,
+and installs (or repoints) the hook. It never registers an OS service.
 
-When retention is enabled in `recorder-config.json`, `hermes-flight-recorder prune` applies the configured age and byte limits immediately. `run` and `sync` also apply it automatically on a six-hour cadence. Events beyond the durable delivery cursor are never deleted.
+`serve` is one portable foreground process that captures, reconciles, and —
+when a sync config is present — syncs, each on its own interval, guarded by a
+single-instance lock. Native service registration (systemd, launchd, Windows
+Service) simply wraps this command.
+
+The recorder home resolves by precedence: `--flight-recorder-home`, then
+`$SC_HERMES_FLIGHT_RECORDER_HOME`, then `$HERMES_HOME/flight-recorder`.
+
+### Configure sync (optional)
+
+Syncing to Hermes DBaaS needs an ingest endpoint and a Cloudflare Access service
+token. `configure-sync` writes them to a private (`0600`) `sync-config.json` in
+the recorder home, keeping the secret out of shell history:
+
+```bash
+hermes-flight-recorder configure-sync --hermes-home "$HOME/.hermes-dev" \
+  --client-id "<token-id>.access"
+# prompts for the client secret (or reads $HFR_CF_ACCESS_CLIENT_SECRET / --client-secret-stdin)
+```
+
+`--ingest-url` defaults to the hosted endpoint. Re-running with a single flag
+does a partial update, so you can change the endpoint without re-entering the
+credential. `serve` then picks the config up automatically; without it, the
+recorder keeps capturing and reconciling locally and the outbox buffers.
+
+### One-shot commands
+
+`run`, `reconcile`, and `sync` remain available as single passes an external
+scheduler can drive, and `observe --tree` renders the captured log locally with
+no network. `sync` is the only command that uses the network.
+
+When retention is enabled in `recorder-config.json`, `hermes-flight-recorder prune` applies the configured age and byte limits immediately. `serve`, `run`, and `sync` also apply it automatically on a six-hour cadence. Events beyond the durable delivery cursor are never deleted.
 
 ## Status
 

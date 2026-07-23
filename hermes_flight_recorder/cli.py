@@ -1,10 +1,12 @@
 """Command-line entry point for the Flight Recorder companion.
 
-Subcommands land across the Phase 0 steps. ``init`` creates the local
-outbox and mints the installation identity. ``run`` polls the durable
-stores into the outbox. ``reconcile`` diffs the durable stores against the
-captured outbox and emits reconcile findings. ``observe`` renders the
-captured outbox locally (stream, tree, report) with no network.
+``install`` makes one Hermes home into one Flight Recorder installation
+(``$HERMES_HOME/flight-recorder``): it creates the outbox, mints the
+installation identity and key, writes config, and installs the hook.
+``serve`` runs one portable foreground process that captures, reconciles, and
+optionally syncs on their own intervals. ``run``/``reconcile``/``sync`` remain
+as one-shot passes a scheduler can drive. ``observe`` renders the captured
+outbox locally (stream, tree, report, kanban, knowledge) with no network.
 """
 
 from __future__ import annotations
@@ -23,15 +25,34 @@ _SYNC_AUTH = 3  # the edge rejected the service token
 _SYNC_TERMINAL = 4  # the server rejected the batch as malformed (a client defect)
 
 
+def _flight_recorder_home(args: argparse.Namespace):
+    """Resolve the Flight Recorder home once for a command.
+
+    Applies the precedence ``--flight-recorder-home`` → env → the namespaced
+    ``$HERMES_HOME/flight-recorder`` default, so every command sees the same
+    location whether or not it also uses the Hermes home.
+    """
+    from .collector._common import resolve_flight_recorder_home
+
+    return resolve_flight_recorder_home(args.flight_recorder_home, args.hermes_home)
+
+
+def _open_outbox(args: argparse.Namespace):
+    """Open the outbox at the resolved Flight Recorder home."""
+    from .collector.outbox import Outbox
+
+    return Outbox.open(_flight_recorder_home(args), hermes_home=args.hermes_home)
+
+
 def _check_initialized(outbox) -> bool:
-    """True when the outbox has an identity; else print the init hint."""
+    """True when the outbox has an identity; else print the install hint."""
     from .collector.outbox import OutboxError
 
     try:
         outbox.installation_id
     except OutboxError:
         print(
-            "outbox not initialized; run `hermes-flight-recorder init` first",
+            "outbox not initialized; run `hermes-flight-recorder install` first",
             file=sys.stderr,
         )
         return False
@@ -76,41 +97,75 @@ def _automatic_prune(outbox, config) -> None:
         _print_prune_result(result, automatic=True)
 
 
-def _cmd_init(args: argparse.Namespace) -> int:
+def _cmd_install(args: argparse.Namespace) -> int:
     # Imported lazily so `hermes-flight-recorder --version` needs no heavy deps.
-    from .collector._common import resolve_hermes_home
-    from .collector.hook import install_hook
-    from .collector.outbox import Outbox
+    from .collector.lifecycle import InstallError, install
 
-    outbox = Outbox.open(args.flight_recorder_home)
     try:
-        installation_id = outbox.initialize()
-        print(f"outbox:          {outbox.path}")
-        print(f"installation_id: {installation_id}")
-
-        hermes_home = resolve_hermes_home(args.hermes_home)
-        try:
-            hook_dir = install_hook(hermes_home, outbox.path.parent, force=args.force)
-            print(f"hook installed:  {hook_dir}")
-            print("restart the Hermes gateway to load the hook.")
-        except FileExistsError as exc:
-            print(f"hook already installed at {exc} (use --force to reinstall)")
-    finally:
-        outbox.close()
+        install(args.flight_recorder_home, args.hermes_home)
+    except InstallError as exc:
+        print(f"install failed: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
-    from .collector import recorder_config, run_pass
-    from .collector.outbox import Outbox
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .collector import recorder_config, sync_config
+    from .collector.runtime_lock import LOCK_FILENAME, RuntimeLock
+    from .collector.serve import configure_logging, serve
+    from .collector.transport import HttpsTransport, RetryingTransport
 
-    outbox = Outbox.open(args.flight_recorder_home)
+    log = configure_logging(args.log_level)
+    fr_home = _flight_recorder_home(args)
+
+    outbox = _open_outbox(args)
     try:
         if not _check_initialized(outbox):
             return 2
 
         try:
-            runtime_config = recorder_config.load(args.flight_recorder_home)
+            config = recorder_config.load(fr_home)
+        except recorder_config.RecorderConfigError as exc:
+            print(f"serve not configured: {exc}", file=sys.stderr)
+            return 2
+
+        transport = None
+        if not args.no_sync:
+            try:
+                sync = sync_config.load(fr_home)
+                transport = RetryingTransport(
+                    HttpsTransport.from_config(
+                        sync, require_https=not args.allow_insecure_url
+                    )
+                )
+            except sync_config.SyncConfigError as exc:
+                log.info("sync disabled: %s", exc)
+
+        return serve(
+            outbox,
+            args.hermes_home,
+            config,
+            transport=transport,
+            capture_interval=args.capture_interval,
+            reconcile_interval=args.reconcile_interval,
+            sync_interval=args.sync_interval,
+            lock=RuntimeLock(fr_home / LOCK_FILENAME),
+            logger=log,
+        )
+    finally:
+        outbox.close()
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    from .collector import recorder_config, run_pass
+
+    outbox = _open_outbox(args)
+    try:
+        if not _check_initialized(outbox):
+            return 2
+
+        try:
+            runtime_config = recorder_config.load(_flight_recorder_home(args))
         except recorder_config.RecorderConfigError as exc:
             print(f"run not configured: {exc}", file=sys.stderr)
             return 2
@@ -135,16 +190,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_reconcile(args: argparse.Namespace) -> int:
     from .collector import recorder_config
-    from .collector.outbox import Outbox
     from .collector.reconcile import reconcile
 
-    outbox = Outbox.open(args.flight_recorder_home)
+    outbox = _open_outbox(args)
     try:
         if not _check_initialized(outbox):
             return 2
 
         try:
-            runtime_config = recorder_config.load(args.flight_recorder_home)
+            runtime_config = recorder_config.load(_flight_recorder_home(args))
         except recorder_config.RecorderConfigError as exc:
             print(f"reconcile not configured: {exc}", file=sys.stderr)
             return 2
@@ -166,7 +220,6 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
 
 def _cmd_observe(args: argparse.Namespace) -> int:
     from . import observe
-    from .collector.outbox import Outbox
 
     since: float | None = None
     if args.since is not None:
@@ -176,7 +229,7 @@ def _cmd_observe(args: argparse.Namespace) -> int:
             print(str(exc), file=sys.stderr)
             return 2
 
-    outbox = Outbox.open(args.flight_recorder_home)
+    outbox = _open_outbox(args)
     try:
         if not _check_initialized(outbox):
             return 2
@@ -225,15 +278,14 @@ def _cmd_observe(args: argparse.Namespace) -> int:
 
 def _cmd_prune(args: argparse.Namespace) -> int:
     from .collector import recorder_config
-    from .collector.outbox import Outbox
     from .collector.retention import RetentionError, prune
 
-    outbox = Outbox.open(args.flight_recorder_home)
+    outbox = _open_outbox(args)
     try:
         if not _check_initialized(outbox):
             return 2
         try:
-            config = recorder_config.load(args.flight_recorder_home).retention
+            config = recorder_config.load(_flight_recorder_home(args)).retention
         except recorder_config.RecorderConfigError as exc:
             print(f"prune not configured: {exc}", file=sys.stderr)
             return 2
@@ -262,14 +314,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
     recorded a success).
     """
     from .collector import CAPTURE_HEARTBEAT_KEY
-    from .collector.outbox import Outbox
     from .collector.reconcile import ReconcileConfig
     from .collector.sync import delivery_cursor
 
     threshold = ReconcileConfig().capture_stale_after
     now = time.time()
 
-    outbox = Outbox.open(args.flight_recorder_home)
+    outbox = _open_outbox(args)
     try:
         if not _check_initialized(outbox):
             return 2
@@ -370,17 +421,17 @@ def _sync_once(
 
 def _cmd_sync(args: argparse.Namespace) -> int:
     from .collector import recorder_config, sync_config
-    from .collector.outbox import Outbox
     from .collector.transport import HttpsTransport, RetryingTransport
 
-    outbox = Outbox.open(args.flight_recorder_home)
+    fr_home = _flight_recorder_home(args)
+    outbox = _open_outbox(args)
     try:
         if not _check_initialized(outbox):
             return _SYNC_CONFIG
 
         try:
-            config = sync_config.load(args.flight_recorder_home)
-            runtime_config = recorder_config.load(args.flight_recorder_home)
+            config = sync_config.load(fr_home)
+            runtime_config = recorder_config.load(fr_home)
         except (
             sync_config.SyncConfigError,
             recorder_config.RecorderConfigError,
@@ -420,20 +471,98 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         outbox.close()
 
 
-def _home_options(*, hermes: bool = False) -> argparse.ArgumentParser:
-    """A parent parser carrying the data-directory options every subcommand shares."""
+def _explicit_secret(args: argparse.Namespace) -> str | None:
+    """The client secret from a non-interactive source, or None.
+
+    Precedence: ``--client-secret-stdin`` (read one value from stdin), then
+    ``--client-secret``, then ``$HFR_CF_ACCESS_CLIENT_SECRET``. No prompt here —
+    an interactive prompt is a last resort handled by the command when the merge
+    would otherwise be incomplete.
+    """
+    import os
+
+    if args.client_secret_stdin:
+        return sys.stdin.read().strip() or None
+    if args.client_secret:
+        return args.client_secret
+    return os.environ.get("HFR_CF_ACCESS_CLIENT_SECRET") or None
+
+
+def _redact_client_id(client_id: str) -> str:
+    """Show enough of the client id to recognize it, hiding the rest."""
+    if len(client_id) <= 8:
+        return client_id[:2] + "…"
+    return client_id[:8] + "…"
+
+
+def _cmd_configure_sync(args: argparse.Namespace) -> int:
+    from .collector import sync_config
+
+    fr_home = _flight_recorder_home(args)
+    secret = _explicit_secret(args)
+
+    def attempt(sec: str | None):
+        return sync_config.configure(
+            fr_home,
+            ingest_url=args.ingest_url,
+            cf_access_client_id=args.client_id,
+            cf_access_client_secret=sec,
+        )
+
+    try:
+        config = attempt(secret)
+    except sync_config.SyncConfigError as exc:
+        # Prompt for the secret only when it is the one missing field and we can
+        # ask interactively; otherwise the caller must supply the flags.
+        only_secret_missing = (
+            secret is None
+            and "cf_access_client_secret" in str(exc)
+            and "cf_access_client_id" not in str(exc)
+            and "ingest_url" not in str(exc)
+        )
+        if only_secret_missing and sys.stdin.isatty():
+            import getpass
+
+            secret = getpass.getpass("Cloudflare Access client secret: ").strip() or None
+            try:
+                config = attempt(secret)
+            except sync_config.SyncConfigError as exc2:
+                print(f"configure-sync failed: {exc2}", file=sys.stderr)
+                return 2
+        else:
+            print(f"configure-sync failed: {exc}", file=sys.stderr)
+            return 2
+
+    if not args.allow_insecure_url and config.ingest_url.startswith("http://"):
+        print(
+            "warning: ingest URL is plaintext http://; use https:// in production "
+            "(sync/serve reject it unless --allow-insecure-url is set).",
+            file=sys.stderr,
+        )
+    print(f"sync configured: {config.ingest_url}")
+    print(f"client id:       {_redact_client_id(config.cf_access_client_id)}")
+    print(f"config written:  {sync_config.config_path(fr_home)}")
+    return 0
+
+
+def _home_options() -> argparse.ArgumentParser:
+    """A parent parser carrying the data-directory options every subcommand shares.
+
+    Both flags apply everywhere now that the Flight Recorder home defaults to the
+    ``flight-recorder`` child of the Hermes home: even commands that never touch
+    the Hermes stores need ``--hermes-home`` to resolve that default.
+    """
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument(
         "--flight-recorder-home",
         default=None,
-        help="Flight Recorder data directory (default: $SC_HERMES_FLIGHT_RECORDER_HOME or ~/.hermes-flight-recorder).",
+        help="Flight Recorder data directory (default: $SC_HERMES_FLIGHT_RECORDER_HOME or $HERMES_HOME/flight-recorder).",
     )
-    if hermes:
-        parent.add_argument(
-            "--hermes-home",
-            default=None,
-            help="Hermes data root (default: $HERMES_HOME or ~/.hermes).",
-        )
+    parent.add_argument(
+        "--hermes-home",
+        default=None,
+        help="Hermes data root (default: $HERMES_HOME or ~/.hermes).",
+    )
     return parent
 
 
@@ -449,29 +578,67 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    p_init = sub.add_parser(
-        "init",
-        help="Create the local outbox, mint the installation id, and install the hook.",
-        parents=[_home_options(hermes=True)],
+    p_install = sub.add_parser(
+        "install",
+        help="Install (idempotently) into a Hermes home: outbox, identity, key, config, and hook.",
+        parents=[_home_options()],
     )
-    p_init.add_argument(
-        "--force",
+    p_install.set_defaults(func=_cmd_install)
+
+    p_serve = sub.add_parser(
+        "serve",
+        help="Run one foreground process: capture, reconcile, and optional sync on their own intervals.",
+        parents=[_home_options()],
+    )
+    p_serve.add_argument(
+        "--capture-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Override the capture cadence (default: capture.interval_seconds).",
+    )
+    p_serve.add_argument(
+        "--reconcile-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Override the reconcile cadence (default: reconcile.interval_seconds).",
+    )
+    p_serve.add_argument(
+        "--sync-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Override the sync cadence (default: sync.interval_seconds, or 60s when a sync config exists).",
+    )
+    p_serve.add_argument(
+        "--no-sync",
         action="store_true",
-        help="Reinstall the hook even if it is already present.",
+        help="Never sync, even when a sync config is present.",
     )
-    p_init.set_defaults(func=_cmd_init)
+    p_serve.add_argument(
+        "--allow-insecure-url",
+        action="store_true",
+        help="Permit a plaintext http:// ingest URL (local dev only; HTTPS is the default).",
+    )
+    p_serve.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ...). Default INFO.",
+    )
+    p_serve.set_defaults(func=_cmd_serve)
 
     p_run = sub.add_parser(
         "run",
         help="Poll state.db and the cron store into the outbox (one pass).",
-        parents=[_home_options(hermes=True)],
+        parents=[_home_options()],
     )
     p_run.set_defaults(func=_cmd_run)
 
     p_rec = sub.add_parser(
         "reconcile",
         help="Diff the durable stores against the outbox and emit reconcile findings.",
-        parents=[_home_options(hermes=True)],
+        parents=[_home_options()],
     )
     p_rec.set_defaults(func=_cmd_reconcile)
 
@@ -534,6 +701,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Permit a plaintext http:// ingest URL (local dev only; HTTPS is the default).",
     )
     p_sync.set_defaults(func=_cmd_sync)
+
+    p_cfg = sub.add_parser(
+        "configure-sync",
+        help="Write the DBaaS ingest endpoint and Cloudflare Access credential (private, 0600).",
+        parents=[_home_options()],
+    )
+    p_cfg.add_argument(
+        "--ingest-url",
+        default=None,
+        help="Ingestion endpoint (default: the hosted Hermes DBaaS endpoint, or the existing value).",
+    )
+    p_cfg.add_argument(
+        "--client-id",
+        default=None,
+        help="Cloudflare Access service-token client id (keeps its existing value if omitted).",
+    )
+    secret_group = p_cfg.add_mutually_exclusive_group()
+    secret_group.add_argument(
+        "--client-secret",
+        default=None,
+        help="Client secret (discouraged: visible in shell history; prefer stdin, env, or the prompt).",
+    )
+    secret_group.add_argument(
+        "--client-secret-stdin",
+        action="store_true",
+        help="Read the client secret from stdin.",
+    )
+    p_cfg.add_argument(
+        "--allow-insecure-url",
+        action="store_true",
+        help="Suppress the plaintext http:// warning.",
+    )
+    p_cfg.set_defaults(func=_cmd_configure_sync)
 
     return parser
 

@@ -20,37 +20,41 @@ from hermes_flight_recorder.collector.hook import SPOOL_FILENAME
 from hermes_flight_recorder.collector.outbox import Outbox
 
 
-def test_init_installs_the_hook(tmp_path: Path, capsys) -> None:
+def _install(bridge: Path, hermes: Path) -> int:
+    hermes.mkdir(parents=True, exist_ok=True)
+    return cli.main(
+        ["install", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes)]
+    )
+
+
+def test_install_installs_the_hook(tmp_path: Path, capsys) -> None:
     bridge, hermes = tmp_path / "bridge", tmp_path / "hermes"
-    rc = cli.main(["init", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes)])
-    assert rc == 0
+    assert _install(bridge, hermes) == 0
     hook_dir = hermes / "hooks" / "hermes-flight-recorder"
     assert (hook_dir / "HOOK.yaml").exists() and (hook_dir / "handler.py").exists()
     out = capsys.readouterr().out
     assert "hook installed:" in out and "restart the Hermes gateway" in out
 
 
-def test_init_twice_reports_already_installed(tmp_path: Path, capsys) -> None:
+def test_install_is_idempotent(tmp_path: Path, capsys) -> None:
     bridge, hermes = tmp_path / "bridge", tmp_path / "hermes"
-    args = ["init", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes)]
-    cli.main(args)
+    assert _install(bridge, hermes) == 0
+    first = Outbox.open(bridge)
+    installation_id = first.installation_id
+    first.close()
     capsys.readouterr()
-    assert cli.main(args) == 0
-    assert "already installed" in capsys.readouterr().out
 
-
-def test_init_force_reinstalls(tmp_path: Path, capsys) -> None:
-    bridge, hermes = tmp_path / "bridge", tmp_path / "hermes"
-    args = ["init", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes)]
-    cli.main(args)
-    capsys.readouterr()
-    assert cli.main(args + ["--force"]) == 0
-    assert "hook installed:" in capsys.readouterr().out
+    assert _install(bridge, hermes) == 0  # re-install succeeds and repoints
+    again = Outbox.open(bridge)
+    assert again.installation_id == installation_id  # identity preserved
+    again.close()
+    hook_dir = hermes / "hooks" / "hermes-flight-recorder"
+    assert (hook_dir / "handler.py").exists()
 
 
 def test_run_drains_the_hook_spool(tmp_path: Path, capsys) -> None:
     bridge, hermes = tmp_path / "bridge", tmp_path / "hermes"
-    cli.main(["init", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes)])
+    _install(bridge, hermes)
     capsys.readouterr()
 
     # Simulate the gateway having spooled two events.
@@ -80,7 +84,7 @@ def test_run_drains_the_hook_spool(tmp_path: Path, capsys) -> None:
 
 def test_run_without_spool_is_clean(tmp_path: Path, capsys) -> None:
     bridge, hermes = tmp_path / "bridge", tmp_path / "hermes"
-    cli.main(["init", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes)])
+    _install(bridge, hermes)
     capsys.readouterr()
     rc = cli.main(["run", "--flight-recorder-home", str(bridge), "--hermes-home", str(hermes)])
     assert rc == 0  # no spool, missing state.db/cron: still a clean pass
