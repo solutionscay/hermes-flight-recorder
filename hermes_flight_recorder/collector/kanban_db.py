@@ -40,8 +40,8 @@ from ._common import (
     read_home_mode,
     resolve_hermes_home,
     runtime_stamp,
-    sqlite_column_or_default,
-    sqlite_table_columns,
+    sqlite_select_list,
+    sqlite_table_exists,
 )
 
 # Hermes task_events.kind -> the task-level task.* event it maps to. Kinds absent
@@ -107,35 +107,34 @@ def poll(
 def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None) -> None:
     conn = open_sqlite_read_only(db_path)
     try:
-        task_cols = sqlite_table_columns(conn, "tasks")
-        task_select = ", ".join(
-            sqlite_column_or_default(task_cols, name)
-            for name in (
-                "id",
-                "status",
-                "session_id",
-                "priority",
-                "assignee",
-                "project_id",
-                "idempotency_key",
-                "block_kind",
-                "consecutive_failures",
+        # task_events is the lifecycle log; with no such table there is nothing
+        # to emit from this board (an older or partial kanban schema).
+        if not sqlite_table_exists(conn, "task_events"):
+            return
+        tasks = {}
+        if sqlite_table_exists(conn, "tasks"):
+            task_select = sqlite_select_list(
+                conn,
+                "tasks",
+                ("id", "status", "session_id", "priority", "assignee",
+                 "project_id", "idempotency_key", "block_kind", "consecutive_failures"),
             )
+            tasks = {r["id"]: r for r in conn.execute(f"SELECT {task_select} FROM tasks")}
+        runs = {}
+        if sqlite_table_exists(conn, "task_runs"):
+            run_select = sqlite_select_list(
+                conn,
+                "task_runs",
+                ("id", "task_id", "claim_lock", "claim_expires", "worker_pid",
+                 "last_heartbeat_at", "started_at", "ended_at", "outcome", "profile",
+                 "step_key"),
+            )
+            runs = {r["id"]: r for r in conn.execute(f"SELECT {run_select} FROM task_runs")}
+        event_select = sqlite_select_list(
+            conn, "task_events", ("id", "task_id", "run_id", "kind", "created_at")
         )
-        tasks = {
-            r["id"]: r
-            for r in conn.execute(f"SELECT {task_select} FROM tasks")
-        }
-        runs = {
-            r["id"]: r
-            for r in conn.execute(
-                "SELECT id, task_id, claim_lock, claim_expires, worker_pid, "
-                "last_heartbeat_at, started_at, ended_at, outcome, profile, "
-                "step_key FROM task_runs"
-            )
-        }
         events = conn.execute(
-            "SELECT id, task_id, run_id, kind, created_at FROM task_events ORDER BY id"
+            f"SELECT {event_select} FROM task_events ORDER BY id"
         ).fetchall()
     finally:
         conn.close()

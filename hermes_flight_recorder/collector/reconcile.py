@@ -64,6 +64,7 @@ from ._common import (
     root_session,
     runtime_stamp,
     sqlite_column_or_default,
+    sqlite_select_list,
     sqlite_table_columns,
     sqlite_table_exists,
     state_db_path,
@@ -300,6 +301,8 @@ def _coverage_messages(
     if not roles:
         return
     columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if not columns:
+        return  # no messages table on this Hermes home — nothing to reconcile
     # Some narrow synthetic/legacy schemas do not expose content. In that
     # case only tool rows can be proven capture-worthy; user/assistant rows
     # need content to distinguish real text from empty tool-call scaffolding.
@@ -737,10 +740,19 @@ def _load_open_task_runs(home: Path) -> list[dict[str, Any]]:
     for board, db_path in kanban_board_dbs(home):
         conn = open_sqlite_read_only(db_path)
         try:
-            rows = conn.execute(
-                "SELECT id, task_id, claim_lock, claim_expires, worker_pid, "
-                "last_heartbeat_at, started_at FROM task_runs WHERE outcome IS NULL"
-            ).fetchall()
+            cols = sqlite_table_columns(conn, "task_runs")
+            if "outcome" not in cols:
+                rows = []  # no such table/column — nothing open to judge
+            else:
+                select = sqlite_select_list(
+                    conn,
+                    "task_runs",
+                    ("id", "task_id", "claim_lock", "claim_expires", "worker_pid",
+                     "last_heartbeat_at", "started_at"),
+                )
+                rows = conn.execute(
+                    f"SELECT {select} FROM task_runs WHERE outcome IS NULL"
+                ).fetchall()
         finally:
             conn.close()
         for r in rows:
@@ -1224,9 +1236,12 @@ def _load_execution_rows(home: Path) -> list[dict[str, Any]]:
         return []
     conn = open_sqlite_read_only(exec_path)
     try:
-        rows = conn.execute(
-            "SELECT id, job_id, status, claimed_at, finished_at FROM executions"
-        ).fetchall()
+        if not sqlite_table_exists(conn, "executions"):
+            return []
+        select = sqlite_select_list(
+            conn, "executions", ("id", "job_id", "status", "claimed_at", "finished_at")
+        )
+        rows = conn.execute(f"SELECT {select} FROM executions").fetchall()
     finally:
         conn.close()
     return [

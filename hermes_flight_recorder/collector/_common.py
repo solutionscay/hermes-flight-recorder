@@ -110,6 +110,17 @@ def sqlite_column_or_default(columns: set[str], name: str, default_sql: str = "N
     return name if name in columns else f"{default_sql} AS {name}"
 
 
+def sqlite_select_list(conn: sqlite3.Connection, table: str, names: tuple[str, ...]) -> str:
+    """A tolerant ``SELECT`` column list for ``table``.
+
+    Each name is emitted verbatim when present and ``NULL AS <name>`` when the
+    older Hermes schema lacks it, so a query keeps working (and the row keeps the
+    expected keys) across schema versions. See :func:`sqlite_column_or_default`.
+    """
+    columns = sqlite_table_columns(conn, table)
+    return ", ".join(sqlite_column_or_default(columns, name) for name in names)
+
+
 def executions_db_path(home: Path) -> Path:
     return home / "cron" / "executions.db"
 

@@ -24,6 +24,8 @@ from typing import Any
 
 from ._common import (
     occurred_before,
+    sqlite_select_list,
+    sqlite_table_exists,
     append_and_count,
     build_record,
     executions_db_path,
@@ -60,10 +62,15 @@ def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
         return
     conn = open_sqlite_read_only(db_path)
     try:
-        rows = conn.execute(
-            "SELECT id, job_id, source, pid, status, claimed_at, started_at, "
-            "finished_at, error FROM executions"
-        ).fetchall()
+        if not sqlite_table_exists(conn, "executions"):
+            return
+        select = sqlite_select_list(
+            conn,
+            "executions",
+            ("id", "job_id", "source", "pid", "status", "claimed_at",
+             "started_at", "finished_at", "error"),
+        )
+        rows = conn.execute(f"SELECT {select} FROM executions").fetchall()
     finally:
         conn.close()
 
