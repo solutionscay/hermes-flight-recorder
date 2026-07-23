@@ -40,15 +40,38 @@ from ._common import (
     root_session,
     runtime_stamp,
     safe_json_dict,
+    sqlite_column_or_default,
+    sqlite_table_columns,
+    sqlite_table_exists,
     state_db_path,
 )
 from .recorder_config import CaptureConfig
 
-_SESSION_COLS = (
-    "id, source, parent_session_id, model, message_count, tool_call_count, "
-    "input_tokens, output_tokens, estimated_cost_usd, started_at, ended_at, "
-    "end_reason, profile_name, expiry_finalized"
+_SESSION_COL_DEFAULTS = (
+    ("id", "NULL"),
+    ("source", "NULL"),
+    ("parent_session_id", "NULL"),
+    ("model", "NULL"),
+    ("message_count", "0"),
+    ("tool_call_count", "0"),
+    ("input_tokens", "0"),
+    ("output_tokens", "0"),
+    ("estimated_cost_usd", "0"),
+    ("started_at", "NULL"),
+    ("ended_at", "NULL"),
+    ("end_reason", "NULL"),
+    ("profile_name", "NULL"),
+    # Missing expiry_finalized means the Hermes schema predates that nuance;
+    # treat ended sessions as stable instead of permanently partial.
+    ("expiry_finalized", "1"),
 )
+
+
+def _session_select(columns: set[str]) -> str:
+    return ", ".join(
+        sqlite_column_or_default(columns, name, default)
+        for name, default in _SESSION_COL_DEFAULTS
+    )
 
 _USAGE_COUNTERS = (
     "api_call_count",
@@ -95,7 +118,8 @@ def poll(
 
     conn = open_sqlite_read_only(db_path)
     try:
-        sessions = conn.execute(f"SELECT {_SESSION_COLS} FROM sessions").fetchall()
+        session_cols = sqlite_table_columns(conn, "sessions")
+        sessions = conn.execute(f"SELECT {_session_select(session_cols)} FROM sessions").fetchall()
         parent_map = {r["id"]: r["parent_session_id"] for r in sessions}
         profile_of = {r["id"]: (r["profile_name"] or "default") for r in sessions}
         invocation_windows = _invocation_windows(outbox)
@@ -205,9 +229,23 @@ def _poll_messages(
     )
     if supported_roles:
         placeholders = ",".join("?" for _ in supported_roles)
+        columns = sqlite_table_columns(conn, "messages")
+        select_cols = ", ".join(
+            sqlite_column_or_default(columns, name)
+            for name in (
+                "id",
+                "session_id",
+                "role",
+                "tool_name",
+                "tool_call_id",
+                "effect_disposition",
+                "content",
+                "timestamp",
+                "finish_reason",
+            )
+        )
         rows = conn.execute(
-            "SELECT id, session_id, role, tool_name, tool_call_id, "
-            "effect_disposition, content, timestamp, finish_reason FROM messages "
+            f"SELECT {select_cols} FROM messages "
             f"WHERE id > ? AND role IN ({placeholders}) ORDER BY id",
             (cursor, *supported_roles),
         ).fetchall()
@@ -318,10 +356,27 @@ def _poll_messages(
 def _poll_model_usage(
     outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
 ) -> None:
+    if not sqlite_table_exists(conn, "session_model_usage"):
+        return
+    columns = sqlite_table_columns(conn, "session_model_usage")
+    select_cols = ", ".join(
+        sqlite_column_or_default(columns, name, default)
+        for name, default in (
+            ("session_id", "NULL"),
+            ("model", "NULL"),
+            ("task", "NULL"),
+            ("api_call_count", "0"),
+            ("input_tokens", "0"),
+            ("output_tokens", "0"),
+            ("cache_read_tokens", "0"),
+            ("reasoning_tokens", "0"),
+            ("estimated_cost_usd", "0"),
+            ("cost_status", "NULL"),
+            ("last_seen", "0"),
+        )
+    )
     rows = conn.execute(
-        "SELECT session_id, model, task, api_call_count, input_tokens, output_tokens, "
-        "cache_read_tokens, reasoning_tokens, estimated_cost_usd, cost_status, last_seen "
-        "FROM session_model_usage"
+        f"SELECT {select_cols} FROM session_model_usage"
     ).fetchall()
     identities = [
         (str(row["session_id"]), str(row["model"] or ""), str(row["task"] or ""))
@@ -394,6 +449,8 @@ def _poll_model_usage(
 def _poll_delegations(
     outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
 ) -> None:
+    if not sqlite_table_exists(conn, "async_delegations"):
+        return
     rows = conn.execute(
         "SELECT delegation_id, origin_session, parent_session_id, state, delivery_state, "
         "owner_pid, dispatched_at, event_json, result_json FROM async_delegations"

@@ -297,3 +297,12 @@ def test_no_kanban_is_tolerated(tmp_path):
     hh.mkdir()  # no kanban.db, no boards dir
     ob = new_outbox(tmp_path)
     assert kanban_db.poll(ob, hh) == {}  # nothing to poll, no crash
+
+
+def test_non_sqlite_legacy_kanban_file_is_ignored(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    (hh / "kanban.db").write_bytes(b"not a sqlite database")
+    ob = new_outbox(tmp_path)
+
+    assert kanban_db.poll(ob, hh) == {}

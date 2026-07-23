@@ -39,6 +39,8 @@ from ._common import (
     read_home_mode,
     resolve_hermes_home,
     runtime_stamp,
+    sqlite_column_or_default,
+    sqlite_table_columns,
 )
 
 # Hermes task_events.kind -> the task-level task.* event it maps to. Kinds absent
@@ -98,12 +100,24 @@ def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
 def _poll_board(outbox, board: str, db_path: Path, counts, home_mode) -> None:
     conn = open_sqlite_read_only(db_path)
     try:
+        task_cols = sqlite_table_columns(conn, "tasks")
+        task_select = ", ".join(
+            sqlite_column_or_default(task_cols, name)
+            for name in (
+                "id",
+                "status",
+                "session_id",
+                "priority",
+                "assignee",
+                "project_id",
+                "idempotency_key",
+                "block_kind",
+                "consecutive_failures",
+            )
+        )
         tasks = {
             r["id"]: r
-            for r in conn.execute(
-                "SELECT id, status, session_id, priority, assignee, project_id, "
-                "idempotency_key, block_kind, consecutive_failures FROM tasks"
-            )
+            for r in conn.execute(f"SELECT {task_select} FROM tasks")
         }
         runs = {
             r["id"]: r

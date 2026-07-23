@@ -223,6 +223,38 @@ def test_adapter_never_writes_state_db(tmp_path):
     assert (hh / "state.db").read_bytes() == before  # byte-for-byte unchanged
 
 
+def test_current_legacy_state_schema_is_tolerated(tmp_path):
+    """Older Hermes homes can lack newer telemetry columns/tables."""
+    hh = tmp_path / "hermes"; hh.mkdir()
+    db = sqlite3.connect(hh / "state.db")
+    db.executescript(
+        """
+        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
+            message_count INT, tool_call_count INT, input_tokens INT, output_tokens INT,
+            estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT);
+        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
+            content TEXT, tool_call_id TEXT, tool_name TEXT, timestamp REAL, finish_reason TEXT);
+        """
+    )
+    db.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("P", "discord", None, "m", 1, 1, 2, 3, 0.0, 1000.0, None, None),
+    )
+    db.execute(
+        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
+        (1, "P", "tool", '{"exit_code":0}', None, "terminal", 1001.0, None),
+    )
+    db.commit(); db.close()
+    ob = new_outbox(tmp_path)
+
+    counts = state_db.poll(ob, hh)
+
+    assert counts["session.created"] == 1
+    assert counts["tool.call_completed"] == 1
+    created = next(e for e in ob.iter_events() if e["payload"]["event_type"] == "session.created")
+    assert created["profile"] == "default"
+
+
 # --- cron ---------------------------------------------------------------
 def test_cron_poll_event_mapping(tmp_path):
     hh = tmp_path / "hermes"; hh.mkdir()

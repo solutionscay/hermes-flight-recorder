@@ -74,6 +74,31 @@ def state_db_path(home: Path) -> Path:
     return home / "state.db"
 
 
+def sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Return whether ``table`` exists in a SQLite database."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
+
+
+def sqlite_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Column names for ``table``; empty for missing tables."""
+    quoted_table = '"' + table.replace('"', '""') + '"'
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({quoted_table})")}
+
+
+def sqlite_column_or_default(columns: set[str], name: str, default_sql: str = "NULL") -> str:
+    """Build a SELECT expression that tolerates older Hermes schemas.
+
+    Flight Recorder follows Hermes' local SQLite stores, which change over
+    time. Older homes can lack columns that newer probes know how to capture;
+    selecting a typed default keeps capture/reconcile alive while preserving
+    the richer fields when present.
+    """
+    return name if name in columns else f"{default_sql} AS {name}"
+
+
 def executions_db_path(home: Path) -> Path:
     return home / "cron" / "executions.db"
 
@@ -103,6 +128,15 @@ def kanban_db_path(home: Path) -> Path:
     return home / "kanban.db"
 
 
+def is_sqlite_database(path: Path) -> bool:
+    """Cheap SQLite file check for optional Hermes sidecar stores."""
+    try:
+        with path.open("rb") as fh:
+            return fh.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
 def kanban_boards_dir(home: Path) -> Path:
     return home / "kanban" / "boards"
 
@@ -117,13 +151,13 @@ def kanban_board_dbs(home: Path) -> list[tuple[str, Path]]:
     """
     boards: list[tuple[str, Path]] = []
     legacy = kanban_db_path(home)
-    if legacy.exists():
+    if legacy.exists() and is_sqlite_database(legacy):
         boards.append(("default", legacy))
     board_dir = kanban_boards_dir(home)
     if board_dir.is_dir():
         for child in sorted(board_dir.iterdir()):
             db = child / "kanban.db"
-            if child.is_dir() and db.exists():
+            if child.is_dir() and db.exists() and is_sqlite_database(db):
                 boards.append((child.name, db))
     return boards
 

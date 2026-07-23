@@ -62,6 +62,9 @@ from ._common import (
     resolve_hermes_home,
     root_session,
     runtime_stamp,
+    sqlite_column_or_default,
+    sqlite_table_columns,
+    sqlite_table_exists,
     state_db_path,
     ticker_heartbeat_path,
     to_epoch,
@@ -195,9 +198,20 @@ def _detect_coverage_gaps(
     if state_path.exists():
         conn = open_sqlite_read_only(state_path)
         try:
+            session_cols = sqlite_table_columns(conn, "sessions")
+            session_select = ", ".join(
+                sqlite_column_or_default(session_cols, name)
+                for name in (
+                    "id",
+                    "source",
+                    "parent_session_id",
+                    "started_at",
+                    "ended_at",
+                    "profile_name",
+                )
+            )
             session_rows = conn.execute(
-                "SELECT id, source, parent_session_id, started_at, ended_at, "
-                "profile_name FROM sessions"
+                f"SELECT {session_select} FROM sessions"
             ).fetchall()
             parent_map = {r["id"]: r["parent_session_id"] for r in session_rows}
             _coverage_sessions(
@@ -297,6 +311,8 @@ def _coverage_messages(
 def _coverage_model_usage(
     outbox, conn, parent_map, captured, counts, when, config
 ) -> None:
+    if not sqlite_table_exists(conn, "session_model_usage"):
+        return
     rows = conn.execute(
         "SELECT session_id, model, task FROM session_model_usage"
     ).fetchall()

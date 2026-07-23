@@ -324,6 +324,27 @@ def test_captured_model_usage_does_not_surface(tmp_path):
     assert coverage_gaps(ob, "model_usage") == []
 
 
+def test_missing_model_usage_table_is_tolerated(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    db = sqlite3.connect(hh / "state.db")
+    db.executescript(
+        """
+        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
+            started_at REAL, ended_at REAL);
+        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
+            content TEXT);
+        """
+    )
+    db.execute("INSERT INTO sessions VALUES ('P','cli',NULL,?,NULL)", (B,))
+    db.commit(); db.close()
+    ob = new_outbox(tmp_path)
+
+    reconcile(ob, hh, now=B, config=CFG)
+
+    assert coverage_gaps(ob, "model_usage") == []
+
+
 # --- execution coverage ------------------------------------------------------
 def test_uncaptured_execution_surfaces_once_as_coverage_gap(tmp_path):
     hh = tmp_path / "hermes"
