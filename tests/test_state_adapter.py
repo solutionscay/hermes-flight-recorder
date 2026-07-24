@@ -136,6 +136,106 @@ def test_open_parent_session_has_no_terminal(tmp_path):
     assert types(ob)["session.ended"] == 0
 
 
+def test_finalized_terminals_preserve_cumulative_usage_and_cost_status(tmp_path):
+    hh = tmp_path / "hermes"; hh.mkdir()
+    make_state_db(hh)
+    db = sqlite3.connect(hh / "state.db")
+    for definition in (
+        "api_call_count INT",
+        "cache_read_tokens INT",
+        "cache_write_tokens INT",
+        "reasoning_tokens INT",
+        "actual_cost_usd REAL",
+        "cost_status TEXT",
+        "cost_source TEXT",
+    ):
+        db.execute(f"ALTER TABLE sessions ADD COLUMN {definition}")
+    db.execute(
+        """
+        UPDATE sessions SET
+            ended_at=1020.0, end_reason='done', expiry_finalized=1,
+            api_call_count=17, input_tokens=259219, output_tokens=15456,
+            cache_read_tokens=1667584, cache_write_tokens=0,
+            reasoning_tokens=3371, estimated_cost_usd=0.0,
+            actual_cost_usd=0.0, cost_status='included', cost_source='none'
+        WHERE id='P'
+        """
+    )
+    db.execute(
+        """
+        UPDATE sessions SET
+            expiry_finalized=1, api_call_count=3,
+            cache_read_tokens=4000, cache_write_tokens=25,
+            reasoning_tokens=42, estimated_cost_usd=0.0125,
+            actual_cost_usd=NULL, cost_status='estimated', cost_source='catalog'
+        WHERE id='C'
+        """
+    )
+    db.commit(); db.close()
+    ob = new_outbox(tmp_path)
+
+    state_db.poll(ob, hh)
+
+    by = {(e["payload"]["event_type"], e.get("session_id")): e for e in ob.iter_events()}
+    root = by[("session.ended", "P")]
+    assert root["partial"] is False
+    assert root["payload"] == {
+        "kind": "cli",
+        "end_reason": "done",
+        "message_count": 8,
+        "tool_call_count": 2,
+        "usage_semantics": "cumulative_total",
+        "api_call_count": 17,
+        "input_tokens": 259219,
+        "output_tokens": 15456,
+        "cache_read_tokens": 1667584,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 3371,
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+        "cost_status": "included",
+        "cost_source": "none",
+        "event_type": "session.ended",
+    }
+
+    child = by[("subagent.completed", "C")]
+    assert child["partial"] is False
+    assert child["payload"]["usage_semantics"] == "cumulative_total"
+    assert child["payload"]["api_call_count"] == 3
+    assert child["payload"]["cache_write_tokens"] == 25
+    assert child["payload"]["reasoning_tokens"] == 42
+    assert child["payload"]["estimated_cost_usd"] == 0.0125
+    assert child["payload"]["cost_status"] == "estimated"
+    assert child["payload"]["cost_source"] == "catalog"
+    assert "actual_cost_usd" not in child["payload"]
+
+
+def test_partial_durable_terminal_does_not_claim_final_usage(tmp_path):
+    hh = tmp_path / "hermes"; hh.mkdir()
+    make_state_db(hh)
+    db = sqlite3.connect(hh / "state.db")
+    db.execute("UPDATE sessions SET expiry_finalized=0 WHERE id='C'")
+    db.commit(); db.close()
+    ob = new_outbox(tmp_path)
+
+    state_db.poll(ob, hh)
+
+    terminal = next(
+        e
+        for e in ob.iter_events()
+        if e["payload"]["event_type"] == "subagent.completed"
+    )
+    assert terminal["partial"] is True
+    for field in (
+        "usage_semantics",
+        "input_tokens",
+        "output_tokens",
+        "estimated_cost_usd",
+        "cost_status",
+    ):
+        assert field not in terminal["payload"]
+
+
 def test_correlation_groups_child_under_parent(tmp_path):
     hh = tmp_path / "hermes"; hh.mkdir()
     make_state_db(hh)
@@ -238,7 +338,7 @@ def test_current_legacy_state_schema_is_tolerated(tmp_path):
     )
     db.execute(
         "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("P", "discord", None, "m", 1, 1, 2, 3, 0.0, 1000.0, None, None),
+        ("P", "discord", None, "m", 1, 1, 2, 3, 0.0, 1000.0, 1002.0, "done"),
     )
     db.execute(
         "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)",
@@ -250,9 +350,61 @@ def test_current_legacy_state_schema_is_tolerated(tmp_path):
     counts = state_db.poll(ob, hh)
 
     assert counts["session.created"] == 1
+    assert counts["session.ended"] == 1
     assert counts["tool.call_completed"] == 1
     created = next(e for e in ob.iter_events() if e["payload"]["event_type"] == "session.created")
     assert created["profile"] == "default"
+    ended = next(e for e in ob.iter_events() if e["payload"]["event_type"] == "session.ended")
+    assert ended["payload"]["usage_semantics"] == "cumulative_total"
+    assert ended["payload"]["input_tokens"] == 2
+    assert ended["payload"]["output_tokens"] == 3
+    assert ended["payload"]["estimated_cost_usd"] == 0.0
+    for field in (
+        "api_call_count",
+        "actual_cost_usd",
+        "cost_status",
+        "cost_source",
+    ):
+        assert field not in ended["payload"]
+
+
+def test_legacy_terminal_without_cost_column_does_not_manufacture_zero(tmp_path):
+    hh = tmp_path / "hermes"; hh.mkdir()
+    db = sqlite3.connect(hh / "state.db")
+    db.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
+            message_count INT, tool_call_count INT,
+            started_at REAL, ended_at REAL, end_reason TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
+            content TEXT, tool_call_id TEXT, tool_name TEXT,
+            timestamp REAL, finish_reason TEXT
+        );
+        """
+    )
+    db.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)",
+        ("P", "cli", None, "m", 1, 0, 1000.0, 1002.0, "done"),
+    )
+    db.commit(); db.close()
+    ob = new_outbox(tmp_path)
+
+    state_db.poll(ob, hh)
+
+    ended = next(e for e in ob.iter_events() if e["payload"]["event_type"] == "session.ended")
+    assert ended["payload"]["usage_semantics"] == "cumulative_total"
+    for field in (
+        "input_tokens",
+        "output_tokens",
+        "estimated_cost_usd",
+        "actual_cost_usd",
+        "cost_status",
+        "cost_source",
+    ):
+        assert field not in ended["payload"]
 
 
 # --- cron ---------------------------------------------------------------

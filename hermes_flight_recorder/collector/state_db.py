@@ -55,9 +55,18 @@ _SESSION_COL_DEFAULTS = (
     ("model", "NULL"),
     ("message_count", "0"),
     ("tool_call_count", "0"),
-    ("input_tokens", "0"),
-    ("output_tokens", "0"),
-    ("estimated_cost_usd", "0"),
+    # Usage and cost fields use NULL fallbacks deliberately.  A missing
+    # legacy-schema column means "unknown", not a measured zero.
+    ("api_call_count", "NULL"),
+    ("input_tokens", "NULL"),
+    ("output_tokens", "NULL"),
+    ("cache_read_tokens", "NULL"),
+    ("cache_write_tokens", "NULL"),
+    ("reasoning_tokens", "NULL"),
+    ("estimated_cost_usd", "NULL"),
+    ("actual_cost_usd", "NULL"),
+    ("cost_status", "NULL"),
+    ("cost_source", "NULL"),
     ("started_at", "NULL"),
     ("ended_at", "NULL"),
     ("end_reason", "NULL"),
@@ -65,6 +74,19 @@ _SESSION_COL_DEFAULTS = (
     # Missing expiry_finalized means the Hermes schema predates that nuance;
     # treat ended sessions as stable instead of permanently partial.
     ("expiry_finalized", "1"),
+)
+
+_TERMINAL_USAGE_FIELDS = (
+    "api_call_count",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "estimated_cost_usd",
+    "actual_cost_usd",
+    "cost_status",
+    "cost_source",
 )
 
 
@@ -198,6 +220,25 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since=None) 
 
         # end_reason is not stable until expiry_finalized flips from 0.
         partial = r["expiry_finalized"] == 0
+        payload = {
+            "kind": kind,
+            "end_reason": r["end_reason"],
+            "message_count": r["message_count"],
+            "tool_call_count": r["tool_call_count"],
+        }
+        if not partial:
+            # These are the authoritative totals on a finalized durable
+            # session row.  Omit unavailable/NULL values so consumers can
+            # distinguish unknown cost from an explicit zero.
+            payload["usage_semantics"] = "cumulative_total"
+            payload.update(
+                {
+                    field: r[field]
+                    for field in _TERMINAL_USAGE_FIELDS
+                    if r[field] is not None
+                }
+            )
+
         record = build_record(
             event_type=ended,
             occurred_at=r["ended_at"],
@@ -209,15 +250,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since=None) 
             parent_session_id=r["parent_session_id"],
             profile=profile,
             partial=partial,
-            payload={
-                "kind": kind,
-                "end_reason": r["end_reason"],
-                "message_count": r["message_count"],
-                "tool_call_count": r["tool_call_count"],
-                "input_tokens": r["input_tokens"],
-                "output_tokens": r["output_tokens"],
-                "estimated_cost_usd": r["estimated_cost_usd"],
-            },
+            payload=payload,
         )
         append_and_count(outbox, counts, record, dedup_key=f"state.db:{ended}:{sid}")
 
