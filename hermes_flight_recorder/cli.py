@@ -15,7 +15,7 @@ import argparse
 import sys
 import time
 
-from . import __version__
+from .version import build_identity
 
 # Exit codes for `sync`, so a cron or a monitor can tell the cases apart.
 _SYNC_OK = 0
@@ -122,6 +122,26 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
         )
     except UninstallError as exc:
         print(f"uninstall failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    from .collector.update import UpdateError, complete_update, update
+
+    try:
+        if args.complete:
+            complete_update(args.flight_recorder_home, args.hermes_home)
+        else:
+            update(
+                args.flight_recorder_home,
+                args.hermes_home,
+                source=args.source,
+                ref=args.ref,
+                editable=args.editable,
+            )
+    except UpdateError as exc:
+        print(f"update failed: {exc}", file=sys.stderr)
         return 2
     return 0
 
@@ -343,6 +363,30 @@ def _cmd_status(args: argparse.Namespace) -> int:
             return 2
 
         print(f"installation:    {outbox.installation_id}")
+        healthy = True
+        package_build = build_identity()
+        print(f"package build:   {package_build}")
+        installed_build = outbox.get_meta("installed_build")
+        if installed_build is not None:
+            from .collector._common import resolve_hermes_home
+            from .collector.hook import (
+                HOOK_DIR_NAME,
+                baked_flight_recorder_build,
+            )
+
+            hook_dir = (
+                resolve_hermes_home(args.hermes_home) / "hooks" / HOOK_DIR_NAME
+            )
+            hook_build = baked_flight_recorder_build(hook_dir)
+            if installed_build == package_build == hook_build:
+                print(f"hook build:      OK — {hook_build}")
+            else:
+                healthy = False
+                print(
+                    "hook build:      MISMATCH — "
+                    f"installed {installed_build!r}, package {package_build!r}, "
+                    f"hook {hook_build!r}"
+                )
 
         high_water = outbox.high_water()
         cursor = delivery_cursor(outbox)
@@ -353,7 +397,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
         )
 
         raw = outbox.get_meta(CAPTURE_HEARTBEAT_KEY)
-        healthy = True
         if raw is None:
             print("capture:         NO SUCCESS RECORDED (capture has never run)")
             healthy = False
@@ -591,7 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"hermes-flight-recorder {__version__}",
+        version=f"hermes-flight-recorder {build_identity()}",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -618,6 +661,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also delete the recorder home (outbox, key, config). Irreversible.",
     )
     p_uninstall.set_defaults(func=_cmd_uninstall)
+
+    p_update = sub.add_parser(
+        "update",
+        help="Back up and update an installed Flight Recorder from Git or a local checkout.",
+        parents=[_home_options()],
+    )
+    p_update.add_argument(
+        "--source",
+        default="git+https://github.com/solutionscay/hermes-flight-recorder.git",
+        help="Git URL or local checkout to install (default: the public repository).",
+    )
+    p_update.add_argument(
+        "--ref",
+        default=None,
+        help="Git branch, tag, or commit to install from a git+ source.",
+    )
+    p_update.add_argument(
+        "--editable",
+        action="store_true",
+        help="Install a local --source as editable for development testing.",
+    )
+    p_update.add_argument(
+        "--complete",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p_update.set_defaults(func=_cmd_update)
 
     p_serve = sub.add_parser(
         "serve",

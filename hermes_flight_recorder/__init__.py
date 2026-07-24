@@ -8,4 +8,6 @@ the event stream is gap-detectable.
 See the collector subpackage for the capture/reconcile components.
 """
 
-__version__ = "0.0.0"
+# Keep this literal dependency-free: importing ``hermes_flight_recorder.envelope``
+# must not pull version/source inspection or collector modules into SDK consumers.
+__version__ = "0.1.0.dev0"

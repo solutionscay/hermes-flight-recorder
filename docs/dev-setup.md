@@ -54,6 +54,27 @@ uv venv --python 3.11
 uv pip install -e .
 ```
 
+The package reports a release version plus the source revision:
+
+```bash
+hermes-flight-recorder --version
+```
+
+To refresh an existing test installation from this checkout, first stop its
+`serve` process, then run:
+
+```bash
+hermes-flight-recorder update \
+  --hermes-home "$HERMES_HOME" \
+  --source "$PWD" \
+  --editable
+```
+
+The updater creates an SQLite-safe recovery snapshot, reinstalls the checkout,
+runs registered schema migrations in a new process, refreshes the hook, and
+verifies that the package and hook build identities match. Restart the Hermes
+gateway after each update so it loads the new hook.
+
 ## 3. Point Hermes Flight Recorder at the dev Hermes
 
 Hermes Flight Recorder reads the Hermes home the same way Hermes does — from
