@@ -27,7 +27,13 @@ from ._common import (
     resolve_flight_recorder_home,
     resolve_hermes_home,
 )
-from .hook import HOOK_DIR_NAME, baked_flight_recorder_home, install_hook
+from ..version import build_identity
+from .hook import (
+    HOOK_DIR_NAME,
+    baked_flight_recorder_build,
+    baked_flight_recorder_home,
+    install_hook,
+)
 from .outbox import Outbox, OutboxError
 from .runtime_lock import LOCK_FILENAME, RuntimeLock, RuntimeLockError
 
@@ -95,33 +101,51 @@ def install(
     if using_default:
         _stop_if_legacy_present(fr_home, log=log)
 
-    # Outbox.open creates fr_home (mode 0700) and mints identity + key.
-    outbox = Outbox.open(fr_home, hermes_home=hermes_home)
+    fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime_lock = RuntimeLock(fr_home / LOCK_FILENAME)
     try:
-        installation_id = outbox.initialize()
-        # Stamp the reconcile horizon once, so the reconciler never judges
-        # Hermes history that predates this installation (see reconcile).
-        if outbox.get_meta(INSTALLED_AT_META_KEY) is None:
-            outbox.set_meta(INSTALLED_AT_META_KEY, repr(time.time()))
-        # Record the backfill choice so capture honors it on every pass. Only
-        # written when disabled, so a re-install never silently flips it on.
-        if not backfill:
-            outbox.set_meta(CAPTURE_BACKFILL_META_KEY, "false")
+        runtime_lock.acquire()
+    except RuntimeLockError:
+        raise InstallError(
+            f"a Flight Recorder process is running against {fr_home}; "
+            "stop `serve` before installing or refreshing the hook"
+        ) from None
+
+    try:
+        # Outbox.open mints the identity/key and applies registered migrations.
+        outbox = Outbox.open(fr_home, hermes_home=hermes_home)
+        try:
+            installation_id = outbox.initialize()
+            # Stamp the reconcile horizon once, so the reconciler never judges
+            # Hermes history that predates this installation (see reconcile).
+            if outbox.get_meta(INSTALLED_AT_META_KEY) is None:
+                outbox.set_meta(INSTALLED_AT_META_KEY, repr(time.time()))
+            # Record the backfill choice so capture honors it on every pass. Only
+            # written when disabled, so a re-install never silently flips it on.
+            if not backfill:
+                outbox.set_meta(CAPTURE_BACKFILL_META_KEY, "false")
+            from .update import write_installed_version
+
+            version = write_installed_version(fr_home)
+            outbox.set_meta("installed_build", version.build)
+        finally:
+            outbox.close()
+        log(f"flight recorder home: {fr_home}")
+        log(f"installation id:      {installation_id}")
+        log(f"installed build:      {version.build}")
+
+        _write_default_config(fr_home, log=log)
+
+        hook_dir = install_hook(hermes, fr_home, force=True, build=version.build)
+        log(f"hook installed:       {hook_dir}")
+
+        _verify(fr_home, hook_dir)
+        log("verified outbox, encryption key, config, and hook.")
+        log("restart the Hermes gateway to load the hook, then run "
+            "`hermes-flight-recorder serve`.")
+        return fr_home
     finally:
-        outbox.close()
-    log(f"flight recorder home: {fr_home}")
-    log(f"installation id:      {installation_id}")
-
-    _write_default_config(fr_home, log=log)
-
-    hook_dir = install_hook(hermes, fr_home, force=True)
-    log(f"hook installed:       {hook_dir}")
-
-    _verify(fr_home, hook_dir)
-    log("verified outbox, encryption key, config, and hook.")
-    log("restart the Hermes gateway to load the hook, then run "
-        "`hermes-flight-recorder serve`.")
-    return fr_home
+        runtime_lock.release()
 
 
 def _stop_if_legacy_present(fr_home: Path, *, log) -> None:
@@ -176,6 +200,13 @@ def _verify(fr_home: Path, hook_dir: Path) -> None:
     if baked is None or Path(baked).resolve() != fr_home.resolve():
         raise InstallError(
             f"hook targets {baked!r}, expected {fr_home.resolve()}"
+        )
+    hook_build = baked_flight_recorder_build(hook_dir)
+    package_build = build_identity()
+    if hook_build != package_build:
+        raise InstallError(
+            f"hook build {hook_build!r} does not match package build "
+            f"{package_build!r}; rerun `hermes-flight-recorder install`"
         )
 
 

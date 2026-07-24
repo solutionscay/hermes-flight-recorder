@@ -60,6 +60,9 @@ __all__ = [
 
 OUTBOX_SCHEMA_VERSION = "1"
 _KEY_VERSION = "aesgcm256:dev"
+# ``old_version: (new_version, method_name)``. Each method runs inside the
+# transaction that also advances the durable schema version.
+_MIGRATIONS: dict[str, tuple[str, str]] = {}
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -180,6 +183,7 @@ class Outbox:
         self._content_key: bytes | None = None
         self._aead: AESGCM | None = None
         self._installation_id: str | None = None
+        self._apply_migrations()
 
     # --- construction ---------------------------------------------------
     @classmethod
@@ -218,8 +222,35 @@ class Outbox:
             "INSERT OR IGNORE INTO meta(key, value) VALUES('outbox_schema_version', ?)",
             (OUTBOX_SCHEMA_VERSION,),
         )
+        self._apply_migrations()
         self._ensure_content_key()
         return self.installation_id
+
+    def _apply_migrations(self) -> None:
+        """Apply registered schema migrations transactionally and in order."""
+        version = self.get_meta("outbox_schema_version")
+        if version is None:
+            return
+        while version != OUTBOX_SCHEMA_VERSION:
+            migration = _MIGRATIONS.get(version)
+            if migration is None:
+                raise OutboxError(
+                    f"unsupported outbox schema version {version!r}; "
+                    f"this build supports {OUTBOX_SCHEMA_VERSION!r}"
+                )
+            next_version, method_name = migration
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                getattr(self, method_name)()
+                self._conn.execute(
+                    "UPDATE meta SET value=? WHERE key='outbox_schema_version'",
+                    (next_version,),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            version = next_version
 
     # --- identity -------------------------------------------------------
     @property

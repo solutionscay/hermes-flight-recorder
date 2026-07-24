@@ -176,11 +176,79 @@ To read the captured log with no network, use `observe`:
 hermes-flight-recorder observe --hermes-home "<HERMES_HOME>" --tree
 ```
 
+## 4. How to update
+
+Stop the `serve` process through the service manager that runs it. The updater
+does not stop or restart systemd, launchd, a Windows service, or the Hermes
+gateway.
+
+Update to the default branch of the public repository:
+
+```bash
+hermes-flight-recorder update --hermes-home "<HERMES_HOME>"
+```
+
+To test a branch, tag, or commit before release, select it explicitly:
+
+```bash
+hermes-flight-recorder update \
+  --hermes-home "<HERMES_HOME>" \
+  --ref "<BRANCH_TAG_OR_COMMIT>"
+```
+
+To test the current contents of a local checkout, including uncommitted changes,
+install it as editable:
+
+```bash
+hermes-flight-recorder update \
+  --hermes-home "<HERMES_HOME>" \
+  --source "/path/to/hermes-flight-recorder" \
+  --editable
+```
+
+The command refuses to run while `serve` holds the recorder runtime lock. Before
+it changes the package, it creates a recovery snapshot under
+`<HERMES_HOME>/flight-recorder/update-backups/`. The snapshot contains a
+consistent SQLite backup, the encryption key, recorder and sync configuration,
+the installed-version record, and the old hook.
+
+After pip installs the selected source, a new Python process applies registered
+outbox migrations, regenerates the hook, records the exact package build, and
+verifies the installation. The installation id, key, events, delivery state,
+capture cursors, and configuration remain in place unless a documented schema
+migration deliberately changes an identity.
+
+Restart the Hermes gateway so it loads the refreshed hook. Then restart the
+recorder service and verify:
+
+```bash
+hermes-flight-recorder --version
+hermes-flight-recorder status --hermes-home "<HERMES_HOME>"
+```
+
+`status` reports a mismatch when the package, installation stamp, and hook were
+not built from the same revision.
+
+### Update failure and rollback
+
+Keep the recorder and Hermes gateway stopped after a failed update. The command
+leaves `pending-update.json` in the recorder home and prints the recovery
+snapshot path. Inspect that file before recovery.
+
+To retry completion after fixing the package installation, run the same
+`update` command again. To roll back, reinstall the previous revision recorded
+in the snapshot metadata and restore the snapshot while all recorder processes
+are stopped. Restore `outbox.sqlite` together with its matching key and
+configuration; do not mix files from different snapshots. Then rerun
+`hermes-flight-recorder install --hermes-home "<HERMES_HOME>"` to regenerate
+and verify the hook before restarting services.
+
 ## Command summary
 
 | Command | Purpose |
 |---------|---------|
 | `install` | Set up the recorder home, identity, key, config, and hook. |
+| `update` | Back up and update the package, schema, installation stamp, and hook. |
 | `uninstall` | Remove the hook; add `--purge-data` to also delete the recorder home. |
 | `serve` | Run capture, reconcile, and optional sync in one process. |
 | `configure-sync` | Write the cloud endpoint and the Cloudflare Access token. |
