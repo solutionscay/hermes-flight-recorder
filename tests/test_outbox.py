@@ -12,6 +12,10 @@ from hermes_flight_recorder.collector.outbox import (
     OutboxError,
     default_flight_recorder_home,
 )
+from hermes_flight_recorder.collector.sync import (
+    MAX_INGEST_BATCH_BYTES,
+    singleton_batch_size,
+)
 from hermes_flight_recorder.envelope import EnvelopeValidationError, validate
 
 
@@ -186,6 +190,99 @@ def test_no_content_leaves_content_fields_absent(tmp_path):
     rec = ob.append(base_record())
     for f in ("content_ciphertext", "content_nonce", "content_hash", "key_version"):
         assert f not in rec
+    ob.close()
+
+
+def test_large_content_that_still_fits_hard_limit_remains_inline(tmp_path):
+    ob = open_outbox(tmp_path)
+    content = b"x" * 3_000_000
+
+    record = ob.append(base_record("tool.call_completed"), content=content)
+
+    assert record["content_ciphertext"]
+    assert "content_storage" not in record["payload"]
+    assert singleton_batch_size(record) <= MAX_INGEST_BATCH_BYTES
+    assert ob.decrypt_content(record) == content
+    assert ob.count() == 1
+    ob.close()
+
+
+def test_oversized_content_is_chunked_atomically_and_restores(tmp_path):
+    ob = open_outbox(tmp_path)
+    content = b"x" * 3_200_000
+
+    parent = ob.append(
+        base_record("knowledge.record_written"),
+        content=content,
+        dedup_key="knowledge:large:v1",
+    )
+
+    events = list(ob.iter_events())
+    chunks = [
+        event
+        for event in events
+        if event["payload"]["event_type"] == "runtime.content_chunk_recorded"
+    ]
+    assert len(chunks) == 2
+    assert [chunk["payload"]["chunk_index"] for chunk in chunks] == [0, 1]
+    assert parent["producer_sequence"] == 3
+    assert parent["payload"]["content_storage"] == "chunked"
+    assert parent["payload"]["content_ref"] == parent["event_id"]
+    assert parent["payload"]["content_chunk_count"] == 2
+    assert "content_ciphertext" not in parent
+    assert ob.decrypt_content(parent) == content
+    assert all(
+        singleton_batch_size(event) <= MAX_INGEST_BATCH_BYTES
+        for event in events
+    )
+
+    duplicate = ob.append(
+        base_record("knowledge.record_written"),
+        content=content,
+        dedup_key="knowledge:large:v1",
+    )
+    assert duplicate["event_id"] == parent["event_id"]
+    assert ob.high_water() == 3
+    assert ob.count() == 3
+    ob.close()
+
+
+def test_metadata_larger_than_hard_limit_is_rejected_without_sequence(tmp_path):
+    ob = open_outbox(tmp_path)
+    record = base_record()
+    record["payload"]["unbounded"] = "x" * MAX_INGEST_BATCH_BYTES
+
+    with pytest.raises(OutboxError, match="metadata exceeds"):
+        ob.append(record)
+
+    assert ob.high_water() == 0
+    assert ob.count() == 0
+    ob.close()
+
+
+def test_chunk_append_failure_rolls_back_the_complete_chunk_set(tmp_path, monkeypatch):
+    ob = open_outbox(tmp_path)
+    original_insert = ob._insert_event
+    insert_count = 0
+
+    def fail_after_first_insert(record, *, dedup_key):
+        nonlocal insert_count
+        original_insert(record, dedup_key=dedup_key)
+        insert_count += 1
+        if insert_count == 1:
+            raise RuntimeError("simulated stop during chunk append")
+
+    monkeypatch.setattr(ob, "_insert_event", fail_after_first_insert)
+
+    with pytest.raises(RuntimeError, match="simulated stop"):
+        ob.append(
+            base_record("knowledge.record_written"),
+            content=b"x" * 3_200_000,
+            dedup_key="knowledge:interrupted:v1",
+        )
+
+    assert ob.high_water() == 0
+    assert ob.count() == 0
     ob.close()
 
 

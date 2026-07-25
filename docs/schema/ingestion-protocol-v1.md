@@ -55,6 +55,14 @@ larger set becomes more than one batch, each a contiguous `producer_sequence`
 range. A single indivisible record that exceeds the byte target is sent alone.
 The target must not block that record and every later sequence.
 
+The hard request-body limit is 4 MiB (4,194,304 bytes), measured using the
+exact UTF-8 JSON body sent on the wire. The configurable byte target must not
+exceed that ceiling, and no emitted batch may exceed it. Before append, the
+outbox converts content that would make a singleton request exceed the hard
+limit into the envelope v1 chunked-content representation. A non-content
+record whose plaintext metadata alone exceeds the hard limit is invalid and
+must be rejected before it consumes a producer sequence.
+
 ## Response
 
 **`202 Accepted`** — the batch was ingested (fully or in part; a duplicate is
@@ -82,6 +90,11 @@ Always `accepted + duplicates == records.length` on a 202.
 |---|---|
 | `bad_request` | `records` is absent, is not an array, is empty, or mixes `installation_id` values. |
 | `bad_record` | A record has no `event_id` or a non-numeric `producer_sequence`. |
+
+The server also returns `bad_request` when the complete request body exceeds
+4 MiB. A conforming current client prevents this locally. A legacy outbox that
+already contains an oversized indivisible record stops with an explicit
+producer-sequence error; it must not silently skip that sequence.
 
 **`401` / `403`** — the request did not pass authentication at the edge (see
 Authentication). The Worker does not produce these; the edge does.

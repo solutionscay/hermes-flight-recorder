@@ -10,6 +10,7 @@ from hermes_flight_recorder.collector.sync import (
     Ack,
     DELIVERY_CURSOR_NAME,
     InMemoryTransport,
+    MAX_INGEST_BATCH_BYTES,
     SyncError,
     build_batches,
     delivery_cursor,
@@ -193,6 +194,48 @@ def test_record_larger_than_batch_target_is_sent_alone(tmp_path):
     assert len(serialize_batch(transport.batches[0])) > 1
     assert result.records_sent == 1
     assert delivery_cursor(outbox) == 1
+    outbox.close()
+
+
+def test_chunked_record_and_later_event_both_clear_the_queue(tmp_path):
+    outbox = new_outbox(tmp_path)
+    content = b"x" * 3_200_000
+    parent = outbox.append(
+        base_record("knowledge.record_written"),
+        content=content,
+        dedup_key="large",
+    )
+    later = outbox.append(base_record("session.created"), dedup_key="later")
+    transport = InMemoryTransport()
+
+    result = sync(outbox, transport)
+
+    shipped = [
+        record
+        for batch in transport.batches
+        for record in batch["records"]
+    ]
+    assert [record["producer_sequence"] for record in shipped] == [1, 2, 3, 4]
+    assert shipped[-2]["event_id"] == parent["event_id"]
+    assert shipped[-1]["event_id"] == later["event_id"]
+    assert all(
+        len(serialize_batch(batch)) <= MAX_INGEST_BATCH_BYTES
+        for batch in transport.batches
+    )
+    assert result.records_sent == 4
+    assert result.pending == 0
+    assert delivery_cursor(outbox) == 4
+    outbox.close()
+
+
+def test_legacy_oversized_record_fails_before_transport(tmp_path):
+    outbox = new_outbox(tmp_path)
+    record = outbox.append(base_record())
+    record["payload"]["legacy_oversized"] = "x" * MAX_INGEST_BATCH_BYTES
+
+    with pytest.raises(SyncError, match="ingestion limit"):
+        list(build_batches([record]))
+
     outbox.close()
 
 

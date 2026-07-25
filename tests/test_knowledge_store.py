@@ -16,6 +16,10 @@ import os
 from hermes_flight_recorder.collector import knowledge_store
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.recorder_config import KnowledgeConfig
+from hermes_flight_recorder.collector.sync import (
+    MAX_INGEST_BATCH_BYTES,
+    singleton_batch_size,
+)
 
 
 def knowledge_events(ob):
@@ -255,6 +259,34 @@ def test_emits_event_with_restorable_encrypted_content(tmp_path):
         for f in bundle["files"]
     }
     assert restored == {"SKILL.md": body, "references/how.md": ref}
+
+
+def test_large_skill_uses_encrypted_chunks_and_restores_from_parent(tmp_path):
+    home = tmp_path / "hermes"
+    body = "large but complete\n" + ("x" * 2_500_000)
+    write_skill(home / "skills", "large", body)
+    ob = new_outbox(tmp_path)
+
+    counts = knowledge_store.poll(ob, home)
+
+    assert counts == {knowledge_store.KNOWLEDGE_EVENT: 1}
+    parent = knowledge_events(ob)[0]
+    assert parent["payload"]["content_storage"] == "chunked"
+    assert "content_ciphertext" not in parent
+    chunks = [
+        event
+        for event in ob.iter_events()
+        if event["payload"]["event_type"] == "runtime.content_chunk_recorded"
+    ]
+    assert len(chunks) == parent["payload"]["content_chunk_count"]
+    assert all(
+        singleton_batch_size(event) <= MAX_INGEST_BATCH_BYTES
+        for event in [*chunks, parent]
+    )
+
+    bundle = json.loads(ob.decrypt_content(parent))
+    restored = base64.b64decode(bundle["files"][0]["content_b64"]).decode()
+    assert restored == body
 
 
 def test_memory_target_and_action_update(tmp_path):
