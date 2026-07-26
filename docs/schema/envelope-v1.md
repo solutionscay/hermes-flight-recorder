@@ -38,11 +38,19 @@ adapter, and the reconciler. The validator lives in
 | `content_ciphertext` | string (base64) | no | encrypted | The client-encrypted content blob. Absent when the event has no content. |
 | `content_nonce` | string (base64) | no | encrypted | The per-record AEAD nonce for `content_ciphertext`. |
 | `content_hash` | string (hex) | no | integrity | The hash of the plaintext content, computed before encryption. |
-| `key_version` | string | no | encrypted | The id of the encryption key and algorithm for `content_ciphertext`. |
+| `key_version` | string | no | encrypted | The id of the key epoch for `content_ciphertext`. Content is encrypted with a per-process AES-256-GCM data key (DEK); `key_version` names that DEK epoch and the operator key it was sealed to. The DEK itself travels wrapped, out of band (see below), so the field's meaning — an opaque key identifier a reader resolves to the right key — is unchanged. |
 | `partial` | boolean | yes | integrity | True when the event is reconstructed, not yet terminal, or content was capped. Consumers treat it as provisional or consult event-specific truncation metadata. |
 
 **Content-field invariant:** `content_nonce`, `content_hash`, and
 `key_version` are present if and only if `content_ciphertext` is present.
+
+**Wrapped data key (out of band).** The four content fields are unchanged and
+self-sufficient for storage and transport. The data key that decrypts
+`content_ciphertext` is not in the envelope: it is sealed to the fleet operator
+public key and carried in a separate `content_keys` stream keyed by
+`key_version`, so an ingesting backend only ever stores and serves an opaque
+blob and never holds a decrypting key. Only the operator private key opens it.
+See [../key-model.md](../key-model.md).
 
 **Content storage modes:** Content that fits in one ingest request stays
 inline on its logical event through the four content fields above. If the

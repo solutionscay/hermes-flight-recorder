@@ -37,7 +37,8 @@ def test_default_removes_hook_preserves_data(tmp_path, capsys):
     assert rc == 0
     assert not hook.exists()  # hook gone
     assert (fr / "outbox.sqlite").exists()  # data preserved
-    assert (fr / "content-dev.key").exists()
+    assert (fr / "operator.pub").exists()
+    assert (fr / "operator.secret").exists()  # key material preserved
     assert "preserved" in capsys.readouterr().out
 
 

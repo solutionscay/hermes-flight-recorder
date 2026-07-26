@@ -112,7 +112,8 @@ def _backup_installation(fr_home: Path, hermes_home: Path) -> Path:
         )
     _backup_sqlite(database, backup / "outbox.sqlite")
     for name in (
-        "content-dev.key",
+        "operator.pub",
+        "operator.secret",
         "recorder-config.json",
         "sync-config.json",
         INSTALLED_VERSION_FILENAME,

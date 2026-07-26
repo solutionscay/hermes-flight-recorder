@@ -83,9 +83,11 @@ from step 1 when you run Hermes Flight Recorder commands.
 
 `hermes-flight-recorder install --hermes-home <path>` is idempotent: it creates
 the recorder home at `$HERMES_HOME/flight-recorder`, mints the installation
-identity and encryption key, writes configuration with mode `0600`, and installs
-(or repoints) the live capture hook under `$HERMES_HOME/hooks/`. Restart the
-Hermes gateway to load the hook. It never registers an OS service.
+identity, establishes the operator key content is sealed to (solo: a local
+keypair; fleet: `--operator-pubkey`, public only — see
+[key-model.md](key-model.md)), writes configuration with mode `0600`, and
+installs (or repoints) the live capture hook under `$HERMES_HOME/hooks/`.
+Restart the Hermes gateway to load the hook. It never registers an OS service.
 
 `hermes-flight-recorder serve --hermes-home <path>` then runs one portable
 foreground process: it drains the hook spool and polls the durable stores on

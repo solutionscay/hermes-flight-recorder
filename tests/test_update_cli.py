@@ -52,7 +52,7 @@ def test_prepare_update_creates_consistent_recovery_backup(tmp_path):
     checkout.mkdir()
 
     outbox = Outbox.open(fr_home, hermes_home=hermes)
-    event = outbox.append(_record(), dedup_key="update:event")
+    event = outbox.append(_record(), content=b"sealed", dedup_key="update:event")
     installation_id = outbox.installation_id
     outbox.set_meta("cursor:delivery", str(event["producer_sequence"]))
     outbox.set_meta("capture:test", "cursor-value")
@@ -77,8 +77,11 @@ def test_prepare_update_creates_consistent_recovery_backup(tmp_path):
         ).fetchone()[0] == "1"
     finally:
         copied.close()
-    assert (backup / "content-dev.key").read_bytes() == (
-        fr_home / "content-dev.key"
+    assert (backup / "operator.pub").read_bytes() == (
+        fr_home / "operator.pub"
+    ).read_bytes()
+    assert (backup / "operator.secret").read_bytes() == (
+        fr_home / "operator.secret"
     ).read_bytes()
     assert (backup / "recorder-config.json").read_bytes() == (
         fr_home / "recorder-config.json"
@@ -182,14 +185,15 @@ def test_complete_update_preserves_state_and_refreshes_hook(tmp_path):
     checkout.mkdir()
 
     outbox = Outbox.open(fr_home, hermes_home=hermes)
-    outbox.append(_record(), dedup_key="update:preserved")
+    outbox.append(_record(), content=b"sealed", dedup_key="update:preserved")
     installation_id = outbox.installation_id
     outbox.set_meta("cursor:delivery", "1")
     outbox.set_meta("capture:test", "42")
     outbox.close()
 
     config_before = (fr_home / "recorder-config.json").read_bytes()
-    key_before = (fr_home / "content-dev.key").read_bytes()
+    public_before = (fr_home / "operator.pub").read_bytes()
+    secret_before = (fr_home / "operator.secret").read_bytes()
     prepare_update(fr_home, hermes, source=str(checkout))
     complete_update(fr_home, hermes, log=lambda _message: None)
 
@@ -204,7 +208,8 @@ def test_complete_update_preserves_state_and_refreshes_hook(tmp_path):
     finally:
         updated.close()
     assert (fr_home / "recorder-config.json").read_bytes() == config_before
-    assert (fr_home / "content-dev.key").read_bytes() == key_before
+    assert (fr_home / "operator.pub").read_bytes() == public_before
+    assert (fr_home / "operator.secret").read_bytes() == secret_before
     assert not (fr_home / PENDING_UPDATE_FILENAME).exists()
     assert json.loads((fr_home / LAST_UPDATE_FILENAME).read_text())["state"] == (
         "complete"
