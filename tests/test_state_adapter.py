@@ -210,30 +210,60 @@ def test_finalized_terminals_preserve_cumulative_usage_and_cost_status(tmp_path)
     assert "actual_cost_usd" not in child["payload"]
 
 
-def test_partial_durable_terminal_does_not_claim_final_usage(tmp_path):
+def test_durable_terminal_waits_for_finalization_then_emits_authoritative_once(tmp_path):
     hh = tmp_path / "hermes"; hh.mkdir()
     make_state_db(hh)
     db = sqlite3.connect(hh / "state.db")
-    db.execute("UPDATE sessions SET expiry_finalized=0 WHERE id='C'")
+    db.execute(
+        """
+        UPDATE sessions SET
+            expiry_finalized=0, end_reason=NULL,
+            message_count=4, tool_call_count=1,
+            input_tokens=12278, output_tokens=126,
+            estimated_cost_usd=0.0
+        WHERE id='C'
+        """
+    )
     db.commit(); db.close()
     ob = new_outbox(tmp_path)
 
-    state_db.poll(ob, hh)
+    first = state_db.poll(ob, hh)
 
+    assert first.get("subagent.completed", 0) == 0
+    assert types(ob)["subagent.completed"] == 0
+
+    db = sqlite3.connect(hh / "state.db")
+    db.execute(
+        """
+        UPDATE sessions SET
+            expiry_finalized=1, end_reason='done',
+            message_count=6, tool_call_count=2,
+            input_tokens=13000, output_tokens=200,
+            estimated_cost_usd=0.25
+        WHERE id='C'
+        """
+    )
+    db.commit(); db.close()
+
+    second = state_db.poll(ob, hh)
     terminal = next(
-        e
-        for e in ob.iter_events()
+        e for e in ob.iter_events()
         if e["payload"]["event_type"] == "subagent.completed"
     )
-    assert terminal["partial"] is True
-    for field in (
-        "usage_semantics",
-        "input_tokens",
-        "output_tokens",
-        "estimated_cost_usd",
-        "cost_status",
-    ):
-        assert field not in terminal["payload"]
+
+    assert second["subagent.completed"] == 1
+    assert terminal["partial"] is False
+    assert terminal["payload"]["end_reason"] == "done"
+    assert terminal["payload"]["message_count"] == 6
+    assert terminal["payload"]["tool_call_count"] == 2
+    assert terminal["payload"]["usage_semantics"] == "cumulative_total"
+    assert terminal["payload"]["input_tokens"] == 13000
+    assert terminal["payload"]["output_tokens"] == 200
+    assert terminal["payload"]["estimated_cost_usd"] == 0.25
+
+    third = state_db.poll(ob, hh)
+    assert third.get("subagent.completed", 0) == 0
+    assert types(ob)["subagent.completed"] == 1
 
 
 def test_correlation_groups_child_under_parent(tmp_path):

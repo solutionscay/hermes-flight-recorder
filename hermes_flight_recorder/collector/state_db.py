@@ -218,26 +218,30 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since=None) 
         if r["ended_at"] is None:
             continue
 
-        # end_reason is not stable until expiry_finalized flips from 0.
-        partial = r["expiry_finalized"] == 0
+        # end_reason and the cumulative counters are not stable until
+        # expiry_finalized flips from 0.  The live hook already supplies a
+        # provisional terminal, so wait rather than consuming the durable
+        # terminal's stable dedup key with a partial record.
+        if r["expiry_finalized"] == 0:
+            continue
+
         payload = {
             "kind": kind,
             "end_reason": r["end_reason"],
             "message_count": r["message_count"],
             "tool_call_count": r["tool_call_count"],
+            "usage_semantics": "cumulative_total",
         }
-        if not partial:
-            # These are the authoritative totals on a finalized durable
-            # session row.  Omit unavailable/NULL values so consumers can
-            # distinguish unknown cost from an explicit zero.
-            payload["usage_semantics"] = "cumulative_total"
-            payload.update(
-                {
-                    field: r[field]
-                    for field in _TERMINAL_USAGE_FIELDS
-                    if r[field] is not None
-                }
-            )
+        # These are the authoritative totals on a finalized durable session
+        # row. Omit unavailable/NULL values so consumers can distinguish
+        # unknown cost from an explicit zero.
+        payload.update(
+            {
+                field: r[field]
+                for field in _TERMINAL_USAGE_FIELDS
+                if r[field] is not None
+            }
+        )
 
         record = build_record(
             event_type=ended,
@@ -249,7 +253,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since=None) 
             session_id=sid,
             parent_session_id=r["parent_session_id"],
             profile=profile,
-            partial=partial,
+            partial=False,
             payload=payload,
         )
         append_and_count(outbox, counts, record, dedup_key=f"state.db:{ended}:{sid}")
