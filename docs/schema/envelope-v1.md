@@ -294,6 +294,42 @@ re-poll produces no duplicate version and no duplicate event. Its complete
 encrypted after-state uses inline content when it fits and the chunked content
 representation above when it does not; either form restores the same bytes.
 
+### Knowledge content bundle v1
+
+The complete encrypted after-state of a non-tombstone store event is a UTF-8
+JSON document with `format="knowledge.bundle.v1"`. The plaintext payload also
+sets `content_format="knowledge.bundle.v1"` so a keyless consumer can select the
+correct parser without inspecting ciphertext. Inline and chunked transport
+decrypt to the same document:
+
+```json
+{
+  "format": "knowledge.bundle.v1",
+  "artifact_id": "skill:deploy",
+  "version_seq": 1,
+  "manifest_hash": "sha256:…",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "byte_count": 37,
+      "content_hash": "sha256:…",
+      "content_b64": "IyBEZXBsb3kKLi4u"
+    }
+  ]
+}
+```
+
+`artifact_id`, `version_seq`, and `manifest_hash` repeat the parent event
+identity and must match it exactly. `files` is ordered lexicographically by
+safe, artifact-relative POSIX path. Paths are unique and never absolute, empty,
+dot segments, or parent traversals. `byte_count` is the decoded byte length and
+`content_hash` is `sha256:` plus the lowercase SHA-256 digest of those bytes.
+The manifest hash is the existing store digest over the canonical ordered
+`[{"blob_hash": content_hash, "path": path}, …]` manifest. Consumers must verify
+all of these invariants before rendering any member as a complete artifact.
+Tombstones keep the parent metadata but carry neither encrypted content nor a
+`content_format`.
+
 ## Event-type surface
 
 **P0-poc** — captured and observed in the Phase 0 POC:

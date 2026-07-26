@@ -47,6 +47,7 @@ from ._common import (
 )
 
 KNOWLEDGE_EVENT = "knowledge.record_written"
+KNOWLEDGE_BUNDLE_FORMAT = "knowledge.bundle.v1"
 
 
 def poll(
@@ -193,8 +194,24 @@ def _skill_files(skill_dir: Path) -> list[tuple[str, Path]]:
         if directory.is_dir():
             for path in sorted(directory.rglob("*")):
                 if path.is_file():
-                    files.append((str(path.relative_to(skill_dir)), path))
+                    relative = path.relative_to(skill_dir).as_posix()
+                    if _safe_bundle_path(relative):
+                        files.append((relative, path))
     return files
+
+
+def _safe_bundle_path(path: str) -> bool:
+    """Whether a producer path is safe for ``knowledge.bundle.v1``.
+
+    The supported skill tree is local and read-only, but filenames can still
+    contain backslashes or control characters on POSIX. Exclude those rather
+    than emitting a bundle the browser must reject as unsafe.
+    """
+    if not path or len(path) > 512 or path.startswith("/") or "\\" in path:
+        return False
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        return False
+    return all(part not in {"", ".", ".."} for part in path.split("/"))
 
 
 def _capture(
@@ -329,11 +346,23 @@ def _emit_version_event(
             raw = outbox.get_blob(entry["blob_hash"])
             byte_count += len(raw)
             files.append(
-                {"path": entry["path"], "content_b64": base64.b64encode(raw).decode("ascii")}
+                {
+                    "path": entry["path"],
+                    "byte_count": len(raw),
+                    "content_hash": entry["blob_hash"],
+                    "content_b64": base64.b64encode(raw).decode("ascii"),
+                }
             )
         file_count = len(files)
         content = json.dumps(
-            {"manifest_hash": version["manifest_hash"], "files": files}
+            {
+                "format": KNOWLEDGE_BUNDLE_FORMAT,
+                "artifact_id": artifact["artifact_id"],
+                "version_seq": seq,
+                "manifest_hash": version["manifest_hash"],
+                "files": files,
+            },
+            separators=(",", ":"),
         )
 
     payload: dict[str, Any] = {
@@ -348,6 +377,8 @@ def _emit_version_event(
         "file_count": file_count,
         "byte_count": byte_count,
     }
+    if not is_tombstone:
+        payload["content_format"] = KNOWLEDGE_BUNDLE_FORMAT
     if kind == "skill":
         payload["skill_name"] = artifact["name"]
         if artifact["category"]:
