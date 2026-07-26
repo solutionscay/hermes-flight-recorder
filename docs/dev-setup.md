@@ -146,6 +146,14 @@ managing it yourself.
 so a shortened body is never silent. The limit applies uniformly to user,
 assistant, and tool content.
 
+`sync.max_bytes` is a soft batch target and defaults to 1 MiB. The ingestion
+protocol has a separate 4 MiB hard request limit. If encrypted content would
+make one event exceed that hard limit, the outbox preserves all of it as
+ordered encrypted `runtime.content_chunk_recorded` events and a small logical
+parent event. This is automatic for every content-producing collector,
+including large knowledge artifacts. The configured sync target cannot exceed
+4 MiB.
+
 Invocation hooks remain the immediate metadata source. Hermes truncates the
 message and response values it supplies to hooks, so the installed spooler
 removes those previews before writing the spool. The next `state.db` poll
@@ -174,7 +182,8 @@ reconciliation from reporting intentional retention as capture loss.
 
 `capture.interval_seconds` (default 15) and `reconcile.interval_seconds`
 (default 60) set the `serve` cadences; the one-shot `run` and `reconcile`
-commands ignore them. `sync.max_records` and `sync.max_bytes` are active now.
+commands ignore them. `sync.max_records` and `sync.max_bytes` are active now;
+`sync.max_bytes` controls batching but never raises the 4 MiB protocol ceiling.
 `sync.interval_seconds` is `null` by default, preserving the one-pass `sync`
 behavior; under `serve`, a `null` sync interval falls back to 60s when a sync
 config is present. An explicit `sync --interval` or `serve --sync-interval`

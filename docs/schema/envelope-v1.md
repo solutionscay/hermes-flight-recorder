@@ -44,6 +44,38 @@ adapter, and the reconciler. The validator lives in
 **Content-field invariant:** `content_nonce`, `content_hash`, and
 `key_version` are present if and only if `content_ciphertext` is present.
 
+**Content storage modes:** Content that fits in one ingest request stays
+inline on its logical event through the four content fields above. If the
+final serialized singleton request would exceed the ingestion protocol's
+4 MiB hard limit, the outbox atomically writes encrypted
+`runtime.content_chunk_recorded` events immediately before the logical parent
+event. The parent carries no top-level content fields. Its plaintext payload
+adds:
+
+- `content_storage="chunked"`
+- `content_ref`, equal to the parent `event_id`
+- `content_chunk_count`
+- `content_plaintext_bytes`
+- `content_plaintext_hash`
+
+Each `runtime.content_chunk_recorded` payload contains only operational
+integrity metadata: `content_ref`, zero-based `chunk_index`, `chunk_count`,
+`chunk_plaintext_bytes`, `content_plaintext_bytes`, and
+`content_plaintext_hash`. The chunk bytes use the normal encrypted content
+fields. Consumers reconstruct content by selecting the complete chunk set,
+ordering it by `chunk_index`, decrypting and concatenating it, and verifying
+the parent byte count and hash. Chunks without their later parent are
+uncommitted content; the parent is the commit record. The `runtime.` prefix
+classifies chunks as recorder transport telemetry, not agent activity.
+Consumers must group them with the parent.
+
+Chunking is a transport representation only. It does not truncate content and
+does not change the logical event's event type, identity, or domain meaning.
+The outbox appends all chunks and the parent in one SQLite transaction, so a
+crash cannot leave a partial local chunk set. The parent's producer sequence
+follows every chunk sequence, and a stable parent deduplication hit writes no
+new chunks.
+
 **payload invariant:** `payload.event_type` is present and is one of the
 event types below.
 
@@ -258,7 +290,9 @@ operation and never emits `knowledge.record_compacted`.
 A `knowledge.record_written` event is dedup-keyed on its `state.db` message row,
 as other message-derived events are. A store version is identified by its
 `(artifact_id, seq)` and its content manifest, so a restart, a re-scan, or a
-re-poll produces no duplicate version and no duplicate event.
+re-poll produces no duplicate version and no duplicate event. Its complete
+encrypted after-state uses inline content when it fits and the chunked content
+representation above when it does not; either form restores the same bytes.
 
 ## Event-type surface
 
@@ -279,8 +313,8 @@ re-poll produces no duplicate version and no duplicate event.
 `tool.approval_responded`, `delegation.delivered`, `delegation.progress`,
 `cron.definition_changed`, `command.invoked`, `handoff.state_changed`,
 `task.created`, `task.claimed`, `task.completed`, `task.blocked`,
-`task.failed_terminal`, `task.attempt_ended`, `knowledge.record_written`,
-`knowledge.record_compacted`.
+`task.failed_terminal`, `task.attempt_ended`, `runtime.content_chunk_recorded`,
+`knowledge.record_written`, `knowledge.record_compacted`.
 
 ## Ordering model
 
@@ -327,8 +361,9 @@ its payload.
   `last_heartbeat_at`, `block_kind`, `run_outcome`, `attempt_disposition`),
   knowledge artifact metadata (`artifact_kind`, `action`, `skill_name`,
   `category`, memory `target`, the relative artifact `path`, `provenance`,
-  `origin`, `artifact_version_ref`, and file and byte counts), `content_hash`,
-  and `key_version`.
+  `origin`, `artifact_version_ref`, and file and byte counts), inline
+  `content_hash`, chunk-set `content_plaintext_hash`, chunk indexes and byte
+  counts, and `key_version`.
 - **Encrypted on the host:** user and assistant text, tool arguments and
   results, the system prompt, reasoning, agent and subagent goals and
   summaries, cron output, error messages, task title/body/result and run

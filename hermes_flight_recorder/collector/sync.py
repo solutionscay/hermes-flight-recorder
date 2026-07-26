@@ -23,6 +23,9 @@ PROTOCOL_VERSION = "1"
 DELIVERY_CURSOR_NAME = "delivery"
 DEFAULT_MAX_RECORDS = 500
 DEFAULT_MAX_BYTES = 1024 * 1024
+# The hosted ingestion worker rejects request bodies above 4 MiB. This is a
+# protocol ceiling, unlike DEFAULT_MAX_BYTES, which is only a batching target.
+MAX_INGEST_BATCH_BYTES = 4 * 1024 * 1024
 
 
 class Batch(TypedDict):
@@ -118,6 +121,11 @@ def serialize_batch(batch: Batch) -> bytes:
     ).encode("utf-8")
 
 
+def singleton_batch_size(record: dict[str, Any]) -> int:
+    """Return the exact wire size when ``record`` is sent by itself."""
+    return len(serialize_batch(_batch([record])))
+
+
 def build_batches(
     records: Iterable[dict[str, Any]],
     *,
@@ -126,15 +134,17 @@ def build_batches(
 ) -> Iterator[Batch]:
     """Yield valid protocol batches within the configured target limits.
 
-    A single record can exceed ``max_bytes`` because records are indivisible.
-    Yield it alone so a local batch target cannot block the ordered queue.
-    The ingestion service remains the authority for its hard request limit.
+    A single record can exceed the soft ``max_bytes`` target because records
+    are indivisible. Yield it alone, but never emit a request above the
+    protocol's hard limit. New content-bearing records are chunked by the
+    outbox before they reach this path.
     """
     if max_records < 1:
         raise ValueError("max_records must be at least 1")
     if max_bytes < 1:
         raise ValueError("max_bytes must be at least 1")
 
+    target_bytes = min(max_bytes, MAX_INGEST_BATCH_BYTES)
     current: list[dict[str, Any]] = []
     current_bytes = 0  # len(serialize_batch(_batch(current))), tracked incrementally
     envelope_bytes = len(serialize_batch(_batch([])))
@@ -157,9 +167,14 @@ def build_batches(
         # Serialize each record once. Batch size is the fixed envelope plus
         # each record plus one comma between records, so the limit check
         # never re-serializes the accumulated batch.
-        single_bytes = len(serialize_batch(_batch([record])))
+        single_bytes = singleton_batch_size(record)
+        if single_bytes > MAX_INGEST_BATCH_BYTES:
+            raise SyncError(
+                f"record at producer_sequence {sequence} exceeds the "
+                f"{MAX_INGEST_BATCH_BYTES}-byte ingestion limit"
+            )
         grown_bytes = current_bytes + (single_bytes - envelope_bytes) + 1
-        if current and (len(current) >= max_records or grown_bytes > max_bytes):
+        if current and (len(current) >= max_records or grown_bytes > target_bytes):
             yield _batch(current)
             current = [record]
             current_bytes = single_bytes
@@ -242,6 +257,7 @@ __all__ = [
     "DEFAULT_MAX_BYTES",
     "DEFAULT_MAX_RECORDS",
     "DELIVERY_CURSOR_NAME",
+    "MAX_INGEST_BATCH_BYTES",
     "InMemoryTransport",
     "PROTOCOL_VERSION",
     "SyncError",
@@ -250,5 +266,6 @@ __all__ = [
     "build_batches",
     "delivery_cursor",
     "serialize_batch",
+    "singleton_batch_size",
     "sync",
 ]

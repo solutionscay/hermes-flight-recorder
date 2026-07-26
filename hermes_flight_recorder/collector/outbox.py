@@ -15,7 +15,9 @@ Key properties:
 - Dedup on a caller-supplied stable key stops a re-captured row from
   appending twice, and does not consume a sequence number.
 - Content is encrypted before write with a local dev key (POC only; real
-  key custody is deferred).
+  key custody is deferred). Content too large for one ingest request is
+  encrypted in bounded runtime chunk records and committed by its logical
+  parent record.
 - Retention can remove acknowledged event rows, but never sequence or meta
   state. Compact non-content tombstones preserve deduplication and
   reconciliation identity. The independent high-water mark therefore remains
@@ -49,6 +51,7 @@ from ._common import (
     resolve_flight_recorder_home,
     resolve_hermes_home,
 )
+from .sync import MAX_INGEST_BATCH_BYTES, singleton_batch_size
 
 __all__ = [
     "OUTBOX_SCHEMA_VERSION",
@@ -60,6 +63,14 @@ __all__ = [
 
 OUTBOX_SCHEMA_VERSION = "1"
 _KEY_VERSION = "aesgcm256:dev"
+_CONTENT_CHUNK_BYTES = 2 * 1024 * 1024
+_CONTENT_CHUNK_EVENT = "runtime.content_chunk_recorded"
+_CONTENT_FIELDS = (
+    "content_ciphertext",
+    "content_nonce",
+    "content_hash",
+    "key_version",
+)
 # ``old_version: (new_version, method_name)``. Each method runs inside the
 # transaction that also advances the durable schema version.
 _MIGRATIONS: dict[str, tuple[str, str]] = {}
@@ -304,12 +315,51 @@ class Outbox:
         """Decrypt a record's content. For tooling and tests only.
 
         The POC observe command never calls this; content stays encrypted
-        at rest and in the console.
+        at rest and in the console. Inline content decrypts directly. Chunked
+        content is reconstructed from its preceding encrypted chunk records
+        and verified against the parent record's byte count and hash.
         """
         ct = record.get("content_ciphertext")
         nonce = record.get("content_nonce")
-        if ct is None or nonce is None:
+        if ct is not None and nonce is not None:
+            return self._decrypt_inline_content(record)
+
+        payload = record.get("payload", {})
+        if payload.get("content_storage") != "chunked":
             raise OutboxError("record has no encrypted content")
+        content_ref = payload.get("content_ref")
+        chunk_count = payload.get("content_chunk_count")
+        if not isinstance(content_ref, str) or not isinstance(chunk_count, int):
+            raise OutboxError("chunked content metadata is invalid")
+
+        chunks = []
+        for event in self.iter_events(record.get("installation_id")):
+            chunk_payload = event.get("payload", {})
+            if (
+                chunk_payload.get("event_type") == _CONTENT_CHUNK_EVENT
+                and chunk_payload.get("content_ref") == content_ref
+            ):
+                chunks.append(event)
+        chunks.sort(key=lambda event: event["payload"].get("chunk_index", -1))
+        indices = [event["payload"].get("chunk_index") for event in chunks]
+        if len(chunks) != chunk_count or indices != list(range(chunk_count)):
+            raise OutboxError(
+                f"chunked content {content_ref} is incomplete: "
+                f"expected {chunk_count} chunks, found {len(chunks)}"
+            )
+
+        raw = b"".join(self._decrypt_inline_content(chunk) for chunk in chunks)
+        expected_bytes = payload.get("content_plaintext_bytes")
+        expected_hash = payload.get("content_plaintext_hash")
+        if expected_bytes != len(raw) or expected_hash != self._content_hash(raw):
+            raise OutboxError(f"chunked content {content_ref} failed verification")
+        return raw
+
+    def _decrypt_inline_content(self, record: dict[str, Any]) -> bytes:
+        ct = record.get("content_ciphertext")
+        nonce = record.get("content_nonce")
+        if ct is None or nonce is None:
+            raise OutboxError("record has no inline encrypted content")
         return self._cipher().decrypt(
             base64.b64decode(nonce), base64.b64decode(ct), None
         )
@@ -570,8 +620,9 @@ class Outbox:
     ) -> tuple[dict[str, Any], bool]:
         """Implement both append APIs and return the stored record and outcome."""
         rec = dict(record)
-        if content is not None:
-            rec.update(self._encrypt_content(content))
+        raw_content = (
+            content.encode("utf-8") if isinstance(content, str) else content
+        )
         rec.setdefault("schema_version", SCHEMA_VERSION)
         rec["installation_id"] = self.installation_id
         rec["event_id"] = str(uuid.uuid4())
@@ -612,33 +663,145 @@ class Outbox:
             row = conn.execute(
                 "SELECT high_water FROM seq WHERE installation_id=?", (inst,)
             ).fetchone()
-            seq = (row[0] if row else 0) + 1
-            rec["producer_sequence"] = seq
+            high_water = row[0] if row else 0
+            rec["producer_sequence"] = high_water + 1
+
+            chunk_records: list[dict[str, Any]] = []
+            if (
+                raw_content is not None
+                and self._inline_singleton_size(rec, len(raw_content))
+                > MAX_INGEST_BATCH_BYTES
+            ):
+                chunk_records = self._content_chunk_records(
+                    rec, raw_content, high_water
+                )
+                payload = dict(rec["payload"])
+                payload.update(
+                    {
+                        "content_storage": "chunked",
+                        "content_ref": rec["event_id"],
+                        "content_chunk_count": len(chunk_records),
+                        "content_plaintext_bytes": len(raw_content),
+                        "content_plaintext_hash": self._content_hash(raw_content),
+                    }
+                )
+                rec["payload"] = payload
+                rec["producer_sequence"] = high_water + len(chunk_records) + 1
+            elif raw_content is not None:
+                rec.update(self._encrypt_content(raw_content))
 
             validate(rec)  # raises before any write on a bad record
+            if singleton_batch_size(rec) > MAX_INGEST_BATCH_BYTES:
+                raise OutboxError(
+                    "record metadata exceeds the ingestion protocol's "
+                    f"{MAX_INGEST_BATCH_BYTES}-byte limit"
+                )
 
-            conn.execute(
-                "INSERT INTO events (event_id, installation_id, producer_sequence, "
-                "dedup_key, recorded_at, envelope_json) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    rec["event_id"],
-                    inst,
-                    seq,
-                    dedup_key,
-                    rec["recorded_at"],
-                    serialize(rec),
-                ),
-            )
+            for chunk in chunk_records:
+                validate(chunk)
+                if singleton_batch_size(chunk) > MAX_INGEST_BATCH_BYTES:
+                    raise OutboxError(
+                        "content chunk exceeds the ingestion protocol's "
+                        f"{MAX_INGEST_BATCH_BYTES}-byte limit"
+                    )
+                self._insert_event(chunk, dedup_key=None)
+            self._insert_event(rec, dedup_key=dedup_key)
             conn.execute(
                 "INSERT INTO seq (installation_id, high_water) VALUES (?, ?) "
                 "ON CONFLICT(installation_id) DO UPDATE SET high_water=excluded.high_water",
-                (inst, seq),
+                (inst, rec["producer_sequence"]),
             )
             conn.execute("COMMIT")
             return rec, True
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    @staticmethod
+    def _inline_singleton_size(record: dict[str, Any], plaintext_bytes: int) -> int:
+        """Exact singleton wire size after encrypting ``plaintext_bytes``.
+
+        AES-GCM adds a 16-byte tag. Base64 length is deterministic, and its
+        alphabet needs no JSON escaping. Measuring a record with empty content
+        fields and adding their encoded lengths avoids allocating and
+        encrypting an arbitrarily large inline candidate only to discard it.
+        """
+        probe = dict(record)
+        probe.update({field: "" for field in _CONTENT_FIELDS})
+        ciphertext_bytes = plaintext_bytes + 16
+        ciphertext_b64 = 4 * ((ciphertext_bytes + 2) // 3)
+        nonce_b64 = 16  # a 12-byte AES-GCM nonce
+        content_hash = len("sha256:") + 64
+        return (
+            singleton_batch_size(probe)
+            + ciphertext_b64
+            + nonce_b64
+            + content_hash
+            + len(_KEY_VERSION)
+        )
+
+    def _content_chunk_records(
+        self, parent: dict[str, Any], raw: bytes, high_water: int
+    ) -> list[dict[str, Any]]:
+        """Build encrypted transport chunks that immediately precede a parent."""
+        chunk_count = (len(raw) + _CONTENT_CHUNK_BYTES - 1) // _CONTENT_CHUNK_BYTES
+        full_hash = self._content_hash(raw)
+        records = []
+        for index, offset in enumerate(
+            range(0, len(raw), _CONTENT_CHUNK_BYTES)
+        ):
+            piece = raw[offset : offset + _CONTENT_CHUNK_BYTES]
+            chunk = {
+                "schema_version": parent["schema_version"],
+                "event_id": str(uuid.uuid4()),
+                "producer_sequence": high_water + index + 1,
+                "occurred_at": parent["occurred_at"],
+                "recorded_at": parent["recorded_at"],
+                "installation_id": parent["installation_id"],
+                "tenant_id": parent["tenant_id"],
+                "profile": parent["profile"],
+                "runtime": parent["runtime"],
+                "correlation_id": parent["correlation_id"],
+                "source": "outbox:content-chunker",
+                "capture_method": "derive:outbox-content-chunk",
+                "payload": {
+                    "event_type": _CONTENT_CHUNK_EVENT,
+                    "content_ref": parent["event_id"],
+                    "chunk_index": index,
+                    "chunk_count": chunk_count,
+                    "chunk_plaintext_bytes": len(piece),
+                    "content_plaintext_bytes": len(raw),
+                    "content_plaintext_hash": full_hash,
+                },
+                "partial": False,
+                **self._encrypt_content(piece),
+            }
+            for field in (
+                "session_id",
+                "session_key",
+                "parent_session_id",
+                "invocation_id",
+            ):
+                if field in parent:
+                    chunk[field] = parent[field]
+            records.append(chunk)
+        return records
+
+    def _insert_event(
+        self, record: dict[str, Any], *, dedup_key: str | None
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO events (event_id, installation_id, producer_sequence, "
+            "dedup_key, recorded_at, envelope_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                record["event_id"],
+                record["installation_id"],
+                record["producer_sequence"],
+                dedup_key,
+                record["recorded_at"],
+                serialize(record),
+            ),
+        )
 
     # --- poll cursors ---------------------------------------------------
     # Producers (the state adapter) keep an incremental cursor per source in
