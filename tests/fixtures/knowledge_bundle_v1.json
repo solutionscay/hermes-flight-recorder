@@ -1,0 +1,14 @@
+{
+  "format": "knowledge.bundle.v1",
+  "artifact_id": "skill:deploy",
+  "version_seq": 1,
+  "manifest_hash": "sha256:a38405b83365f30f91a355c11616bd0f7fb997e1264b63b86bac1aa3352d69c2",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "byte_count": 37,
+      "content_hash": "sha256:fc65f02c05cf95b236baf856fcf1a04125fadf3bc7920e0a3d8eca33e8f143c5",
+      "content_b64": "IyBEZXBsb3kKClJ1biB0aGUgcmVsZWFzZSBjaGVja2xpc3QuCg=="
+    }
+  ]
+}
