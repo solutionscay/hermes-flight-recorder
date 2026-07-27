@@ -32,7 +32,17 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .. import __version__
-from .sync import Ack, Batch, SyncResult, serialize_batch, sync
+from .sync import (
+    Ack,
+    Batch,
+    KeyAck,
+    KeyBatch,
+    KeySyncResult,
+    SyncResult,
+    serialize_batch,
+    sync,
+    sync_content_keys,
+)
 from .sync_config import SyncConfig
 
 DEFAULT_TIMEOUT = 30.0
@@ -80,6 +90,10 @@ class HttpsTransport:
     headers: dict[str, str]
     timeout: float = DEFAULT_TIMEOUT
     require_https: bool = True
+    # The wrapped-DEK side-channel endpoint. Empty means "derive from
+    # ingest_url" (the hosted layout puts it at the ``/keys`` child of
+    # ``/ingest``); the same Cloudflare Access service token gates both.
+    keys_url: str = ""
     _urlopen: UrlOpen = urllib.request.urlopen
 
     def __post_init__(self) -> None:
@@ -87,6 +101,8 @@ class HttpsTransport:
             raise TransportError(
                 f"ingest_url must be HTTPS, got {self.ingest_url!r}"
             )
+        if not self.keys_url:
+            self.keys_url = self.ingest_url.rstrip("/") + "/keys"
 
     @classmethod
     def from_config(
@@ -107,9 +123,19 @@ class HttpsTransport:
         )
 
     def send(self, batch: Batch) -> Ack:
-        body = serialize_batch(batch)
+        return _parse_ack(self._post(self.ingest_url, serialize_batch(batch)))
+
+    def send_keys(self, batch: KeyBatch) -> KeyAck:
+        return _parse_key_ack(self._post(self.keys_url, serialize_batch(batch)))
+
+    def _post(self, url: str, body: bytes) -> bytes:
+        """POST one serialized batch and return the 202 payload, or classify.
+
+        Shared by event and wrapped-DEK delivery: identical transport,
+        auth headers, and failure classification against a different path.
+        """
         request = urllib.request.Request(
-            self.ingest_url,
+            url,
             data=body,
             method="POST",
             headers={
@@ -135,7 +161,7 @@ class HttpsTransport:
         if status != 202:
             raise _classify_status(status, payload.decode("utf-8", "replace"))
 
-        return _parse_ack(payload)
+        return payload
 
 
 @dataclass
@@ -162,10 +188,16 @@ class RetryingTransport:
             raise ValueError("max_attempts must be at least 1")
 
     def send(self, batch: Batch) -> Ack:
+        return self._with_retry(lambda: self.inner.send(batch))
+
+    def send_keys(self, batch: KeyBatch) -> KeyAck:
+        return self._with_retry(lambda: self.inner.send_keys(batch))
+
+    def _with_retry(self, call: Callable[[], Any]) -> Any:
         attempt = 0
         while True:
             try:
-                return self.inner.send(batch)
+                return call()
             except RetryableTransportError:
                 attempt += 1
                 if attempt >= self.max_attempts:
@@ -189,7 +221,7 @@ class PushOutcome:
 
     ok: bool
     reason: str
-    result: SyncResult | None
+    result: SyncResult | KeySyncResult | None
     detail: str | None = None
 
 
@@ -204,6 +236,27 @@ def push(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOutcome:
     """
     try:
         result = sync(outbox, transport, **sync_kwargs)
+    except RetryableTransportError as exc:
+        return PushOutcome(
+            ok=False, reason="offline", result=None, detail=str(exc)
+        )
+    except AuthError as exc:
+        return PushOutcome(
+            ok=False, reason="auth", result=None, detail=str(exc)
+        )
+    return PushOutcome(ok=True, reason="ok", result=result)
+
+
+def push_content_keys(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOutcome:
+    """Ship pending wrapped DEKs, tolerating network and auth failure like push.
+
+    The wrapped-DEK side-channel is best-effort and independent of event
+    delivery: a failure leaves the records unshipped (``shipped_at`` unset) for
+    the next pass, and delivery is idempotent server-side, so nothing is lost or
+    duplicated. A terminal defect still propagates.
+    """
+    try:
+        result = sync_content_keys(outbox, transport, **sync_kwargs)
     except RetryableTransportError as exc:
         return PushOutcome(
             ok=False, reason="offline", result=None, detail=str(exc)
@@ -254,6 +307,25 @@ def _parse_ack(payload: bytes) -> Ack:
     return Ack(accepted=accepted, duplicates=duplicates, high_water=high_water)
 
 
+def _parse_key_ack(payload: bytes) -> KeyAck:
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError) as exc:
+        raise TerminalTransportError(
+            f"wrapped-DEK acknowledgement is not JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise TerminalTransportError("wrapped-DEK acknowledgement is not an object")
+    try:
+        accepted = int(data["accepted"])
+        duplicates = int(data["duplicates"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TerminalTransportError(
+            f"wrapped-DEK acknowledgement is missing a field: {exc}"
+        ) from exc
+    return KeyAck(accepted=accepted, duplicates=duplicates)
+
+
 __all__ = [
     "AuthError",
     "DEFAULT_BASE_DELAY",
@@ -267,4 +339,5 @@ __all__ = [
     "TerminalTransportError",
     "TransportError",
     "push",
+    "push_content_keys",
 ]

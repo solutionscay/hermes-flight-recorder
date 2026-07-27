@@ -106,10 +106,48 @@ def _cmd_install(args: argparse.Namespace) -> int:
             args.flight_recorder_home,
             args.hermes_home,
             backfill=not args.no_backfill,
+            operator_pubkey=args.operator_pubkey,
         )
     except InstallError as exc:
         print(f"install failed: {exc}", file=sys.stderr)
         return 2
+    return 0
+
+
+def _cmd_keygen(args: argparse.Namespace) -> int:
+    from .collector import keystore
+
+    fr_home = _flight_recorder_home(args)
+    fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    # Without --rotate, minting over an existing key is refused; surface the
+    # current public key instead so an operator can distribute it to agents.
+    if not args.rotate and keystore.has_public(fr_home):
+        public = keystore.load_public_key(fr_home)
+        print(f"operator key already present ({public.key_id}); "
+              f"pass --rotate to mint a new one.")
+        print(f"public key file: {keystore.public_path(fr_home)}")
+        print(public.to_text())
+        return 0
+
+    try:
+        keypair = keystore.mint_operator_keypair(fr_home, rotate=args.rotate)
+    except keystore.KeystoreError as exc:
+        print(f"keygen failed: {exc}", file=sys.stderr)
+        return 2
+
+    verb = "rotated to" if args.rotate else "minted"
+    print(f"operator keypair {verb} {keypair.key_id}")
+    print(f"public key:  {keystore.public_path(fr_home)}")
+    print(f"private key: {keystore.secret_path(fr_home)} (keep this secret; "
+          f"never distribute or place on an agent host)")
+    if args.rotate:
+        print(f"the previous key was retained under "
+              f"'{keystore.RETIRED_DIR_NAME}/' so existing history stays readable.")
+    print()
+    print("distribute this public key to fleet agents "
+          "(`install --operator-pubkey <file>`):")
+    print(keypair.public.to_text())
     return 0
 
 
@@ -462,6 +500,7 @@ def _sync_once(
         f"shipped {acked} / acked {acked} / pending {pending}  "
         f"(delivery cursor {cursor}, producer high-water {cursor + pending})"
     )
+    _sync_content_keys_once(outbox, transport)
     if retention_config is not None:
         _automatic_prune(outbox, retention_config)
     if outcome.ok:
@@ -477,6 +516,31 @@ def _sync_once(
         message += f": {outcome.detail}"
     print(message, file=sys.stderr)
     return _SYNC_UNREACHABLE
+
+
+def _sync_content_keys_once(outbox, transport) -> None:
+    """Ship pending wrapped DEKs alongside events; best-effort, never fatal.
+
+    The wrapped-DEK side-channel is independent of event delivery: a network or
+    auth failure just leaves the records for the next pass (delivery is
+    idempotent server-side), so it only reports and never changes the sync exit
+    code. A terminal client defect is surfaced but still not fatal to events.
+    """
+    from .collector.transport import TerminalTransportError, push_content_keys
+
+    try:
+        outcome = push_content_keys(outbox, transport)
+    except TerminalTransportError as exc:
+        print(
+            f"wrapped-key sync stopped: malformed batch (client defect): {exc}",
+            file=sys.stderr,
+        )
+        return
+    if outcome.ok:
+        if outcome.result is not None and outcome.result.keys_sent:
+            print(f"shipped {outcome.result.keys_sent} wrapped key(s)")
+    else:
+        print(f"wrapped-key sync deferred ({outcome.reason})", file=sys.stderr)
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
@@ -648,7 +712,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Capture only activity from now on; do not ingest existing Hermes history.",
     )
+    p_install.add_argument(
+        "--operator-pubkey",
+        default=None,
+        metavar="FILE",
+        help="Install as a fleet agent that seals content to this operator public "
+        "key; no private key is written to the host. Omit for a solo install "
+        "(a keypair is minted locally). Generate the key with `keygen`.",
+    )
     p_install.set_defaults(func=_cmd_install)
+
+    p_keygen = sub.add_parser(
+        "keygen",
+        help="Mint (or --rotate) the fleet operator keypair and print its public key.",
+        parents=[_home_options()],
+    )
+    p_keygen.add_argument(
+        "--rotate",
+        action="store_true",
+        help="Retire the current keypair (kept for reading history) and mint a new "
+        "one. New content seals to the new key; forward-only.",
+    )
+    p_keygen.set_defaults(func=_cmd_keygen)
 
     p_uninstall = sub.add_parser(
         "uninstall",

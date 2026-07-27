@@ -1,11 +1,12 @@
 """Installation lifecycle for a Flight Recorder companion.
 
 ``install`` makes one Hermes home into one Flight Recorder installation: it
-creates ``$HERMES_HOME/flight-recorder``, initializes the outbox identity and
-encryption key, writes configuration with restrictive permissions, installs (or
-repoints) the in-gateway hook, and verifies the result. It is idempotent and
-never registers an OS service — native service registration wraps ``serve``
-separately.
+creates ``$HERMES_HOME/flight-recorder``, initializes the outbox identity,
+establishes the operator key (solo: auto-mint both halves; fleet:
+``--operator-pubkey`` writes only the public half), writes configuration with
+restrictive permissions, installs (or repoints) the in-gateway hook, and
+verifies the result. It is idempotent and never registers an OS service —
+native service registration wraps ``serve`` separately.
 
 Legacy ``~/.hermes-flight-recorder`` data is never moved silently: ``install``
 detects it and stops with an actionable message. (A ``migrate`` command that
@@ -19,7 +20,10 @@ import shutil
 import time
 from pathlib import Path
 
+from . import content_crypto as cc
+from . import keystore
 from . import recorder_config
+from . import sync_config
 from ._common import (
     CAPTURE_BACKFILL_META_KEY,
     INSTALLED_AT_META_KEY,
@@ -64,6 +68,7 @@ def install(
     hermes_home: str | os.PathLike[str] | None,
     *,
     backfill: bool = True,
+    operator_pubkey: str | os.PathLike[str] | None = None,
     log=print,
 ) -> Path:
     """Install (or update) the Flight Recorder into ``hermes_home``.
@@ -72,6 +77,12 @@ def install(
     validation or verification failure. ``log`` receives human-readable progress
     lines (default ``print``). With ``backfill=False`` capture starts from the
     install moment instead of ingesting the whole Hermes history.
+
+    ``operator_pubkey`` selects the key model. Omitted → **solo**: an operator
+    keypair is minted here (both halves local), so this box can decrypt its own
+    outbox. A path → **fleet agent**: only that operator public key is written;
+    no private key ever lands on the host, so a compromise can write but not
+    read history.
     """
     hermes = resolve_hermes_home(hermes_home)
     if not hermes.is_dir():
@@ -134,13 +145,15 @@ def install(
         log(f"installation id:      {installation_id}")
         log(f"installed build:      {version.build}")
 
+        _establish_operator_key(fr_home, operator_pubkey, log=log)
+
         _write_default_config(fr_home, log=log)
 
         hook_dir = install_hook(hermes, fr_home, force=True, build=version.build)
         log(f"hook installed:       {hook_dir}")
 
         _verify(fr_home, hook_dir)
-        log("verified outbox, encryption key, config, and hook.")
+        log("verified outbox, operator key, config, and hook.")
         log("restart the Hermes gateway to load the hook, then run "
             "`hermes-flight-recorder serve`.")
         return fr_home
@@ -156,10 +169,60 @@ def _stop_if_legacy_present(fr_home: Path, *, log) -> None:
         raise InstallError(
             f"legacy Flight Recorder data found at {legacy}.\n"
             f"Automatic migration is not available yet. Move its contents "
-            f"(outbox.sqlite, content-dev.key, recorder-config.json, "
-            f"sync-config.json) to {fr_home} while `serve` is stopped, then "
-            f"re-run install; or set SC_HERMES_FLIGHT_RECORDER_HOME to keep "
-            f"using {legacy}."
+            f"(outbox.sqlite, operator.pub, operator.secret, "
+            f"recorder-config.json, sync-config.json) to {fr_home} while "
+            f"`serve` is stopped, then re-run install; or set "
+            f"SC_HERMES_FLIGHT_RECORDER_HOME to keep using {legacy}."
+        )
+
+
+def _establish_operator_key(
+    fr_home: Path, operator_pubkey: str | os.PathLike[str] | None, *, log
+) -> None:
+    """Set up the operator key this install seals content to.
+
+    Fleet agent (``operator_pubkey`` given): write only the public key, so no
+    private key touches the host. Solo (omitted): mint a keypair locally if one
+    is not already present, and warn if a sync config is present — a host-held
+    private key defeats the compromised-host property, and the fleet flow keeps
+    the private half on the operator console instead. Idempotent: an existing
+    key is preserved.
+    """
+    if operator_pubkey is not None:
+        source = Path(operator_pubkey).expanduser()
+        try:
+            public = cc.load_public_key(source.read_text(encoding="ascii"))
+        except OSError as exc:
+            raise InstallError(
+                f"cannot read operator public key at {source}: {exc}"
+            ) from exc
+        except cc.CryptoError as exc:
+            raise InstallError(f"invalid operator public key at {source}: {exc}") from exc
+        try:
+            path = keystore.write_public_key(fr_home, public)
+        except keystore.KeystoreError as exc:
+            raise InstallError(str(exc)) from exc
+        log(f"operator key:         fleet agent, public only ({public.key_id})")
+        log(f"                      {path}")
+        return
+
+    if keystore.has_public(fr_home) and not keystore.has_secret(fr_home):
+        raise InstallError(
+            f"{keystore.public_path(fr_home)} exists without a private key; this "
+            f"host is a fleet agent. Re-run with --operator-pubkey to refresh it, "
+            f"or remove it deliberately to convert this host to solo."
+        )
+    try:
+        keypair = keystore.ensure_solo_keypair(fr_home)
+    except keystore.KeystoreError as exc:
+        raise InstallError(str(exc)) from exc
+    log(f"operator key:         solo, both halves local ({keypair.key_id})")
+    if sync_config.config_path(fr_home).exists():
+        log(
+            "warning: a sync config is present and this host now holds the "
+            "operator private key. A host-held private key defeats the "
+            "compromised-host property; for a fleet, install agents with "
+            "--operator-pubkey and keep the private key on your operator console."
         )
 
 
@@ -185,11 +248,14 @@ def _verify(fr_home: Path, hook_dir: Path) -> None:
     except OutboxError as exc:
         raise InstallError(f"outbox verification failed: {exc}") from exc
 
-    # Encryption key exists with owner-only permissions (where supported).
-    key = fr_home / "content-dev.key"
-    if not key.exists():
-        raise InstallError(f"encryption key missing at {key}")
-    _require_owner_only(key, "encryption key")
+    # Operator public key exists (both solo and fleet installs have it). A
+    # private key is optional (solo has it, a fleet agent must not); when it is
+    # present it must be owner-only.
+    public = keystore.public_path(fr_home)
+    if not public.exists():
+        raise InstallError(f"operator public key missing at {public}")
+    if keystore.has_secret(fr_home):
+        _require_owner_only(keystore.secret_path(fr_home), "operator private key")
     _require_owner_only(recorder_config.config_path(fr_home), "recorder config")
 
     # Hook files exist and target this recorder root.

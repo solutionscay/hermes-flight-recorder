@@ -41,15 +41,18 @@ def test_fresh_install_default_location(tmp_path, capsys):
     fr = hermes / "flight-recorder"
     assert (fr / "outbox.sqlite").exists()
     assert (fr / "recorder-config.json").exists()
-    key = fr / "content-dev.key"
-    assert key.exists()
+    # Solo install mints both operator key halves locally.
+    public = fr / "operator.pub"
+    secret = fr / "operator.secret"
+    assert public.exists()
+    assert secret.exists()
 
     hook_dir = hermes / "hooks" / "hermes-flight-recorder"
     assert (hook_dir / "handler.py").exists() and (hook_dir / "HOOK.yaml").exists()
     assert Path(baked_flight_recorder_home(hook_dir)).resolve() == fr.resolve()
 
     if os.name == "posix":
-        assert (key.stat().st_mode & 0o077) == 0
+        assert (secret.stat().st_mode & 0o077) == 0  # private key owner-only
         assert ((fr / "recorder-config.json").stat().st_mode & 0o077) == 0
 
     # No OS service artifacts created anywhere under the Hermes home.
