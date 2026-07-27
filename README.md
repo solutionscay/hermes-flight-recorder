@@ -124,6 +124,25 @@ hermes-flight-recorder install --hermes-home "<HERMES_HOME>" \
   --operator-pubkey /path/to/operator.pub
 ```
 
+#### Operator key in one minute
+
+- **One key pair for the whole fleet.** `keygen` mints it **once**, on your
+  operator console — not on an agent. There is no key to "get" from the backend;
+  the backend never holds one.
+- **Agents get the public half only.** Hand every agent `operator.pub` (via
+  `--operator-pubkey`). **Never** distribute `operator.secret` or place it on an
+  agent host.
+- **Plain `install` (no `--operator-pubkey`) is *solo*** — it mints the key pair
+  **on that host**. Fine for a single laptop that reads its own data, but do not
+  use one agent's solo key as the fleet key: its private half would sit on an
+  agent, so a compromise of that host could read the whole fleet's history.
+- **Back up `operator.secret`.** It is the single key that decrypts the fleet.
+  Lose it and captured history is unreadable; leak it and the protection is gone.
+- **To read captured content**, paste `operator.secret` (the
+  `hfr-operator-secret-v1:…` line) into the console's unlock. It is used in the
+  browser only — decryption is client-side, and the key is never sent to the
+  backend. See [docs/key-model.md](docs/key-model.md).
+
 By default `install` captures the existing Hermes history on the first pass. To
 record only new activity from the install moment on, add `--no-backfill`:
 
