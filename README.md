@@ -54,6 +54,10 @@ Facts about the cloud connection:
 - The ingestion protocol is open. You can also run your own compatible backend.
 - Flight Recorder sends the token in two headers, not in the request body.
 - If the network is down, the outbox keeps the events. The next sync sends them.
+- Each sync pass also ships the **wrapped data keys** (the operator-sealed keys
+  that decrypt content) to `/ingest/keys`, so the operator console can decrypt
+  content client-side. They travel as opaque blobs; the backend never unwraps
+  them. See [docs/key-model.md](docs/key-model.md).
 
 ## 3. How to install and configure
 
