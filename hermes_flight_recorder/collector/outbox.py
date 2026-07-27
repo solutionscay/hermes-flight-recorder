@@ -43,7 +43,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from ..envelope import SCHEMA_VERSION, parse, serialize, validate
 from . import content_crypto as cc
@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS content_keys (
     key_version     TEXT PRIMARY KEY,
     operator_key_id TEXT NOT NULL,
     wrapped_dek     TEXT NOT NULL,
-    created_at      REAL NOT NULL
+    created_at      REAL NOT NULL,
+    shipped_at      REAL
 );
 CREATE TABLE IF NOT EXISTS knowledge_artifact (
     artifact_id TEXT PRIMARY KEY,
@@ -349,6 +350,41 @@ class Outbox:
             "content_hash": content_hash,
             "key_version": key_version,
         }
+
+    # --- wrapped DEK shipping -------------------------------------------
+    # The wrapped DEKs are a small keyless side-channel: each is an opaque
+    # blob sealed to the operator public key, shipped out of band so a reader
+    # with the operator private key can unwrap it (the server never can). They
+    # travel to the ingestion service's wrapped-DEK endpoint separately from
+    # events; ``shipped_at`` records a durable ack so a later pass skips them.
+    # Delivery is idempotent server-side by (installation_id, key_version).
+    def iter_unshipped_content_keys(self) -> Iterator[dict[str, Any]]:
+        """Yield wrapped-DEK records not yet acknowledged by the service.
+
+        ``recipient_key_id`` is the operator key epoch the DEK was sealed to;
+        ``wrapped_dek`` is opaque base64 already. ``installation_id`` ties each
+        record to this installation, exactly as an event does.
+        """
+        inst = self.installation_id
+        rows = self._conn.execute(
+            "SELECT key_version, operator_key_id, wrapped_dek FROM content_keys "
+            "WHERE shipped_at IS NULL ORDER BY created_at, key_version"
+        ).fetchall()
+        for key_version, operator_key_id, wrapped_dek in rows:
+            yield {
+                "installation_id": inst,
+                "key_version": key_version,
+                "recipient_key_id": operator_key_id,
+                "wrapped_dek": wrapped_dek,
+            }
+
+    def mark_content_keys_shipped(self, key_versions: Iterable[str]) -> None:
+        """Record that wrapped-DEK records were durably accepted."""
+        now = time.time()
+        self._conn.executemany(
+            "UPDATE content_keys SET shipped_at=? WHERE key_version=?",
+            [(now, kv) for kv in key_versions],
+        )
 
     # --- reading (operator private key required) ------------------------
     def _resolve_keypair(self, keypair: cc.OperatorKeyPair | None) -> cc.OperatorKeyPair:

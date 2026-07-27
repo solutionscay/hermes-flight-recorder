@@ -500,6 +500,7 @@ def _sync_once(
         f"shipped {acked} / acked {acked} / pending {pending}  "
         f"(delivery cursor {cursor}, producer high-water {cursor + pending})"
     )
+    _sync_content_keys_once(outbox, transport)
     if retention_config is not None:
         _automatic_prune(outbox, retention_config)
     if outcome.ok:
@@ -515,6 +516,31 @@ def _sync_once(
         message += f": {outcome.detail}"
     print(message, file=sys.stderr)
     return _SYNC_UNREACHABLE
+
+
+def _sync_content_keys_once(outbox, transport) -> None:
+    """Ship pending wrapped DEKs alongside events; best-effort, never fatal.
+
+    The wrapped-DEK side-channel is independent of event delivery: a network or
+    auth failure just leaves the records for the next pass (delivery is
+    idempotent server-side), so it only reports and never changes the sync exit
+    code. A terminal client defect is surfaced but still not fatal to events.
+    """
+    from .collector.transport import TerminalTransportError, push_content_keys
+
+    try:
+        outcome = push_content_keys(outbox, transport)
+    except TerminalTransportError as exc:
+        print(
+            f"wrapped-key sync stopped: malformed batch (client defect): {exc}",
+            file=sys.stderr,
+        )
+        return
+    if outcome.ok:
+        if outcome.result is not None and outcome.result.keys_sent:
+            print(f"shipped {outcome.result.keys_sent} wrapped key(s)")
+    else:
+        print(f"wrapped-key sync deferred ({outcome.reason})", file=sys.stderr)
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:

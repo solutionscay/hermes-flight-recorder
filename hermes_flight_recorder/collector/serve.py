@@ -228,7 +228,26 @@ def _sync(outbox, transport, config, log: logging.Logger) -> None:
             log.error("sync failed: the edge rejected the service token")
         else:
             log.warning("sync failed: the ingestion service is unreachable (buffered)")
+    _sync_content_keys(outbox, transport, log)
     _maybe_prune(outbox, config.retention, log)
+
+
+def _sync_content_keys(outbox, transport, log: logging.Logger) -> None:
+    """Ship pending wrapped DEKs; best-effort and independent of event sync."""
+    from .transport import TerminalTransportError, push_content_keys
+
+    try:
+        outcome = push_content_keys(outbox, transport)
+    except TerminalTransportError as exc:
+        log.error("wrapped-key sync stopped: malformed batch (client defect): %s", exc)
+        return
+    if outcome.ok:
+        if outcome.result is not None and outcome.result.keys_sent:
+            log.info("wrapped-key sync: shipped %d", outcome.result.keys_sent)
+    elif outcome.reason == "auth":
+        log.error("wrapped-key sync failed: the edge rejected the service token")
+    else:
+        log.warning("wrapped-key sync failed: the service is unreachable (buffered)")
 
 
 def _maybe_prune(outbox, retention_config, log: logging.Logger) -> None:

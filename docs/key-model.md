@@ -114,6 +114,20 @@ content of the current run — not the fleet's history. This is documented, not
 hidden. The mitigation is the fleet posture (no private key on the host) plus
 ordinary process isolation.
 
+## Shipping to the backend
+
+The wrapped DEKs are a small **keyless side-channel**, shipped out of band from
+events. Each sync pass, after delivering events, the agent ships any
+`content_keys` rows it has not yet had acknowledged to the ingestion service's
+wrapped-DEK endpoint (`POST <ingest_url>/keys`, under the same Cloudflare Access
+service token), then records a durable `shipped_at` so a later pass skips them.
+Delivery is idempotent server-side by `(installation_id, key_version)`, so a
+resend after a lost ack is harmless, and it is best-effort: an offline or auth
+failure just leaves the rows for the next pass without affecting event delivery.
+The backend stores and serves each `wrapped_dek` as an opaque blob and never
+unwraps it (hermes-dbaas #62); the operator console fetches the set and unwraps
+client-side with the operator private key (hermes-dbaas #63).
+
 ## Greenfield
 
 There are no users and no migration shims. Agents are reinstalled under this
