@@ -108,6 +108,19 @@ counter, its current absolute value becomes the first delta of the new counter
 epoch and the affected names appear in `counter_reset_fields`. Consumers can
 therefore sum event values without double-counting cumulative snapshots.
 
+**Durable terminal usage semantics:** a finalized `session.ended` or
+`subagent.completed` event projected from `state.db:sessions` sets
+`payload.usage_semantics` to `"cumulative_total"`. Its available API-call,
+token, and cost fields are the authoritative whole-session totals, not
+additive event-stream deltas. Consumers must not add them to
+`model.usage_recorded` deltas. Optional telemetry columns and SQL `NULL`
+values are omitted, while an explicit numeric zero is preserved. When
+available, the terminal also carries `actual_cost_usd`, `cost_status`, and
+`cost_source`. Partial terminals do not claim cumulative totals and omit
+these usage and cost fields. This additive v1 payload extension is prospective:
+the append-only outbox does not rewrite terminal events captured before the
+field existed, so consumers must tolerate a terminal without the marker.
+
 **Invocation content projection:** the live `hook:agent:start` and
 `hook:agent:end` records are immediate, partial, metadata-only bookends.
 Hermes truncates their message/response context before the hook runs, so the

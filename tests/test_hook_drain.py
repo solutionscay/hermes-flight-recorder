@@ -171,6 +171,7 @@ def test_session_end_recovers_session_id_from_start(tmp_path: Path) -> None:
     assert ended["session_id"] == "s1"  # recovered via the session_key map
     assert ended["correlation_id"] == "s1"
     assert ended["partial"] is True
+    assert "usage_semantics" not in ended["payload"]
     assert ended["payload"]["reason"] == "end"
 
 

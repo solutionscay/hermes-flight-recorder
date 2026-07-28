@@ -120,14 +120,30 @@ def _stream_key(r: dict[str, Any]) -> tuple:
     return (r.get("installation_id") or "", r.get("producer_sequence") or 0)
 
 
+_TERMINAL_SUMMARY_FIELDS = (
+    "kind",
+    "end_reason",
+    "usage_semantics",
+    "api_call_count",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "estimated_cost_usd",
+    "actual_cost_usd",
+    "cost_status",
+    "cost_source",
+)
+
 # key plaintext fields to surface per event family, in display order
 _SUMMARY_FIELDS: dict[str, tuple[str, ...]] = {
     "tool.call_completed": ("tool_name", "status", "effect_disposition"),
     "model.usage_recorded": ("model", "input_tokens", "output_tokens", "estimated_cost_usd"),
     "session.created": ("kind", "model"),
-    "session.ended": ("kind", "end_reason", "input_tokens", "output_tokens", "estimated_cost_usd"),
+    "session.ended": _TERMINAL_SUMMARY_FIELDS,
     "subagent.child_spawned": ("kind", "model"),
-    "subagent.completed": ("kind", "end_reason"),
+    "subagent.completed": _TERMINAL_SUMMARY_FIELDS,
     "delegation.dispatched": ("delegation_id", "state", "is_batch"),
     "cron.run_claimed": ("job_id", "status"),
     "cron.run_finished": ("job_id", "status", "ok"),
@@ -294,11 +310,20 @@ class _Index:
         ended = node.get("ended")
         if ended is not None:
             p = ended["payload"]
-            return (
-                int(p.get("input_tokens") or 0),
-                int(p.get("output_tokens") or 0),
-                float(p.get("estimated_cost_usd") or 0.0),
-            )
+            semantics = p.get("usage_semantics")
+            # New finalized durable terminals declare their totals explicitly.
+            # Preserve support for non-partial legacy terminals captured before
+            # that marker existed.  A partial terminal is only a lifecycle
+            # bookend; its counters are not authoritative.
+            if not ended.get("partial", False) and semantics in (
+                None,
+                "cumulative_total",
+            ):
+                return (
+                    int(p.get("input_tokens") or 0),
+                    int(p.get("output_tokens") or 0),
+                    float(p.get("estimated_cost_usd") or 0.0),
+                )
         tin = tout = 0
         cost = 0.0
         for u in self.usage.get(sid, []):

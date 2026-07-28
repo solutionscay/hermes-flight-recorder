@@ -114,9 +114,13 @@ _CASES: list[tuple[str, dict, str]] = [
      {"kind": "cli", "model": "gpt"},
      "kind=cli model=gpt"),
     ("session.ended",
-     {"kind": "cli", "end_reason": "done", "input_tokens": 50, "output_tokens": 10,
-      "estimated_cost_usd": 0.02},
-     "kind=cli end_reason=done input_tokens=50 output_tokens=10 estimated_cost_usd=0.02"),
+     {"kind": "cli", "end_reason": "done", "usage_semantics": "cumulative_total",
+      "api_call_count": 3, "input_tokens": 50, "output_tokens": 10,
+      "reasoning_tokens": 2, "estimated_cost_usd": 0.0,
+      "actual_cost_usd": 0.0, "cost_status": "included", "cost_source": "none"},
+     "kind=cli end_reason=done usage_semantics=cumulative_total api_call_count=3 "
+     "input_tokens=50 output_tokens=10 reasoning_tokens=2 estimated_cost_usd=0 "
+     "actual_cost_usd=0 cost_status=included cost_source=none"),
     ("subagent.child_spawned",
      {"kind": "subagent", "model": "gpt"},
      "kind=subagent model=gpt"),

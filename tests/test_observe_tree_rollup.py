@@ -65,6 +65,22 @@ def test_own_tokens_ended_takes_precedence_no_double_count(tmp_path):
     assert "999" not in p_line and "888" not in p_line
 
 
+def test_own_tokens_partial_terminal_falls_back_to_usage_deltas(tmp_path):
+    ob = new_outbox(tmp_path)
+    add(ob, "session.created", session_id="P", correlation_id="P", payload={"kind": "cli"})
+    add(ob, "model.usage_recorded", session_id="P", correlation_id="P",
+        payload={"model": "m", "input_tokens": 12, "output_tokens": 5,
+                 "estimated_cost_usd": 0.0025})
+    add(ob, "session.ended", session_id="P", correlation_id="P", partial=True,
+        payload={"kind": "cli", "usage_semantics": "cumulative_total",
+                 "input_tokens": 999, "output_tokens": 888,
+                 "estimated_cost_usd": 9.99})
+
+    idx = observe._Index(observe.load(ob))
+
+    assert idx.own_tokens("P") == (12, 5, 0.0025)
+
+
 def test_own_tokens_sums_multiple_usage_rows_when_no_ended(tmp_path):
     ob = new_outbox(tmp_path)
     add(ob, "session.created", session_id="Q", correlation_id="Q", payload={"kind": "cli"})
