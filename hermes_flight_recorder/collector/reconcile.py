@@ -15,13 +15,18 @@ Four detectors, each grounded in the real probe (see issue #6):
 - **Coverage-gap.** A durable row (session, tool message, model-usage,
   execution) with no matching captured event means the live stream dropped
   it. Emit ``reconcile.gap_detected`` with ``gap_kind='uncaptured_row'``.
-- **Missing-terminal.** A start-node past its lifetime with no terminal.
-  Sessions, cron runs, and open Kanban task attempts are judged from the
-  authoritative durable row (``ended_at`` / ``finished_at`` / a lapsed
-  ``claim_expires`` on a run whose ``outcome`` is still NULL); invocations are
-  judged from the outbox (``invocation.started`` with no
-  ``invocation.completed``), because the ``turn_id`` lives only in memory.
-  Emit ``reconcile.terminal_missing``.
+- **Missing-terminal.** An ``invocation.started`` in the outbox with no
+  matching ``invocation.completed`` past its lifetime. Judged from the captured
+  stream — ``invocation.completed`` is the authoritative end-of-run signal, and
+  the ``turn_id`` lives only in memory. Emit ``reconcile.terminal_missing``.
+
+  Session, subagent, and cron-run missing-terminal detection was removed: it
+  judged completion from the durable ``ended_at`` / ``finished_at`` column
+  rather than the captured terminal event, so a run that finished (its
+  ``invocation.completed`` captured) but whose durable column lagged or never
+  finalized produced a false ``terminal_missing`` minutes later. See issues
+  #94 (false negatives) and #95 (partial durable terminals) — the durable
+  column and the captured event never agreed, so the check was net noise.
 - **Missed-cron.** Reconstruct the expected fire instants from the
   ``jobs.json`` schedule (interval, once, or cron expression) and diff them
   against ``executions.db`` ``claimed_at``. Emit ``cron.run_missed`` with
@@ -46,7 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from . import CAPTURE_HEARTBEAT_KEY, knowledge_store
-from ..envelope import SESSION_LIFECYCLE, SESSION_START_TYPES
+from ..envelope import SESSION_START_TYPES
 from ._common import (
     INSTALLED_AT_META_KEY,
     append_and_count,
@@ -86,11 +91,11 @@ class ReconcileConfig:
     pass small windows and a fixed ``now``.
     """
 
-    # A start-node older than this with no terminal is judged missing.
-    session_terminal_timeout: float = 12 * 3600.0
-    subagent_terminal_timeout: float = 30 * 60.0
+    # An invocation.started older than this with no invocation.completed is
+    # judged missing. (Session/subagent/cron-run terminal detection was removed;
+    # it relied on the durable ended_at/finished_at column, which disagrees with
+    # the captured terminal — see issues #94 and #95.)
     invocation_terminal_timeout: float = 60 * 60.0
-    cron_run_terminal_timeout: float = 15 * 60.0
     # A durable row must remain absent from the captured stream through more
     # than one capture tick before it is a coverage gap. Reconcile and capture
     # can start at the same second, so an immediate diff creates false alerts.
@@ -153,12 +158,10 @@ def reconcile(
     counts: dict[str, int] = defaultdict(int)
 
     _detect_sequence_gaps(outbox, events, installation_id, counts, when)
-    session_rows, parent_map = _detect_coverage_gaps(
+    _detect_coverage_gaps(
         outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
     )
-    _detect_missing_terminals(
-        outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map, horizon
-    )
+    _detect_missing_terminals(outbox, events, counts, when, cfg, horizon)
     _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon)
     _detect_gateway_start_failed(outbox, home, counts, when)
     _detect_stale_task_leases(outbox, home, counts, when, cfg)
@@ -277,7 +280,6 @@ def _detect_coverage_gaps(
             grace=config.coverage_grace,
         )
     _coverage_kanban(outbox, home, captured, counts, when, config, horizon)
-    return session_rows, parent_map
 
 
 def _coverage_sessions(
@@ -536,95 +538,16 @@ def _coverage_ready(
 
 
 # --- missing terminals --------------------------------------------------
-def _detect_missing_terminals(
-    outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map, horizon
-) -> None:
-    _terminals_sessions(outbox, session_rows, parent_map, counts, when, cfg, horizon)
-    _terminals_cron_runs(outbox, exec_rows, counts, when, cfg, horizon)
-    _terminals_invocations(outbox, events, counts, when, cfg, horizon)
-
-
-def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg, horizon) -> None:
-    """A durable session/subagent row with ended_at NULL past its window.
-
-    The durable row is authoritative: a live session keeps ended_at=NULL and
-    is not a crash, so judge it only after the lifetime window.
-    """
-    for r in rows:
-        if r["ended_at"] is not None:
-            continue
-        started = to_epoch(r["started_at"])
-        if started is None:
-            continue
-        if started < horizon:
-            continue  # started before the recorder existed — not our crash
-        is_sub = r["source"] == "subagent"
-        timeout = cfg.subagent_terminal_timeout if is_sub else cfg.session_terminal_timeout
-        age = when - started
-        if age <= timeout:
-            continue  # still within its lifetime — provisional, not missing
-        subject_type = "subagent" if is_sub else "session"
-        start_type, expected = SESSION_LIFECYCLE[subject_type]
-        sid = r["id"]
-        corr = root_session(sid, parent_map) or sid
-        _emit_terminal_missing(
-            outbox,
-            counts,
-            occurred_at=when,
-            correlation_id=corr,
-            subject_type=subject_type,
-            subject_id=sid,
-            start_event_type=start_type,
-            expected_terminal_event_type=expected,
-            session_id=sid,
-            parent_session_id=r["parent_session_id"],
-            profile=r["profile_name"] or "default",
-            details={
-                "start_occurred_at": started,
-                "age_seconds": age,
-            },
-            dedup_key=f"reconcile:terminal:{subject_type}:{sid}",
-        )
-
-
-def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg, horizon) -> None:
-    """A durable execution with finished_at NULL past its window."""
-    for r in exec_rows:
-        if r["finished_at"] is not None:
-            continue
-        claimed = r["claimed_epoch"]
-        if claimed is None:
-            continue
-        if claimed < horizon:
-            continue  # claimed before the recorder existed
-        age = when - claimed
-        if age <= cfg.cron_run_terminal_timeout:
-            continue
-        exid = r["id"]
-        _emit_terminal_missing(
-            outbox,
-            counts,
-            occurred_at=when,
-            correlation_id=r["job_id"],
-            subject_type="cron_run",
-            subject_id=exid,
-            start_event_type="cron.run_claimed",
-            expected_terminal_event_type="cron.run_finished",
-            details={
-                "job_id": r["job_id"],
-                "status": r["status"],
-                "start_occurred_at": claimed,
-                "age_seconds": age,
-            },
-            dedup_key=f"reconcile:terminal:cron_run:{exid}",
-        )
-
-
-def _terminals_invocations(outbox, events, counts, when, cfg, horizon) -> None:
+def _detect_missing_terminals(outbox, events, counts, when, cfg, horizon) -> None:
     """An invocation.started with no invocation.completed, past its window.
 
-    The turn_id lives only in memory, so invocations are judged from the
-    captured (hook) stream, not a durable table.
+    Only invocations are judged. ``invocation.completed`` is the authoritative
+    end-of-run signal and the ``turn_id`` lives only in memory, so this reads
+    the captured (hook) stream, not a durable table. Session, subagent, and
+    cron-run terminal detection was removed: it trusted the durable
+    ``ended_at`` / ``finished_at`` column, which disagrees with the captured
+    terminal and produced false findings after a run had finished (issues #94,
+    #95).
     """
     completed: set[str] = set()
     started: dict[str, dict[str, Any]] = {}

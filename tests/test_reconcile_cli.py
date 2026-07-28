@@ -90,9 +90,9 @@ def make_state_db(hermes_home: Path, session_rows: list[tuple]) -> None:
     """A minimal state.db with just the sessions table (plus the empty
     messages / session_model_usage tables the coverage detector queries).
 
-    The sessions column list and order match exactly what
-    ``_terminals_sessions`` selects: (id, source, parent_session_id,
-    started_at, ended_at, expiry_finalized, profile_name).
+    The sessions column list and order match exactly what the coverage
+    detector selects: (id, source, parent_session_id, started_at, ended_at,
+    expiry_finalized, profile_name).
     """
     db = sqlite3.connect(hermes_home / "state.db")
     db.executescript(
@@ -205,9 +205,8 @@ def test_reconcile_reports_coverage_gap_for_uncaptured_session(tmp_path, capsys)
     make_initialized_flight_recorder_home(bridge)
     hermes_home = tmp_path / "hermes-cover"
     hermes_home.mkdir()
-    # started "now" (real wall clock): comfortably inside the default
-    # session_terminal_timeout window (12h), so only the coverage-gap
-    # fires, not a terminal-missing.
+    # An open session row (ended_at NULL). Sessions are not terminal-judged
+    # (that detection was removed — #94/#95), so only the coverage-gap fires.
     recent_started = time.time()
     make_state_db(hermes_home, [("S", "cli", None, recent_started, None, 0, None)])
 
@@ -236,16 +235,19 @@ def test_reconcile_reports_coverage_gap_for_uncaptured_session(tmp_path, capsys)
     assert "reconcile.terminal_missing" not in captured.out
 
 
-def test_reconcile_reports_terminal_missing_for_stale_session(tmp_path, capsys):
+def test_stale_open_session_is_not_terminal_missing(tmp_path, capsys):
+    """Regression for the missing-terminal removal (#94/#95): a long-open
+    session (ended_at NULL, started well in the past) must NEVER produce a
+    reconcile.terminal_missing. It surfaces only as a coverage gap.
+    """
     bridge = tmp_path / "bridge-term"
     make_initialized_flight_recorder_home(bridge)
     hermes_home = tmp_path / "hermes-term"
     hermes_home.mkdir()
 
-    # Anchor on the real default threshold plus a large safety margin, so
-    # this can never flip regardless of how long the test takes to run.
-    default_timeout = ReconcileConfig().session_terminal_timeout
-    stale_started = time.time() - default_timeout - 3600.0
+    # An old open session — the exact shape that used to emit a false
+    # terminal_missing minutes/hours after the run had actually finished.
+    stale_started = time.time() - 24 * 3600.0
     make_state_db(hermes_home, [("S", "cli", None, stale_started, None, 0, None)])
 
     code = cli.main(
@@ -254,10 +256,10 @@ def test_reconcile_reports_terminal_missing_for_stale_session(tmp_path, capsys):
     captured = capsys.readouterr()
 
     assert code == 0
-    # Terminal detection is immediate. Coverage detection waits through the
-    # capture grace and reports the same durable row on the next pass.
-    assert "reconciled 1 new finding(s)" in captured.out
-    assert "  reconcile.terminal_missing: 1" in captured.out
+    # No terminal finding at all; coverage detection waits through the capture
+    # grace and reports the durable row on the next pass.
+    assert "reconciled 0 new finding(s)" in captured.out
+    assert "reconcile.terminal_missing" not in captured.out
 
     outbox = Outbox.open(bridge)
     outbox.set_meta(

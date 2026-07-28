@@ -33,10 +33,7 @@ TZ = datetime.timezone(datetime.timedelta(hours=-5))
 # stays fired across a +300s "now" advance (see module docstring above).
 CFG = ReconcileConfig(
     coverage_grace=0.0,
-    session_terminal_timeout=100.0,
-    subagent_terminal_timeout=100.0,
     invocation_terminal_timeout=100.0,
-    cron_run_terminal_timeout=100.0,
     ticker_stale_after=100.0,
     cron_match_slack=45.0,
     once_match_slack=300.0,
@@ -139,11 +136,14 @@ def _interval_job(job_id, *, minutes, created) -> dict:
 def _build_scenario(tmp_path):
     """One store that triggers every reconcile.* / cron.run_missed finding.
 
+    Terminal detection covers only invocations and the cron ticker now;
+    session/subagent/cron-run terminal detection was removed (#94/#95).
+
     - S1: an open session (ended_at NULL) with no captured session.created
-      event -> both reconcile.gap_detected(uncaptured_row) AND, once past
-      its window, reconcile.terminal_missing(session).
+      event -> reconcile.gap_detected(uncaptured_row). (No terminal finding.)
     - INV1: invocation.started with no invocation.completed -> terminal_missing(invocation).
-    - ex_open: a cron execution with finished_at NULL -> terminal_missing(cron_run).
+    - ex_open: a cron execution with finished_at NULL -> reconcile.gap_detected(uncaptured_row).
+      (No terminal finding.)
     - j1: an interval job that fired at B+60 and B+240 but missed the B+120
       slot -> cron.run_missed (missed_count=2, not a tail: e2 closes the run).
     - A ticker heartbeat already stale at B+250 -> terminal_missing(cron_ticker),
@@ -185,14 +185,14 @@ def test_full_scenario_covers_every_finding_type(tmp_path):
     counts = reconcile(ob, hh, now=B + 250, config=CFG)
 
     assert counts.get("reconcile.gap_detected", 0) >= 2
-    assert counts.get("reconcile.terminal_missing", 0) >= 4
+    assert counts.get("reconcile.terminal_missing", 0) >= 2
     assert counts.get("cron.run_missed", 0) == 1
 
     gap_kinds = {e["payload"]["gap_kind"] for e in findings(ob, "reconcile.gap_detected")}
     assert gap_kinds == {"sequence", "uncaptured_row"}
 
     term_subjects = {e["payload"]["subject_type"] for e in findings(ob, "reconcile.terminal_missing")}
-    assert term_subjects == {"session", "invocation", "cron_run", "cron_ticker"}
+    assert term_subjects == {"invocation", "cron_ticker"}
 
     missed = findings(ob, "cron.run_missed")
     assert len(missed) == 1
@@ -278,14 +278,14 @@ def test_terminal_missing_dedup_key_is_subject_id_and_stable(tmp_path):
     ob, hh = _build_scenario(tmp_path)
     reconcile(ob, hh, now=B + 250, config=CFG)
 
-    session_keys = dedup_keys(ob, "reconcile:terminal:session:%")
-    assert session_keys == ["reconcile:terminal:session:S1"]
+    # Sessions are no longer terminal-judged (#94/#95); only the invocation
+    # subject keys on subject_id here.
+    assert dedup_keys(ob, "reconcile:terminal:session:%") == []
     invocation_keys = dedup_keys(ob, "reconcile:terminal:invocation:%")
     assert invocation_keys == ["reconcile:terminal:invocation:INV1"]
 
     reconcile(ob, hh, now=B + 550, config=CFG)  # age grows, subject_id doesn't
 
-    assert dedup_keys(ob, "reconcile:terminal:session:%") == session_keys
     assert dedup_keys(ob, "reconcile:terminal:invocation:%") == invocation_keys
 
 

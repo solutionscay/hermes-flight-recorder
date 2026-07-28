@@ -108,7 +108,7 @@ def test_durable_row_with_no_captured_event_is_uncaptured(tmp_path):
     assert len(cover) == 1
     assert cover[0]["payload"]["subject_type"] == "session"
     assert cover[0]["payload"]["subject_id"] == "S"
-    assert types(ob)["reconcile.terminal_missing"] == 0  # within lifetime
+    assert types(ob)["reconcile.terminal_missing"] == 0  # sessions are not terminal-judged
 
 
 def test_polled_rows_are_not_flagged_as_uncaptured(tmp_path):
@@ -123,32 +123,9 @@ def test_polled_rows_are_not_flagged_as_uncaptured(tmp_path):
 
 
 # --- missing terminals --------------------------------------------------
-def test_open_session_past_timeout_is_terminal_missing(tmp_path):
-    hh = tmp_path / "hermes"; hh.mkdir()
-    db = sqlite3.connect(hh / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, expiry_finalized INT, profile_name TEXT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
-        """
-    )
-    db.execute("INSERT INTO sessions VALUES ('S','cli',NULL,?,NULL,0,NULL)", (B,))
-    db.commit(); db.close()
-    ob = new_outbox(tmp_path)
-
-    cfg = ReconcileConfig(session_terminal_timeout=100.0)
-    reconcile(ob, hh, now=B + 500, config=cfg)  # 500s > 100s window
-
-    term = findings(ob, "reconcile.terminal_missing")
-    assert len(term) == 1
-    assert term[0]["payload"]["subject_type"] == "session"
-    assert term[0]["payload"]["subject_id"] == "S"
-    assert term[0]["session_id"] == "S"
-    assert term[0]["partial"] is True
-
-
+# Only invocations are terminal-judged. Session/subagent/cron-run terminal
+# detection was removed: it trusted the durable ended_at/finished_at column,
+# which disagrees with the captured terminal (issues #94, #95).
 def test_invocation_started_without_completed_is_terminal_missing(tmp_path):
     ob = new_outbox(tmp_path)
     append_event(
@@ -167,21 +144,6 @@ def test_invocation_started_without_completed_is_terminal_missing(tmp_path):
     assert term[0]["payload"]["subject_type"] == "invocation"
     assert term[0]["payload"]["subject_id"] == "S:turn:3"
     assert term[0]["invocation_id"] == "S:turn:3"
-
-
-def test_unfinished_cron_execution_is_terminal_missing(tmp_path):
-    hh = tmp_path / "hermes"; hh.mkdir()
-    cron = hh / "cron"; cron.mkdir()
-    _executions_db(cron, [("e1", "j1", "running", iso(B), None, None)])
-    ob = new_outbox(tmp_path)
-
-    cfg = ReconcileConfig(cron_run_terminal_timeout=100.0)
-    reconcile(ob, hh, now=B + 500, config=cfg)
-
-    term = [e for e in findings(ob, "reconcile.terminal_missing")
-            if e["payload"]["subject_type"] == "cron_run"]
-    assert len(term) == 1
-    assert term[0]["payload"]["subject_id"] == "e1"
 
 
 # --- missed cron --------------------------------------------------------
