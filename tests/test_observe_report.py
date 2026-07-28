@@ -148,9 +148,9 @@ def test_uncaptured_row_detail_wording(tmp_path):
 def test_terminal_missing_detail_wording(tmp_path, extra_payload, expected_suffix):
     ob = new_outbox(tmp_path)
     payload = {
-        "subject_type": "session",
-        "subject_id": "P",
-        "expected_terminal_event_type": "session.ended",
+        "subject_type": "invocation",
+        "subject_id": "P:turn:1",
+        "expected_terminal_event_type": "invocation.completed",
         **extra_payload,
     }
     add(ob, "reconcile.terminal_missing", session_id="P", correlation_id="P",
@@ -160,7 +160,7 @@ def test_terminal_missing_detail_wording(tmp_path, extra_payload, expected_suffi
 
     assert code == 1
     detail_line = lines[2]
-    expected = f"session P has no session.ended{expected_suffix}"
+    expected = f"invocation P:turn:1 has no invocation.completed{expected_suffix}"
     assert detail_line.strip().endswith(expected)
 
 
@@ -268,7 +268,10 @@ def test_capture_stale_renders_a_readable_detail_line(tmp_path):
 
 
 # --- CLI + real reconciler integration ---------------------------------------
-def test_report_reflects_a_real_reconciler_terminal_missing_finding(tmp_path):
+def test_report_reflects_a_real_reconciler_coverage_gap_finding(tmp_path):
+    # A durable session row never captured into the outbox is a coverage gap.
+    # (Session terminal-missing detection was removed — #94/#95 — so the gap,
+    # not a terminal_missing, is what surfaces here.)
     hh = tmp_path / "hermes"
     hh.mkdir()
     db = sqlite3.connect(hh / "state.db")
@@ -278,14 +281,13 @@ def test_report_reflects_a_real_reconciler_terminal_missing_finding(tmp_path):
     db.close()
 
     ob = new_outbox(tmp_path)
-    cfg = ReconcileConfig(session_terminal_timeout=100.0)
-    reconcile(ob, hh, now=B + 500, config=cfg)  # 500s > 100s window -> terminal_missing
+    reconcile(ob, hh, now=B + 500, config=ReconcileConfig(coverage_grace=0.0))
     ob.close()
 
     bridge = str(tmp_path / "bridge")
     code = main(["observe", "--report", "--flight-recorder-home", bridge])
 
-    assert code == 1  # >=1 finding exists (terminal_missing, plus a coverage gap)
+    assert code == 1  # the uncaptured session row is a coverage gap
 
 
 def test_cli_clean_report_exits_zero(tmp_path, capsys):

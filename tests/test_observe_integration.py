@@ -37,12 +37,8 @@ TZ = datetime.timezone(datetime.timedelta(hours=-5))
 
 # Reconcile thresholds small enough that B + 250 already crosses them, so
 # the whole pipeline is deterministic with no wall-clock dependency.
-CFG = ReconcileConfig(
-    coverage_grace=0.0,
-    subagent_terminal_timeout=100.0,
-    cron_run_terminal_timeout=100.0,
-)
-NOW = B + 250  # subagent C (started B+5) is 245s old; the j1 cron gap sits at B+120
+CFG = ReconcileConfig(coverage_grace=0.0)
+NOW = B + 250  # the j1 cron gap sits at B+120/B+180; ticker heartbeat is fresh
 
 
 def iso(epoch: float) -> str:
@@ -228,15 +224,17 @@ def test_session_filter_scopes_to_subagent_subtree_and_excludes_unrelated(tmp_pa
 
 
 # --- report: reconcile findings surface with the right exit code --------
-def test_full_pipeline_report_surfaces_terminal_missing_and_cron_missed(tmp_path):
+def test_full_pipeline_report_surfaces_cron_missed(tmp_path):
+    # The open subagent C is NOT a reconcile finding: session/subagent terminal
+    # detection was removed (issues #94/#95). The missed cron fire is what
+    # drives the non-zero exit here.
     ob, _hh = _run_pipeline(tmp_path)
     lines, code = observe.render_report(observe.load(ob))
     text = "\n".join(lines)
     assert code == 1
-    assert "subagent C has no subagent.completed" in text
     assert "job j1 missed 2 fire(s)" in text
-    assert "reconcile.terminal_missing=1" in text
     assert "cron.run_missed=1" in text
+    assert "reconcile.terminal_missing" not in text
 
 
 def test_full_pipeline_stream_is_ordered_and_covers_every_stage(tmp_path):
@@ -248,10 +246,12 @@ def test_full_pipeline_stream_is_ordered_and_covers_every_stage(tmp_path):
 
     seen = {r["payload"]["event_type"] for r in records}
     # state_db.poll, cron_db.poll, and reconcile all contributed events.
+    # (No reconcile.terminal_missing: this fixture has no unpaired invocation,
+    # and session/subagent/cron-run terminal detection was removed — #94/#95.)
     assert {
         "session.created", "subagent.child_spawned", "tool.call_completed",
         "model.usage_recorded", "cron.run_claimed", "cron.run_finished",
-        "cron.ticker_heartbeat", "reconcile.terminal_missing", "cron.run_missed",
+        "cron.ticker_heartbeat", "cron.run_missed",
     } <= seen
 
 
@@ -308,4 +308,3 @@ def test_cli_observe_report_reads_full_pipeline_outbox_end_to_end(tmp_path, caps
     out = capsys.readouterr().out
     assert code == 1
     assert "job j1 missed 2 fire(s)" in out
-    assert "subagent C has no subagent.completed" in out

@@ -109,10 +109,7 @@ def make_executions_db(cron_dir, rows):
 # Small, explicit, deterministic windows — never wall-clock defaults.
 CFG = ReconcileConfig(
     coverage_grace=0.0,
-    session_terminal_timeout=100.0,
-    subagent_terminal_timeout=100.0,
     invocation_terminal_timeout=100.0,
-    cron_run_terminal_timeout=100.0,
     ticker_stale_after=100.0,
     cron_match_slack=45.0,
     once_match_slack=300.0,

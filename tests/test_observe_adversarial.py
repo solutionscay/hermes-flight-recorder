@@ -147,13 +147,13 @@ def test_stream_tree_report_never_leak_ciphertext_or_plaintext(tmp_path):
 def test_render_report_missing_optional_fields_does_not_raise():
     records = [
         mk("reconcile.terminal_missing", session_id="P",
-           payload={"subject_type": "session", "subject_id": "P",
-                    "expected_terminal_event_type": "session.ended"}),
+           payload={"subject_type": "invocation", "subject_id": "P:turn:1",
+                    "expected_terminal_event_type": "invocation.completed"}),
     ]
     lines, code = observe.render_report(records)
     assert code == 1
     text = "\n".join(lines)
-    assert "session P has no session.ended" in text
+    assert "invocation P:turn:1 has no invocation.completed" in text
     assert "None" not in text  # age missing -> no stray "~Nones past window"
 
 

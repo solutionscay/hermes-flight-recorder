@@ -131,8 +131,8 @@ def test_report_lists_findings_and_exits_nonzero(tmp_path):
         payload={"gap_kind": "sequence", "missing_sequence": 3,
                  "prev_sequence": 2, "next_sequence": 4}, partial=False)
     add(ob, "reconcile.terminal_missing", session_id="P", correlation_id="P",
-        payload={"subject_type": "session", "subject_id": "P",
-                 "expected_terminal_event_type": "session.ended", "age_seconds": 500},
+        payload={"subject_type": "invocation", "subject_id": "P:turn:1",
+                 "expected_terminal_event_type": "invocation.completed", "age_seconds": 500},
         partial=True)
     add(ob, "cron.run_missed", correlation_id="j1",
         payload={"job_id": "j1", "expected_fire_at": B, "missed_count": 2}, partial=True)
@@ -140,7 +140,7 @@ def test_report_lists_findings_and_exits_nonzero(tmp_path):
     text = "\n".join(lines)
     assert code == 1
     assert "missing #3" in text
-    assert "session P has no session.ended" in text
+    assert "invocation P:turn:1 has no invocation.completed" in text
     assert "job j1 missed 2 fire(s)" in text
     assert "reconcile.gap_detected=1" in text
 

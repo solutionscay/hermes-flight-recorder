@@ -3,14 +3,17 @@
 A fresh install over a long-lived Hermes home must not emit
 ``reconcile.terminal_missing`` (or ``cron.run_missed``) findings for work that
 started before the recorder existed. The horizon is the ``installed_at`` marker
-stamped at install, falling back to the earliest ``recorded_at``.
+stamped at install; absent the marker it is ``0.0`` (judge the whole store).
+
+Exercised against the invocation terminal detector — the surviving
+missing-terminal check. Session/subagent/cron-run terminal detection was
+removed (#94/#95), so the original #109 pre-install burst it guarded against
+can no longer come from those subjects; the horizon still gates invocations.
 """
 
 from __future__ import annotations
 
-import sqlite3
-
-from hermes_flight_recorder.collector._common import INSTALLED_AT_META_KEY
+from hermes_flight_recorder.collector._common import INSTALLED_AT_META_KEY, build_record
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 
@@ -26,25 +29,20 @@ def _outbox(tmp_path, *, installed_at: float | None = HORIZON) -> Outbox:
     return ob
 
 
-def _sessions_db(hermes, rows) -> None:
-    db = sqlite3.connect(hermes / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
-            model TEXT, message_count INT, tool_call_count INT, input_tokens INT,
-            output_tokens INT, estimated_cost_usd REAL, started_at REAL,
-            ended_at REAL, end_reason TEXT, profile_name TEXT, expiry_finalized INT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
-        """
+def _started(ob, inv_id: str, occurred: float) -> None:
+    """An invocation.started with no matching completed, occurring at ``occurred``."""
+    rec = build_record(
+        event_type="invocation.started",
+        occurred_at=occurred,
+        source="hook:test",
+        capture_method="hook:test",
+        runtime={"kind": "cli", "engine": "standard"},
+        correlation_id=inv_id,
+        invocation_id=inv_id,
+        session_id=inv_id,
+        payload={},
     )
-    for sid, started in rows:
-        db.execute(
-            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, "subagent", None, "m", 0, 0, 0, 0, 0.0, started, None, None, "default", 0),
-        )
-    db.commit()
-    db.close()
+    ob.append(rec)
 
 
 def _flagged(ob) -> set[str]:
@@ -55,29 +53,27 @@ def _flagged(ob) -> set[str]:
     }
 
 
-def test_pre_install_session_not_flagged_post_install_is(tmp_path):
-    hermes = tmp_path / "hermes"
-    hermes.mkdir()
-    _sessions_db(hermes, [("OLD", HORIZON - 10 * DAY), ("NEW", HORIZON + 10)])
+def test_pre_install_invocation_not_flagged_post_install_is(tmp_path):
     ob = _outbox(tmp_path)
+    _started(ob, "OLD", HORIZON - 10 * DAY)  # started before install
+    _started(ob, "NEW", HORIZON + 10)  # started after install
 
-    reconcile(ob, hermes, now=HORIZON + 100 * DAY, config=ReconcileConfig())
+    reconcile(ob, tmp_path / "no-hermes", now=HORIZON + 100 * DAY, config=ReconcileConfig())
 
     flagged = _flagged(ob)
     assert "OLD" not in flagged  # started before install — suppressed
-    assert "NEW" in flagged  # started after install, never ended — flagged
+    assert "NEW" in flagged  # started after install, never completed — flagged
     ob.close()
 
 
 def test_all_flagged_when_no_horizon(tmp_path):
-    # No installed_at marker and no captured events → horizon 0.0 → pre-#109
-    # behavior (judge the whole store). Both unended sessions are flagged.
-    hermes = tmp_path / "hermes"
-    hermes.mkdir()
-    _sessions_db(hermes, [("OLD", HORIZON - 10 * DAY), ("NEW", HORIZON + 10)])
+    # No installed_at marker → horizon 0.0 → pre-#109 behavior (judge the whole
+    # store). Both unpaired invocations are flagged.
     ob = _outbox(tmp_path, installed_at=None)
+    _started(ob, "OLD", HORIZON - 10 * DAY)
+    _started(ob, "NEW", HORIZON + 10)
 
-    reconcile(ob, hermes, now=HORIZON + 100 * DAY, config=ReconcileConfig())
+    reconcile(ob, tmp_path / "no-hermes", now=HORIZON + 100 * DAY, config=ReconcileConfig())
 
     assert _flagged(ob) == {"OLD", "NEW"}
     ob.close()
