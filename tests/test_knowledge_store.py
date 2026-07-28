@@ -12,10 +12,15 @@ from __future__ import annotations
 import base64
 import json
 import os
+from pathlib import Path
 
 from hermes_flight_recorder.collector import knowledge_store
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.recorder_config import KnowledgeConfig
+from hermes_flight_recorder.collector.sync import (
+    MAX_INGEST_BATCH_BYTES,
+    singleton_batch_size,
+)
 
 
 def knowledge_events(ob):
@@ -246,15 +251,55 @@ def test_emits_event_with_restorable_encrypted_content(tmp_path):
     assert payload["version_seq"] == 1
     assert payload["origin"] == "background"
     assert payload["file_count"] == 2
+    assert payload["content_format"] == knowledge_store.KNOWLEDGE_BUNDLE_FORMAT
     # The metadata is plaintext; the artifact content is encrypted and restores
     # byte-for-byte from the event alone.
     assert events[0].get("content_ciphertext") is not None
     bundle = json.loads(ob.decrypt_content(events[0]))
+    assert bundle["format"] == knowledge_store.KNOWLEDGE_BUNDLE_FORMAT
+    assert bundle["artifact_id"] == payload["artifact_id"]
+    assert bundle["version_seq"] == payload["version_seq"]
+    assert bundle["manifest_hash"] == payload["manifest_hash"]
+    assert [
+        (f["path"], f["byte_count"], f["content_hash"])
+        for f in bundle["files"]
+    ] == [
+        (entry["path"], len(ob.get_blob(entry["blob_hash"])), entry["blob_hash"])
+        for entry in ob.latest_knowledge_version(payload["artifact_id"])["manifest"]
+    ]
     restored = {
         f["path"]: base64.b64decode(f["content_b64"]).decode("utf-8")
         for f in bundle["files"]
     }
     assert restored == {"SKILL.md": body, "references/how.md": ref}
+
+
+def test_large_skill_uses_encrypted_chunks_and_restores_from_parent(tmp_path):
+    home = tmp_path / "hermes"
+    body = "large but complete\n" + ("x" * 2_500_000)
+    write_skill(home / "skills", "large", body)
+    ob = new_outbox(tmp_path)
+
+    counts = knowledge_store.poll(ob, home)
+
+    assert counts == {knowledge_store.KNOWLEDGE_EVENT: 1}
+    parent = knowledge_events(ob)[0]
+    assert parent["payload"]["content_storage"] == "chunked"
+    assert "content_ciphertext" not in parent
+    chunks = [
+        event
+        for event in ob.iter_events()
+        if event["payload"]["event_type"] == "runtime.content_chunk_recorded"
+    ]
+    assert len(chunks) == parent["payload"]["content_chunk_count"]
+    assert all(
+        singleton_batch_size(event) <= MAX_INGEST_BATCH_BYTES
+        for event in [*chunks, parent]
+    )
+
+    bundle = json.loads(ob.decrypt_content(parent))
+    restored = base64.b64decode(bundle["files"][0]["content_b64"]).decode()
+    assert restored == body
 
 
 def test_memory_target_and_action_update(tmp_path):
@@ -287,6 +332,7 @@ def test_delete_emits_a_contentless_tombstone_event(tmp_path):
     events = [e for e in knowledge_events(ob) if e["payload"]["artifact_id"] == "skill:gone"]
     assert [e["payload"]["action"] for e in events] == ["create", "delete"]
     assert events[-1].get("content_ciphertext") is None  # a tombstone carries no content
+    assert "content_format" not in events[-1]["payload"]
 
 
 def test_events_are_not_duplicated_on_repoll(tmp_path):
@@ -324,3 +370,33 @@ def test_backfills_a_version_that_predates_the_transport(tmp_path):
     assert len(events) == 1
     bundle = json.loads(ob.decrypt_content(events[0]))
     assert base64.b64decode(bundle["files"][0]["content_b64"]) == b"hello\n"
+
+
+def test_bundle_excludes_paths_that_are_not_safe_relative_posix_paths(tmp_path):
+    home = tmp_path / "hermes"
+    skill = write_skill(home / "skills", "safe", "# safe\n")
+    write(skill / "references" / "bad\\name.md", "not portable\n")
+    ob = new_outbox(tmp_path)
+
+    knowledge_store.poll(ob, home)
+
+    bundle = json.loads(ob.decrypt_content(knowledge_events(ob)[0]))
+    assert [entry["path"] for entry in bundle["files"]] == ["SKILL.md"]
+
+
+def test_knowledge_bundle_v1_matches_the_compatibility_fixture(tmp_path):
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "knowledge_bundle_v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    home = tmp_path / "hermes"
+    body = "# Deploy\n\nRun the release checklist.\n"
+    write_skill(home / "skills", "deploy", body)
+    ob = new_outbox(tmp_path)
+
+    knowledge_store.poll(ob, home)
+
+    event = knowledge_events(ob)[0]
+    assert event["payload"]["content_format"] == "knowledge.bundle.v1"
+    assert json.loads(ob.decrypt_content(event)) == fixture

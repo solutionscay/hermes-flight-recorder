@@ -54,6 +54,27 @@ uv venv --python 3.11
 uv pip install -e .
 ```
 
+The package reports a release version plus the source revision:
+
+```bash
+hermes-flight-recorder --version
+```
+
+To refresh an existing test installation from this checkout, first stop its
+`serve` process, then run:
+
+```bash
+hermes-flight-recorder update \
+  --hermes-home "$HERMES_HOME" \
+  --source "$PWD" \
+  --editable
+```
+
+The updater creates an SQLite-safe recovery snapshot, reinstalls the checkout,
+runs registered schema migrations in a new process, refreshes the hook, and
+verifies that the package and hook build identities match. Restart the Hermes
+gateway after each update so it loads the new hook.
+
 ## 3. Point Hermes Flight Recorder at the dev Hermes
 
 Hermes Flight Recorder reads the Hermes home the same way Hermes does — from
@@ -62,9 +83,11 @@ from step 1 when you run Hermes Flight Recorder commands.
 
 `hermes-flight-recorder install --hermes-home <path>` is idempotent: it creates
 the recorder home at `$HERMES_HOME/flight-recorder`, mints the installation
-identity and encryption key, writes configuration with mode `0600`, and installs
-(or repoints) the live capture hook under `$HERMES_HOME/hooks/`. Restart the
-Hermes gateway to load the hook. It never registers an OS service.
+identity, establishes the operator key content is sealed to (solo: a local
+keypair; fleet: `--operator-pubkey`, public only — see
+[key-model.md](key-model.md)), writes configuration with mode `0600`, and
+installs (or repoints) the live capture hook under `$HERMES_HOME/hooks/`.
+Restart the Hermes gateway to load the hook. It never registers an OS service.
 
 `hermes-flight-recorder serve --hermes-home <path>` then runs one portable
 foreground process: it drains the hook spool and polls the durable stores on
@@ -125,6 +148,14 @@ managing it yourself.
 so a shortened body is never silent. The limit applies uniformly to user,
 assistant, and tool content.
 
+`sync.max_bytes` is a soft batch target and defaults to 1 MiB. The ingestion
+protocol has a separate 4 MiB hard request limit. If encrypted content would
+make one event exceed that hard limit, the outbox preserves all of it as
+ordered encrypted `runtime.content_chunk_recorded` events and a small logical
+parent event. This is automatic for every content-producing collector,
+including large knowledge artifacts. The configured sync target cannot exceed
+4 MiB.
+
 Invocation hooks remain the immediate metadata source. Hermes truncates the
 message and response values it supplies to hooks, so the installed spooler
 removes those previews before writing the spool. The next `state.db` poll
@@ -153,7 +184,8 @@ reconciliation from reporting intentional retention as capture loss.
 
 `capture.interval_seconds` (default 15) and `reconcile.interval_seconds`
 (default 60) set the `serve` cadences; the one-shot `run` and `reconcile`
-commands ignore them. `sync.max_records` and `sync.max_bytes` are active now.
+commands ignore them. `sync.max_records` and `sync.max_bytes` are active now;
+`sync.max_bytes` controls batching but never raises the 4 MiB protocol ceiling.
 `sync.interval_seconds` is `null` by default, preserving the one-pass `sync`
 behavior; under `serve`, a `null` sync interval falls back to 60s when a sync
 config is present. An explicit `sync --interval` or `serve --sync-interval`

@@ -13,8 +13,10 @@ The hook package is the only write Flight Recorder ever makes into the Hermes ho
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+from ...version import build_identity
 from . import ERRLOG_FILENAME, HOOK_DIR_NAME, HOOK_EVENTS, SPOOL_FILENAME
 
 # Retained for installed-handler compatibility. The handler no longer drops
@@ -42,6 +44,7 @@ import time
 import uuid
 
 _BAKED_SC_HERMES_FLIGHT_RECORDER_HOME = @@BAKED@@
+_FLIGHT_RECORDER_BUILD = @@BUILD@@
 _SPOOL_FILENAME = @@SPOOL@@
 _ERRLOG_FILENAME = @@ERRLOG@@
 _MAX_SPOOL_BYTES = @@MAXBYTES@@
@@ -99,11 +102,15 @@ def handle(event_type, context):
 '''
 
 
-def render_handler(flight_recorder_home: str | Path) -> str:
+def render_handler(
+    flight_recorder_home: str | Path, *, build: str | None = None
+) -> str:
     """Return the handler source with the Flight Recorder home and constants baked in."""
     baked = str(Path(flight_recorder_home).expanduser().resolve())
+    installed_build = build or build_identity()
     return (
         _HANDLER_TEMPLATE.replace("@@BAKED@@", json.dumps(baked))
+        .replace("@@BUILD@@", json.dumps(installed_build))
         .replace("@@SPOOL@@", json.dumps(SPOOL_FILENAME))
         .replace("@@ERRLOG@@", json.dumps(ERRLOG_FILENAME))
         .replace("@@MAXBYTES@@", str(MAX_SPOOL_BYTES))
@@ -132,8 +139,43 @@ def baked_flight_recorder_home(hook_dir: str | Path) -> str | None:
     return None
 
 
+def baked_flight_recorder_build(hook_dir: str | Path) -> str | None:
+    """Return the package build identity baked into the installed handler."""
+    handler = Path(hook_dir) / "handler.py"
+    try:
+        text = handler.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    marker = "_FLIGHT_RECORDER_BUILD = "
+    for line in text.splitlines():
+        if line.startswith(marker):
+            try:
+                value = json.loads(line[len(marker):])
+            except ValueError:
+                return None
+            return value if isinstance(value, str) else None
+    return None
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Replace one generated hook file without exposing partial content."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def install_hook(
-    hermes_home: str | Path, flight_recorder_home: str | Path, *, force: bool = False
+    hermes_home: str | Path,
+    flight_recorder_home: str | Path,
+    *,
+    force: bool = False,
+    build: str | None = None,
 ) -> Path:
     """Write the hook package under ``$HERMES_HOME/hooks/hermes-flight-recorder``.
 
@@ -144,6 +186,9 @@ def install_hook(
     if hook_dir.exists() and not force:
         raise FileExistsError(str(hook_dir))
     hook_dir.mkdir(parents=True, exist_ok=True)
-    (hook_dir / "HOOK.yaml").write_text(_MANIFEST, encoding="utf-8")
-    (hook_dir / "handler.py").write_text(render_handler(flight_recorder_home), encoding="utf-8")
+    _write_atomic(hook_dir / "HOOK.yaml", _MANIFEST)
+    _write_atomic(
+        hook_dir / "handler.py",
+        render_handler(flight_recorder_home, build=build),
+    )
     return hook_dir

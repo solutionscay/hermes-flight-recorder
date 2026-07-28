@@ -42,12 +42,17 @@ HOOK_EVENTS = (
 )
 
 from .drain import drain  # noqa: E402  (constants above must exist first)
-from .install import baked_flight_recorder_home, install_hook  # noqa: E402
+from .install import (  # noqa: E402
+    baked_flight_recorder_build,
+    baked_flight_recorder_home,
+    install_hook,
+)
 
 __all__ = [
     "drain",
     "install_hook",
     "baked_flight_recorder_home",
+    "baked_flight_recorder_build",
     "HOOK_DIR_NAME",
     "SPOOL_FILENAME",
     "ERRLOG_FILENAME",

@@ -48,6 +48,7 @@ from typing import Any
 from . import CAPTURE_HEARTBEAT_KEY, knowledge_store
 from ..envelope import SESSION_LIFECYCLE, SESSION_START_TYPES
 from ._common import (
+    INSTALLED_AT_META_KEY,
     append_and_count,
     build_record,
     executions_db_path,
@@ -56,6 +57,7 @@ from ._common import (
     jobs_path,
     kanban_board_dbs,
     load_json_dict,
+    occurred_before,
     open_sqlite_read_only,
     read_float,
     read_home_mode,
@@ -63,6 +65,7 @@ from ._common import (
     root_session,
     runtime_stamp,
     sqlite_column_or_default,
+    sqlite_select_list,
     sqlite_table_columns,
     sqlite_table_exists,
     state_db_path,
@@ -137,6 +140,7 @@ def reconcile(
     when = float(now) if now is not None else time.time()
     home = resolve_hermes_home(hermes_home)
     installation_id = outbox.installation_id
+    horizon = _install_horizon(outbox)
 
     # Snapshot the retained stream and compact retention summaries once,
     # before any emission, so findings appended this pass never perturb
@@ -150,17 +154,41 @@ def reconcile(
 
     _detect_sequence_gaps(outbox, events, installation_id, counts, when)
     session_rows, parent_map = _detect_coverage_gaps(
-        outbox, events, home, exec_rows, counts, when, cfg, capture
+        outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
     )
     _detect_missing_terminals(
-        outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map
+        outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map, horizon
     )
-    _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg)
+    _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon)
     _detect_gateway_start_failed(outbox, home, counts, when)
     _detect_stale_task_leases(outbox, home, counts, when, cfg)
     _detect_capture_stale(outbox, counts, when, cfg)
     _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
     return dict(counts)
+
+
+# --- install horizon ----------------------------------------------------
+def _install_horizon(outbox: Any) -> float:
+    """The epoch before which the reconciler ignores durable history.
+
+    The ``installed_at`` marker stamped at ``install`` (see lifecycle). Returns
+    ``0.0`` (no horizon — reconcile the full store, the pre-#109 behavior) when
+    the marker is absent, so an install that predates this marker is protected
+    the moment it re-runs ``install``. The "should have finished by now"
+    detectors (``terminal_missing``, ``cron.run_missed``) skip subjects that
+    started before this, so a fresh install over a long-lived Hermes home does
+    not flag work that ended before the recorder existed. Coverage-gap detection
+    also ignores durable rows that predate the horizon; otherwise a no-backfill
+    install over a long-lived Hermes home immediately reports the whole historic
+    store as uncaptured.
+    """
+    raw = outbox.get_meta(INSTALLED_AT_META_KEY)
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
 
 
 # --- sequence gaps ------------------------------------------------------
@@ -187,7 +215,7 @@ def _detect_sequence_gaps(outbox, events, installation_id, counts, when) -> None
 
 # --- coverage gaps ------------------------------------------------------
 def _detect_coverage_gaps(
-    outbox, events, home, exec_rows, counts, when, config, capture_config
+    outbox, events, home, exec_rows, counts, when, config, capture_config, horizon
 ):
     """A durable row with no captured event proves a dropped capture."""
     captured = _captured_subjects(events)
@@ -214,26 +242,31 @@ def _detect_coverage_gaps(
                 f"SELECT {session_select} FROM sessions"
             ).fetchall()
             parent_map = {r["id"]: r["parent_session_id"] for r in session_rows}
+            session_started = {r["id"]: r["started_at"] for r in session_rows}
             _coverage_sessions(
-                outbox, session_rows, parent_map, captured, counts, when, config
+                outbox, session_rows, parent_map, captured, counts, when, config, horizon
             )
             _coverage_messages(
                 outbox,
                 conn,
                 parent_map,
+                session_started,
                 captured,
                 counts,
                 when,
                 config,
                 capture_config,
+                horizon,
             )
             _coverage_model_usage(
-                outbox, conn, parent_map, captured, counts, when, config
+                outbox, conn, parent_map, session_started, captured, counts, when, config, horizon
             )
         finally:
             conn.close()
 
     for r in exec_rows:
+        if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
+            continue
         if r["id"] in captured["executions"]:
             _clear_coverage_pending(outbox, "execution", r["id"])
             continue
@@ -243,14 +276,16 @@ def _detect_coverage_gaps(
             source_table="cron:executions.db", correlation_id=r["job_id"],
             grace=config.coverage_grace,
         )
-    _coverage_kanban(outbox, home, captured, counts, when, config)
+    _coverage_kanban(outbox, home, captured, counts, when, config, horizon)
     return session_rows, parent_map
 
 
 def _coverage_sessions(
-    outbox, rows, parent_map, captured, counts, when, config
+    outbox, rows, parent_map, captured, counts, when, config, horizon
 ) -> None:
     for r in rows:
+        if occurred_before(horizon, r["started_at"]):
+            continue
         sid = r["id"]
         if sid in captured["sessions"]:
             _clear_coverage_pending(outbox, "session", sid)
@@ -266,7 +301,7 @@ def _coverage_sessions(
 
 
 def _coverage_messages(
-    outbox, conn, parent_map, captured, counts, when, config, capture_config
+    outbox, conn, parent_map, session_started, captured, counts, when, config, capture_config, horizon
 ) -> None:
     roles = tuple(
         role
@@ -276,6 +311,8 @@ def _coverage_messages(
     if not roles:
         return
     columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if not columns:
+        return  # no messages table on this Hermes home — nothing to reconcile
     # Some narrow synthetic/legacy schemas do not expose content. In that
     # case only tool rows can be proven capture-worthy; user/assistant rows
     # need content to distinguish real text from empty tool-call scaffolding.
@@ -289,16 +326,21 @@ def _coverage_messages(
         if "content" in columns
         else ""
     )
+    timestamp_expr = sqlite_column_or_default(columns, "timestamp")
     rows = conn.execute(
-        "SELECT id, session_id FROM messages "
+        f"SELECT id, session_id, {timestamp_expr} FROM messages "
         f"WHERE role IN ({placeholders}){content_predicate}",
         roles,
     ).fetchall()
     for r in rows:
+        sid = r["session_id"]
+        if occurred_before(horizon, r["timestamp"]):
+            continue
+        if r["timestamp"] is None and occurred_before(horizon, session_started.get(sid)):
+            continue
         if r["id"] in captured["messages"]:
             _clear_coverage_pending(outbox, "message", str(r["id"]))
             continue
-        sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
         _emit_coverage(
             outbox, counts, when,
@@ -309,7 +351,7 @@ def _coverage_messages(
 
 
 def _coverage_model_usage(
-    outbox, conn, parent_map, captured, counts, when, config
+    outbox, conn, parent_map, session_started, captured, counts, when, config, horizon
 ) -> None:
     if not sqlite_table_exists(conn, "session_model_usage"):
         return
@@ -317,6 +359,8 @@ def _coverage_model_usage(
         "SELECT session_id, model, task FROM session_model_usage"
     ).fetchall()
     for r in rows:
+        if occurred_before(horizon, session_started.get(r["session_id"])):
+            continue
         key = (r["session_id"], r["model"], r["task"])
         subject_id = f"{r['session_id']}:{r['model']}:{r['task']}"
         if key in captured["model_usage"]:
@@ -332,7 +376,7 @@ def _coverage_model_usage(
         )
 
 
-def _coverage_kanban(outbox, home, captured, counts, when, config) -> None:
+def _coverage_kanban(outbox, home, captured, counts, when, config, horizon) -> None:
     """A durable Kanban task/run with no captured ``task.*`` event.
 
     The Kanban analog of the session/execution coverage diff: every board's
@@ -350,17 +394,29 @@ def _coverage_kanban(outbox, home, captured, counts, when, config) -> None:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            tasks = (
-                conn.execute("SELECT id, session_id FROM tasks").fetchall()
-                if "tasks" in present else []
-            )
-            runs = (
-                conn.execute("SELECT id, task_id FROM task_runs").fetchall()
-                if "task_runs" in present else []
-            )
+            if "tasks" in present:
+                task_cols = sqlite_table_columns(conn, "tasks")
+                tasks = conn.execute(
+                    "SELECT id, session_id, "
+                    f"{sqlite_column_or_default(task_cols, 'created_at')}, "
+                    f"{sqlite_column_or_default(task_cols, 'started_at')} FROM tasks"
+                ).fetchall()
+            else:
+                tasks = []
+            if "task_runs" in present:
+                run_cols = sqlite_table_columns(conn, "task_runs")
+                runs = conn.execute(
+                    "SELECT id, task_id, "
+                    f"{sqlite_column_or_default(run_cols, 'started_at')}, "
+                    f"{sqlite_column_or_default(run_cols, 'ended_at')} FROM task_runs"
+                ).fetchall()
+            else:
+                runs = []
         finally:
             conn.close()
         for r in tasks:
+            if occurred_before(horizon, r["created_at"] or r["started_at"]):
+                continue
             if (board, r["id"]) in captured["tasks"]:
                 _clear_coverage_pending(outbox, "task", f"{board}:{r['id']}")
                 continue
@@ -372,6 +428,8 @@ def _coverage_kanban(outbox, home, captured, counts, when, config) -> None:
                 grace=config.coverage_grace,
             )
         for r in runs:
+            if occurred_before(horizon, r["started_at"] or r["ended_at"]):
+                continue
             if (board, r["id"]) in captured["task_runs"]:
                 _clear_coverage_pending(outbox, "task_run", f"{board}:{r['id']}")
                 continue
@@ -479,14 +537,14 @@ def _coverage_ready(
 
 # --- missing terminals --------------------------------------------------
 def _detect_missing_terminals(
-    outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map
+    outbox, events, exec_rows, counts, when, cfg, session_rows, parent_map, horizon
 ) -> None:
-    _terminals_sessions(outbox, session_rows, parent_map, counts, when, cfg)
-    _terminals_cron_runs(outbox, exec_rows, counts, when, cfg)
-    _terminals_invocations(outbox, events, counts, when, cfg)
+    _terminals_sessions(outbox, session_rows, parent_map, counts, when, cfg, horizon)
+    _terminals_cron_runs(outbox, exec_rows, counts, when, cfg, horizon)
+    _terminals_invocations(outbox, events, counts, when, cfg, horizon)
 
 
-def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
+def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg, horizon) -> None:
     """A durable session/subagent row with ended_at NULL past its window.
 
     The durable row is authoritative: a live session keeps ended_at=NULL and
@@ -498,6 +556,8 @@ def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
         started = to_epoch(r["started_at"])
         if started is None:
             continue
+        if started < horizon:
+            continue  # started before the recorder existed — not our crash
         is_sub = r["source"] == "subagent"
         timeout = cfg.subagent_terminal_timeout if is_sub else cfg.session_terminal_timeout
         age = when - started
@@ -527,7 +587,7 @@ def _terminals_sessions(outbox, rows, parent_map, counts, when, cfg) -> None:
         )
 
 
-def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg) -> None:
+def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg, horizon) -> None:
     """A durable execution with finished_at NULL past its window."""
     for r in exec_rows:
         if r["finished_at"] is not None:
@@ -535,6 +595,8 @@ def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg) -> None:
         claimed = r["claimed_epoch"]
         if claimed is None:
             continue
+        if claimed < horizon:
+            continue  # claimed before the recorder existed
         age = when - claimed
         if age <= cfg.cron_run_terminal_timeout:
             continue
@@ -558,7 +620,7 @@ def _terminals_cron_runs(outbox, exec_rows, counts, when, cfg) -> None:
         )
 
 
-def _terminals_invocations(outbox, events, counts, when, cfg) -> None:
+def _terminals_invocations(outbox, events, counts, when, cfg, horizon) -> None:
     """An invocation.started with no invocation.completed, past its window.
 
     The turn_id lives only in memory, so invocations are judged from the
@@ -583,6 +645,8 @@ def _terminals_invocations(outbox, events, counts, when, cfg) -> None:
         occurred = e.get("occurred_at")
         if occurred is None or when - occurred <= cfg.invocation_terminal_timeout:
             continue
+        if occurred < horizon:
+            continue  # started before the recorder existed
         _emit_terminal_missing(
             outbox,
             counts,
@@ -707,10 +771,19 @@ def _load_open_task_runs(home: Path) -> list[dict[str, Any]]:
     for board, db_path in kanban_board_dbs(home):
         conn = open_sqlite_read_only(db_path)
         try:
-            rows = conn.execute(
-                "SELECT id, task_id, claim_lock, claim_expires, worker_pid, "
-                "last_heartbeat_at, started_at FROM task_runs WHERE outcome IS NULL"
-            ).fetchall()
+            cols = sqlite_table_columns(conn, "task_runs")
+            if "outcome" not in cols:
+                rows = []  # no such table/column — nothing open to judge
+            else:
+                select = sqlite_select_list(
+                    conn,
+                    "task_runs",
+                    ("id", "task_id", "claim_lock", "claim_expires", "worker_pid",
+                     "last_heartbeat_at", "started_at"),
+                )
+                rows = conn.execute(
+                    f"SELECT {select} FROM task_runs WHERE outcome IS NULL"
+                ).fetchall()
         finally:
             conn.close()
         for r in rows:
@@ -730,7 +803,7 @@ def _load_open_task_runs(home: Path) -> list[dict[str, Any]]:
 
 
 # --- missed cron --------------------------------------------------------
-def _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg) -> None:
+def _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon) -> None:
     jobs = _load_jobs(jobs_path(home))
     if not jobs:
         return
@@ -744,10 +817,10 @@ def _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg) -> None:
         if r["claimed_epoch"] is not None:
             exec_by_job[r["job_id"]].append(r["claimed_epoch"])
     for job in jobs:
-        _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead)
+        _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon)
 
 
-def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead) -> None:
+def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon) -> None:
     if not _job_is_active(job):
         return  # paused, disabled, or repeat-exhausted — no fire is expected
     sched = job.get("schedule") or {}
@@ -774,6 +847,8 @@ def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead) ->
         return
 
     for first_at, count, is_tail in runs:
+        if first_at < horizon:
+            continue  # the fire was due before the recorder existed
         # A dead scheduler explains the open-ended tail; don't double-report
         # it per job — the single ticker signal already covers it.
         if is_tail and ticker_dead:
@@ -1192,9 +1267,12 @@ def _load_execution_rows(home: Path) -> list[dict[str, Any]]:
         return []
     conn = open_sqlite_read_only(exec_path)
     try:
-        rows = conn.execute(
-            "SELECT id, job_id, status, claimed_at, finished_at FROM executions"
-        ).fetchall()
+        if not sqlite_table_exists(conn, "executions"):
+            return []
+        select = sqlite_select_list(
+            conn, "executions", ("id", "job_id", "status", "claimed_at", "finished_at")
+        )
+        rows = conn.execute(f"SELECT {select} FROM executions").fetchall()
     finally:
         conn.close()
     return [

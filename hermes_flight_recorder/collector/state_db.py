@@ -40,6 +40,7 @@ from ._common import (
     root_session,
     runtime_stamp,
     safe_json_dict,
+    occurred_before,
     sqlite_column_or_default,
     sqlite_table_columns,
     sqlite_table_exists,
@@ -54,9 +55,18 @@ _SESSION_COL_DEFAULTS = (
     ("model", "NULL"),
     ("message_count", "0"),
     ("tool_call_count", "0"),
-    ("input_tokens", "0"),
-    ("output_tokens", "0"),
-    ("estimated_cost_usd", "0"),
+    # Usage and cost fields use NULL fallbacks deliberately.  A missing
+    # legacy-schema column means "unknown", not a measured zero.
+    ("api_call_count", "NULL"),
+    ("input_tokens", "NULL"),
+    ("output_tokens", "NULL"),
+    ("cache_read_tokens", "NULL"),
+    ("cache_write_tokens", "NULL"),
+    ("reasoning_tokens", "NULL"),
+    ("estimated_cost_usd", "NULL"),
+    ("actual_cost_usd", "NULL"),
+    ("cost_status", "NULL"),
+    ("cost_source", "NULL"),
     ("started_at", "NULL"),
     ("ended_at", "NULL"),
     ("end_reason", "NULL"),
@@ -64,6 +74,19 @@ _SESSION_COL_DEFAULTS = (
     # Missing expiry_finalized means the Hermes schema predates that nuance;
     # treat ended sessions as stable instead of permanently partial.
     ("expiry_finalized", "1"),
+)
+
+_TERMINAL_USAGE_FIELDS = (
+    "api_call_count",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "estimated_cost_usd",
+    "actual_cost_usd",
+    "cost_status",
+    "cost_source",
 )
 
 
@@ -105,8 +128,15 @@ def poll(
     hermes_home: str | Path | None = None,
     *,
     capture_config: CaptureConfig | None = None,
+    since: float | None = None,
 ) -> dict[str, int]:
-    """One read-only poll pass over ``state.db``. Returns per-type counts."""
+    """One read-only poll pass over ``state.db``. Returns per-type counts.
+
+    ``since`` is the capture horizon: when set (``install --no-backfill``), rows
+    whose activity predates it are skipped, so history is not backfilled. The
+    session parent/profile maps are still built from every row so post-horizon
+    activity in an older session keeps its attribution.
+    """
     db_path = state_db_path(resolve_hermes_home(hermes_home))
     if not db_path.exists():
         raise FileNotFoundError(f"state.db not found at {db_path}")
@@ -125,7 +155,7 @@ def poll(
         invocation_windows = _invocation_windows(outbox)
 
         counts: dict[str, int] = defaultdict(int)
-        _poll_sessions(outbox, sessions, parent_map, counts, home_mode)
+        _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since)
         _poll_messages(
             outbox,
             conn,
@@ -135,20 +165,23 @@ def poll(
             counts,
             home_mode,
             capture,
+            since,
         )
         _poll_model_usage(
-            outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
+            outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode, since
         )
         _poll_delegations(
-            outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
+            outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode, since
         )
         return dict(counts)
     finally:
         conn.close()
 
 
-def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
+def _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since=None) -> None:
     for r in sessions:
+        if occurred_before(since, r["started_at"]):
+            continue  # started before the capture horizon (no backfill)
         sid = r["id"]
         is_sub = r["source"] == "subagent"
         kind = r["source"] or "unknown"
@@ -185,8 +218,31 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
         if r["ended_at"] is None:
             continue
 
-        # end_reason is not stable until expiry_finalized flips from 0.
-        partial = r["expiry_finalized"] == 0
+        # end_reason and the cumulative counters are not stable until
+        # expiry_finalized flips from 0.  The live hook already supplies a
+        # provisional terminal, so wait rather than consuming the durable
+        # terminal's stable dedup key with a partial record.
+        if r["expiry_finalized"] == 0:
+            continue
+
+        payload = {
+            "kind": kind,
+            "end_reason": r["end_reason"],
+            "message_count": r["message_count"],
+            "tool_call_count": r["tool_call_count"],
+            "usage_semantics": "cumulative_total",
+        }
+        # These are the authoritative totals on a finalized durable session
+        # row. Omit unavailable/NULL values so consumers can distinguish
+        # unknown cost from an explicit zero.
+        payload.update(
+            {
+                field: r[field]
+                for field in _TERMINAL_USAGE_FIELDS
+                if r[field] is not None
+            }
+        )
+
         record = build_record(
             event_type=ended,
             occurred_at=r["ended_at"],
@@ -197,16 +253,8 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
             session_id=sid,
             parent_session_id=r["parent_session_id"],
             profile=profile,
-            partial=partial,
-            payload={
-                "kind": kind,
-                "end_reason": r["end_reason"],
-                "message_count": r["message_count"],
-                "tool_call_count": r["tool_call_count"],
-                "input_tokens": r["input_tokens"],
-                "output_tokens": r["output_tokens"],
-                "estimated_cost_usd": r["estimated_cost_usd"],
-            },
+            partial=False,
+            payload=payload,
         )
         append_and_count(outbox, counts, record, dedup_key=f"state.db:{ended}:{sid}")
 
@@ -220,6 +268,7 @@ def _poll_messages(
     counts,
     home_mode,
     capture_config,
+    since=None,
 ) -> None:
     cursor = int(outbox.get_cursor(_MESSAGE_CURSOR) or 0)
     supported_roles = tuple(
@@ -257,6 +306,8 @@ def _poll_messages(
         # Advance only through this query's snapshot. A separate MAX(id)
         # query can see a row inserted after the snapshot and skip it forever.
         last_seen_id = max(last_seen_id, int(r["id"]))
+        if occurred_before(since, r["timestamp"]):
+            continue  # predates the capture horizon; cursor still advances
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
         role = r["role"]
@@ -354,7 +405,7 @@ def _poll_messages(
 
 
 def _poll_model_usage(
-    outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
+    outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode, since=None
 ) -> None:
     if not sqlite_table_exists(conn, "session_model_usage"):
         return
@@ -384,6 +435,8 @@ def _poll_model_usage(
     ]
     previous_states = _usage_states(outbox, identities)
     for r in rows:
+        if occurred_before(since, r["last_seen"]):
+            continue  # last touched before the capture horizon (no backfill)
         sid = str(r["session_id"])
         corr = root_session(sid, parent_map) or sid
         identity = (sid, str(r["model"] or ""), str(r["task"] or ""))
@@ -447,7 +500,7 @@ def _poll_model_usage(
 
 
 def _poll_delegations(
-    outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode
+    outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode, since=None
 ) -> None:
     if not sqlite_table_exists(conn, "async_delegations"):
         return
@@ -456,6 +509,8 @@ def _poll_delegations(
         "owner_pid, dispatched_at, event_json, result_json FROM async_delegations"
     ).fetchall()
     for r in rows:
+        if occurred_before(since, r["dispatched_at"]):
+            continue  # dispatched before the capture horizon (no backfill)
         parent = r["parent_session_id"] or r["origin_session"]
         corr = root_session(parent, parent_map) or parent
         event = safe_json_dict(r["event_json"])  # is_batch lives here, not as a column

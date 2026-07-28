@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ._common import default_flight_recorder_home
-from .sync import DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS
+from .sync import DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS, MAX_INGEST_BATCH_BYTES
 
 CONFIG_FILENAME = "recorder-config.json"
 DEFAULT_MAX_CONTENT_BYTES = 65_536
@@ -174,9 +174,10 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 _value("HFR_SYNC_MAX_RECORDS", sync, "max_records", DEFAULT_MAX_RECORDS),
                 "sync.max_records",
             ),
-            max_bytes=_positive_int(
+            max_bytes=_bounded_positive_int(
                 _value("HFR_SYNC_MAX_BYTES", sync, "max_bytes", DEFAULT_MAX_BYTES),
                 "sync.max_bytes",
+                maximum=MAX_INGEST_BATCH_BYTES,
             ),
         ),
         reconcile=ReconcileRuntimeConfig(
@@ -271,6 +272,13 @@ def _positive_int(value: Any, name: str) -> int:
         raise RecorderConfigError(f"{name} must be a positive integer") from exc
     if result < 1 or (isinstance(value, float) and not value.is_integer()):
         raise RecorderConfigError(f"{name} must be a positive integer")
+    return result
+
+
+def _bounded_positive_int(value: Any, name: str, *, maximum: int) -> int:
+    result = _positive_int(value, name)
+    if result > maximum:
+        raise RecorderConfigError(f"{name} must be at most {maximum}")
     return result
 
 

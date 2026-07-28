@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
+    occurred_before,
     append_and_count,
     build_record,
     kanban_board_dbs,
@@ -39,8 +40,8 @@ from ._common import (
     read_home_mode,
     resolve_hermes_home,
     runtime_stamp,
-    sqlite_column_or_default,
-    sqlite_table_columns,
+    sqlite_select_list,
+    sqlite_table_exists,
 )
 
 # Hermes task_events.kind -> the task-level task.* event it maps to. Kinds absent
@@ -87,54 +88,61 @@ _TASK_META = (
 )
 
 
-def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
-    """One read-only poll pass over every Kanban board. Returns per-type counts."""
+def poll(
+    outbox: Any, hermes_home: str | Path | None = None, *, since: float | None = None
+) -> dict[str, int]:
+    """One read-only poll pass over every Kanban board. Returns per-type counts.
+
+    ``since`` is the capture horizon (``install --no-backfill``); task events and
+    attempts older than it are skipped so history is not backfilled.
+    """
     home = resolve_hermes_home(hermes_home)
     home_mode = read_home_mode(hermes_home)
     counts: dict[str, int] = defaultdict(int)
     for board, db_path in kanban_board_dbs(home):
-        _poll_board(outbox, board, db_path, counts, home_mode)
+        _poll_board(outbox, board, db_path, counts, home_mode, since)
     return dict(counts)
 
 
-def _poll_board(outbox, board: str, db_path: Path, counts, home_mode) -> None:
+def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None) -> None:
     conn = open_sqlite_read_only(db_path)
     try:
-        task_cols = sqlite_table_columns(conn, "tasks")
-        task_select = ", ".join(
-            sqlite_column_or_default(task_cols, name)
-            for name in (
-                "id",
-                "status",
-                "session_id",
-                "priority",
-                "assignee",
-                "project_id",
-                "idempotency_key",
-                "block_kind",
-                "consecutive_failures",
+        # task_events is the lifecycle log; with no such table there is nothing
+        # to emit from this board (an older or partial kanban schema).
+        if not sqlite_table_exists(conn, "task_events"):
+            return
+        tasks = {}
+        if sqlite_table_exists(conn, "tasks"):
+            task_select = sqlite_select_list(
+                conn,
+                "tasks",
+                ("id", "status", "session_id", "priority", "assignee",
+                 "project_id", "idempotency_key", "block_kind", "consecutive_failures"),
             )
+            tasks = {r["id"]: r for r in conn.execute(f"SELECT {task_select} FROM tasks")}
+        runs = {}
+        if sqlite_table_exists(conn, "task_runs"):
+            run_select = sqlite_select_list(
+                conn,
+                "task_runs",
+                ("id", "task_id", "claim_lock", "claim_expires", "worker_pid",
+                 "last_heartbeat_at", "started_at", "ended_at", "outcome", "profile",
+                 "step_key"),
+            )
+            runs = {r["id"]: r for r in conn.execute(f"SELECT {run_select} FROM task_runs")}
+        event_select = sqlite_select_list(
+            conn, "task_events", ("id", "task_id", "run_id", "kind", "created_at")
         )
-        tasks = {
-            r["id"]: r
-            for r in conn.execute(f"SELECT {task_select} FROM tasks")
-        }
-        runs = {
-            r["id"]: r
-            for r in conn.execute(
-                "SELECT id, task_id, claim_lock, claim_expires, worker_pid, "
-                "last_heartbeat_at, started_at, ended_at, outcome, profile, "
-                "step_key FROM task_runs"
-            )
-        }
         events = conn.execute(
-            "SELECT id, task_id, run_id, kind, created_at FROM task_events ORDER BY id"
+            f"SELECT {event_select} FROM task_events ORDER BY id"
         ).fetchall()
     finally:
         conn.close()
 
     rt = runtime_stamp("kanban", home_mode=home_mode)
     for ev in events:
+        if occurred_before(since, ev["created_at"]):
+            continue  # created before the capture horizon (no backfill)
         event_type = _KIND_EVENT.get(ev["kind"])
         if event_type is None:
             continue
@@ -161,6 +169,8 @@ def _poll_board(outbox, board: str, db_path: Path, counts, home_mode) -> None:
         run = runs[run_id]
         if run["outcome"] is None:
             continue
+        if occurred_before(since, run["ended_at"] or run["started_at"]):
+            continue  # attempt ended before the capture horizon (no backfill)
         task = tasks.get(run["task_id"])
         record = build_record(
             event_type="task.attempt_ended",

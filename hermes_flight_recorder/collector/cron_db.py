@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
+    occurred_before,
+    sqlite_select_list,
+    sqlite_table_exists,
     append_and_count,
     build_record,
     executions_db_path,
@@ -37,30 +40,43 @@ from ._common import (
 )
 
 
-def poll(outbox: Any, hermes_home: str | Path | None = None) -> dict[str, int]:
-    """One read-only poll pass over the cron store. Returns per-type counts."""
+def poll(
+    outbox: Any, hermes_home: str | Path | None = None, *, since: float | None = None
+) -> dict[str, int]:
+    """One read-only poll pass over the cron store. Returns per-type counts.
+
+    ``since`` is the capture horizon (``install --no-backfill``); executions
+    claimed before it are skipped so history is not backfilled.
+    """
     home = resolve_hermes_home(hermes_home)
     home_mode = read_home_mode(hermes_home)
     counts: dict[str, int] = defaultdict(int)
-    _poll_executions(outbox, home, counts, home_mode)
+    _poll_executions(outbox, home, counts, home_mode, since)
     _poll_heartbeat(outbox, home, counts, home_mode)
     return dict(counts)
 
 
-def _poll_executions(outbox, home: Path, counts, home_mode) -> None:
+def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
     db_path = executions_db_path(home)
     if not db_path.exists():
         return
     conn = open_sqlite_read_only(db_path)
     try:
-        rows = conn.execute(
-            "SELECT id, job_id, source, pid, status, claimed_at, started_at, "
-            "finished_at, error FROM executions"
-        ).fetchall()
+        if not sqlite_table_exists(conn, "executions"):
+            return
+        select = sqlite_select_list(
+            conn,
+            "executions",
+            ("id", "job_id", "source", "pid", "status", "claimed_at",
+             "started_at", "finished_at", "error"),
+        )
+        rows = conn.execute(f"SELECT {select} FROM executions").fetchall()
     finally:
         conn.close()
 
     for r in rows:
+        if occurred_before(since, r["claimed_at"]):
+            continue  # claimed before the capture horizon (no backfill)
         exid, job = r["id"], r["job_id"]
         claimed = to_epoch(r["claimed_at"]) or 0.0
         rt = runtime_stamp("cron", home_mode=home_mode)

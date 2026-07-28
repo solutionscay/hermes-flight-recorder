@@ -54,6 +54,10 @@ Facts about the cloud connection:
 - The ingestion protocol is open. You can also run your own compatible backend.
 - Flight Recorder sends the token in two headers, not in the request body.
 - If the network is down, the outbox keeps the events. The next sync sends them.
+- Each sync pass also ships the **wrapped data keys** (the operator-sealed keys
+  that decrypt content) to `/ingest/keys`, so the operator console can decrypt
+  content client-side. They travel as opaque blobs; the backend never unwraps
+  them. See [docs/key-model.md](docs/key-model.md).
 
 ## 3. How to install and configure
 
@@ -93,14 +97,58 @@ hermes-flight-recorder install --hermes-home "<HERMES_HOME>"
 The `install` command does these things:
 
 - It creates the recorder home at `<HERMES_HOME>/flight-recorder`.
-- It creates the installation identity and the encryption key.
+- It creates the installation identity.
+- It establishes the operator key that content is sealed to. With no key
+  argument this is a **solo** install: a keypair is minted locally (both halves,
+  the private one at `0600`) so the box can read its own outbox. Pass
+  `--operator-pubkey <file>` for a **fleet agent**: only the public key is
+  written and no private key ever lands on the host. See
+  [docs/key-model.md](docs/key-model.md).
 - It writes the configuration files with private permissions (`0600`).
 - It installs (or updates) the hook.
 - It verifies the result.
 
 The `install` command is idempotent. You can run it again with no harm. It does
-not change the installation identity or the encryption key. It does not register
+not change the installation identity or the operator key. It does not register
 an operating-system service.
+
+For a fleet, mint the operator keypair once with `keygen` and distribute the
+public key to each agent:
+
+```bash
+# On the operator console — mint the keypair (private half stays here):
+hermes-flight-recorder keygen --hermes-home "<OPERATOR_HOME>"
+
+# On each agent — seal to the operator public key, no private key on the host:
+hermes-flight-recorder install --hermes-home "<HERMES_HOME>" \
+  --operator-pubkey /path/to/operator.pub
+```
+
+#### Operator key in one minute
+
+- **One key pair for the whole fleet.** `keygen` mints it **once**, on your
+  operator console — not on an agent. There is no key to "get" from the backend;
+  the backend never holds one.
+- **Agents get the public half only.** Hand every agent `operator.pub` (via
+  `--operator-pubkey`). **Never** distribute `operator.secret` or place it on an
+  agent host.
+- **Plain `install` (no `--operator-pubkey`) is *solo*** — it mints the key pair
+  **on that host**. Fine for a single laptop that reads its own data, but do not
+  use one agent's solo key as the fleet key: its private half would sit on an
+  agent, so a compromise of that host could read the whole fleet's history.
+- **Back up `operator.secret`.** It is the single key that decrypts the fleet.
+  Lose it and captured history is unreadable; leak it and the protection is gone.
+- **To read captured content**, paste `operator.secret` (the
+  `hfr-operator-secret-v1:…` line) into the console's unlock. It is used in the
+  browser only — decryption is client-side, and the key is never sent to the
+  backend. See [docs/key-model.md](docs/key-model.md).
+
+By default `install` captures the existing Hermes history on the first pass. To
+record only new activity from the install moment on, add `--no-backfill`:
+
+```bash
+hermes-flight-recorder install --hermes-home "<HERMES_HOME>" --no-backfill
+```
 
 ### Step 3 — Restart the Hermes gateway
 
@@ -169,11 +217,81 @@ To read the captured log with no network, use `observe`:
 hermes-flight-recorder observe --hermes-home "<HERMES_HOME>" --tree
 ```
 
+## 4. How to update
+
+Stop the `serve` process through the service manager that runs it. The updater
+does not stop or restart systemd, launchd, a Windows service, or the Hermes
+gateway.
+
+Update to the default branch of the public repository:
+
+```bash
+hermes-flight-recorder update --hermes-home "<HERMES_HOME>"
+```
+
+To test a branch, tag, or commit before release, select it explicitly:
+
+```bash
+hermes-flight-recorder update \
+  --hermes-home "<HERMES_HOME>" \
+  --ref "<BRANCH_TAG_OR_COMMIT>"
+```
+
+To test the current contents of a local checkout, including uncommitted changes,
+install it as editable:
+
+```bash
+hermes-flight-recorder update \
+  --hermes-home "<HERMES_HOME>" \
+  --source "/path/to/hermes-flight-recorder" \
+  --editable
+```
+
+The command refuses to run while `serve` holds the recorder runtime lock. Before
+it changes the package, it creates a recovery snapshot under
+`<HERMES_HOME>/flight-recorder/update-backups/`. The snapshot contains a
+consistent SQLite backup, the operator key files, recorder and sync configuration,
+the installed-version record, and the old hook.
+
+After pip installs the selected source, a new Python process applies registered
+outbox migrations, regenerates the hook, records the exact package build, and
+verifies the installation. The installation id, key, events, delivery state,
+capture cursors, and configuration remain in place unless a documented schema
+migration deliberately changes an identity.
+
+Restart the Hermes gateway so it loads the refreshed hook. Then restart the
+recorder service and verify:
+
+```bash
+hermes-flight-recorder --version
+hermes-flight-recorder status --hermes-home "<HERMES_HOME>"
+```
+
+`status` reports a mismatch when the package, installation stamp, and hook were
+not built from the same revision.
+
+### Update failure and rollback
+
+Keep the recorder and Hermes gateway stopped after a failed update. The command
+leaves `pending-update.json` in the recorder home and prints the recovery
+snapshot path. Inspect that file before recovery.
+
+To retry completion after fixing the package installation, run the same
+`update` command again. To roll back, reinstall the previous revision recorded
+in the snapshot metadata and restore the snapshot while all recorder processes
+are stopped. Restore `outbox.sqlite` together with its matching key and
+configuration; do not mix files from different snapshots. Then rerun
+`hermes-flight-recorder install --hermes-home "<HERMES_HOME>"` to regenerate
+and verify the hook before restarting services.
+
 ## Command summary
 
 | Command | Purpose |
 |---------|---------|
-| `install` | Set up the recorder home, identity, key, config, and hook. |
+| `install` | Set up the recorder home, identity, operator key, config, and hook. |
+| `keygen` | Mint (or `--rotate`) the fleet operator keypair and print its public key. |
+| `update` | Back up and update the package, schema, installation stamp, and hook. |
+| `uninstall` | Remove the hook; add `--purge-data` to also delete the recorder home. |
 | `serve` | Run capture, reconcile, and optional sync in one process. |
 | `configure-sync` | Write the cloud endpoint and the Cloudflare Access token. |
 | `status` | Show capture freshness and delivery lag. |

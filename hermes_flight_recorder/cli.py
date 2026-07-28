@@ -15,7 +15,7 @@ import argparse
 import sys
 import time
 
-from . import __version__
+from .version import build_identity
 
 # Exit codes for `sync`, so a cron or a monitor can tell the cases apart.
 _SYNC_OK = 0
@@ -102,9 +102,84 @@ def _cmd_install(args: argparse.Namespace) -> int:
     from .collector.lifecycle import InstallError, install
 
     try:
-        install(args.flight_recorder_home, args.hermes_home)
+        install(
+            args.flight_recorder_home,
+            args.hermes_home,
+            backfill=not args.no_backfill,
+            operator_pubkey=args.operator_pubkey,
+        )
     except InstallError as exc:
         print(f"install failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _cmd_keygen(args: argparse.Namespace) -> int:
+    from .collector import keystore
+
+    fr_home = _flight_recorder_home(args)
+    fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    # Without --rotate, minting over an existing key is refused; surface the
+    # current public key instead so an operator can distribute it to agents.
+    if not args.rotate and keystore.has_public(fr_home):
+        public = keystore.load_public_key(fr_home)
+        print(f"operator key already present ({public.key_id}); "
+              f"pass --rotate to mint a new one.")
+        print(f"public key file: {keystore.public_path(fr_home)}")
+        print(public.to_text())
+        return 0
+
+    try:
+        keypair = keystore.mint_operator_keypair(fr_home, rotate=args.rotate)
+    except keystore.KeystoreError as exc:
+        print(f"keygen failed: {exc}", file=sys.stderr)
+        return 2
+
+    verb = "rotated to" if args.rotate else "minted"
+    print(f"operator keypair {verb} {keypair.key_id}")
+    print(f"public key:  {keystore.public_path(fr_home)}")
+    print(f"private key: {keystore.secret_path(fr_home)} (keep this secret; "
+          f"never distribute or place on an agent host)")
+    if args.rotate:
+        print(f"the previous key was retained under "
+              f"'{keystore.RETIRED_DIR_NAME}/' so existing history stays readable.")
+    print()
+    print("distribute this public key to fleet agents "
+          "(`install --operator-pubkey <file>`):")
+    print(keypair.public.to_text())
+    return 0
+
+
+def _cmd_uninstall(args: argparse.Namespace) -> int:
+    from .collector.lifecycle import UninstallError, uninstall
+
+    try:
+        uninstall(
+            args.flight_recorder_home, args.hermes_home, purge_data=args.purge_data
+        )
+    except UninstallError as exc:
+        print(f"uninstall failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    from .collector.update import UpdateError, complete_update, update
+
+    try:
+        if args.complete:
+            complete_update(args.flight_recorder_home, args.hermes_home)
+        else:
+            update(
+                args.flight_recorder_home,
+                args.hermes_home,
+                source=args.source,
+                ref=args.ref,
+                editable=args.editable,
+            )
+    except UpdateError as exc:
+        print(f"update failed: {exc}", file=sys.stderr)
         return 2
     return 0
 
@@ -326,6 +401,30 @@ def _cmd_status(args: argparse.Namespace) -> int:
             return 2
 
         print(f"installation:    {outbox.installation_id}")
+        healthy = True
+        package_build = build_identity()
+        print(f"package build:   {package_build}")
+        installed_build = outbox.get_meta("installed_build")
+        if installed_build is not None:
+            from .collector._common import resolve_hermes_home
+            from .collector.hook import (
+                HOOK_DIR_NAME,
+                baked_flight_recorder_build,
+            )
+
+            hook_dir = (
+                resolve_hermes_home(args.hermes_home) / "hooks" / HOOK_DIR_NAME
+            )
+            hook_build = baked_flight_recorder_build(hook_dir)
+            if installed_build == package_build == hook_build:
+                print(f"hook build:      OK — {hook_build}")
+            else:
+                healthy = False
+                print(
+                    "hook build:      MISMATCH — "
+                    f"installed {installed_build!r}, package {package_build!r}, "
+                    f"hook {hook_build!r}"
+                )
 
         high_water = outbox.high_water()
         cursor = delivery_cursor(outbox)
@@ -336,7 +435,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
         )
 
         raw = outbox.get_meta(CAPTURE_HEARTBEAT_KEY)
-        healthy = True
         if raw is None:
             print("capture:         NO SUCCESS RECORDED (capture has never run)")
             healthy = False
@@ -402,6 +500,7 @@ def _sync_once(
         f"shipped {acked} / acked {acked} / pending {pending}  "
         f"(delivery cursor {cursor}, producer high-water {cursor + pending})"
     )
+    _sync_content_keys_once(outbox, transport)
     if retention_config is not None:
         _automatic_prune(outbox, retention_config)
     if outcome.ok:
@@ -417,6 +516,31 @@ def _sync_once(
         message += f": {outcome.detail}"
     print(message, file=sys.stderr)
     return _SYNC_UNREACHABLE
+
+
+def _sync_content_keys_once(outbox, transport) -> None:
+    """Ship pending wrapped DEKs alongside events; best-effort, never fatal.
+
+    The wrapped-DEK side-channel is independent of event delivery: a network or
+    auth failure just leaves the records for the next pass (delivery is
+    idempotent server-side), so it only reports and never changes the sync exit
+    code. A terminal client defect is surfaced but still not fatal to events.
+    """
+    from .collector.transport import TerminalTransportError, push_content_keys
+
+    try:
+        outcome = push_content_keys(outbox, transport)
+    except TerminalTransportError as exc:
+        print(
+            f"wrapped-key sync stopped: malformed batch (client defect): {exc}",
+            file=sys.stderr,
+        )
+        return
+    if outcome.ok:
+        if outcome.result is not None and outcome.result.keys_sent:
+            print(f"shipped {outcome.result.keys_sent} wrapped key(s)")
+    else:
+        print(f"wrapped-key sync deferred ({outcome.reason})", file=sys.stderr)
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
@@ -574,7 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"hermes-flight-recorder {__version__}",
+        version=f"hermes-flight-recorder {build_identity()}",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -583,7 +707,72 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install (idempotently) into a Hermes home: outbox, identity, key, config, and hook.",
         parents=[_home_options()],
     )
+    p_install.add_argument(
+        "--no-backfill",
+        action="store_true",
+        help="Capture only activity from now on; do not ingest existing Hermes history.",
+    )
+    p_install.add_argument(
+        "--operator-pubkey",
+        default=None,
+        metavar="FILE",
+        help="Install as a fleet agent that seals content to this operator public "
+        "key; no private key is written to the host. Omit for a solo install "
+        "(a keypair is minted locally). Generate the key with `keygen`.",
+    )
     p_install.set_defaults(func=_cmd_install)
+
+    p_keygen = sub.add_parser(
+        "keygen",
+        help="Mint (or --rotate) the fleet operator keypair and print its public key.",
+        parents=[_home_options()],
+    )
+    p_keygen.add_argument(
+        "--rotate",
+        action="store_true",
+        help="Retire the current keypair (kept for reading history) and mint a new "
+        "one. New content seals to the new key; forward-only.",
+    )
+    p_keygen.set_defaults(func=_cmd_keygen)
+
+    p_uninstall = sub.add_parser(
+        "uninstall",
+        help="Remove the Hermes hook; preserve recorder data unless --purge-data is given.",
+        parents=[_home_options()],
+    )
+    p_uninstall.add_argument(
+        "--purge-data",
+        action="store_true",
+        help="Also delete the recorder home (outbox, key, config). Irreversible.",
+    )
+    p_uninstall.set_defaults(func=_cmd_uninstall)
+
+    p_update = sub.add_parser(
+        "update",
+        help="Back up and update an installed Flight Recorder from Git or a local checkout.",
+        parents=[_home_options()],
+    )
+    p_update.add_argument(
+        "--source",
+        default="git+https://github.com/solutionscay/hermes-flight-recorder.git",
+        help="Git URL or local checkout to install (default: the public repository).",
+    )
+    p_update.add_argument(
+        "--ref",
+        default=None,
+        help="Git branch, tag, or commit to install from a git+ source.",
+    )
+    p_update.add_argument(
+        "--editable",
+        action="store_true",
+        help="Install a local --source as editable for development testing.",
+    )
+    p_update.add_argument(
+        "--complete",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p_update.set_defaults(func=_cmd_update)
 
     p_serve = sub.add_parser(
         "serve",

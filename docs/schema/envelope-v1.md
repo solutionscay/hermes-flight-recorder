@@ -38,11 +38,51 @@ adapter, and the reconciler. The validator lives in
 | `content_ciphertext` | string (base64) | no | encrypted | The client-encrypted content blob. Absent when the event has no content. |
 | `content_nonce` | string (base64) | no | encrypted | The per-record AEAD nonce for `content_ciphertext`. |
 | `content_hash` | string (hex) | no | integrity | The hash of the plaintext content, computed before encryption. |
-| `key_version` | string | no | encrypted | The id of the encryption key and algorithm for `content_ciphertext`. |
+| `key_version` | string | no | encrypted | The id of the key epoch for `content_ciphertext`. Content is encrypted with a per-process AES-256-GCM data key (DEK); `key_version` names that DEK epoch and the operator key it was sealed to. The DEK itself travels wrapped, out of band (see below), so the field's meaning — an opaque key identifier a reader resolves to the right key — is unchanged. |
 | `partial` | boolean | yes | integrity | True when the event is reconstructed, not yet terminal, or content was capped. Consumers treat it as provisional or consult event-specific truncation metadata. |
 
 **Content-field invariant:** `content_nonce`, `content_hash`, and
 `key_version` are present if and only if `content_ciphertext` is present.
+
+**Wrapped data key (out of band).** The four content fields are unchanged and
+self-sufficient for storage and transport. The data key that decrypts
+`content_ciphertext` is not in the envelope: it is sealed to the fleet operator
+public key and carried in a separate `content_keys` stream keyed by
+`key_version`, so an ingesting backend only ever stores and serves an opaque
+blob and never holds a decrypting key. Only the operator private key opens it.
+See [../key-model.md](../key-model.md).
+
+**Content storage modes:** Content that fits in one ingest request stays
+inline on its logical event through the four content fields above. If the
+final serialized singleton request would exceed the ingestion protocol's
+4 MiB hard limit, the outbox atomically writes encrypted
+`runtime.content_chunk_recorded` events immediately before the logical parent
+event. The parent carries no top-level content fields. Its plaintext payload
+adds:
+
+- `content_storage="chunked"`
+- `content_ref`, equal to the parent `event_id`
+- `content_chunk_count`
+- `content_plaintext_bytes`
+- `content_plaintext_hash`
+
+Each `runtime.content_chunk_recorded` payload contains only operational
+integrity metadata: `content_ref`, zero-based `chunk_index`, `chunk_count`,
+`chunk_plaintext_bytes`, `content_plaintext_bytes`, and
+`content_plaintext_hash`. The chunk bytes use the normal encrypted content
+fields. Consumers reconstruct content by selecting the complete chunk set,
+ordering it by `chunk_index`, decrypting and concatenating it, and verifying
+the parent byte count and hash. Chunks without their later parent are
+uncommitted content; the parent is the commit record. The `runtime.` prefix
+classifies chunks as recorder transport telemetry, not agent activity.
+Consumers must group them with the parent.
+
+Chunking is a transport representation only. It does not truncate content and
+does not change the logical event's event type, identity, or domain meaning.
+The outbox appends all chunks and the parent in one SQLite transaction, so a
+crash cannot leave a partial local chunk set. The parent's producer sequence
+follows every chunk sequence, and a stable parent deduplication hit writes no
+new chunks.
 
 **payload invariant:** `payload.event_type` is present and is one of the
 event types below.
@@ -67,6 +107,19 @@ absolute source values. An unchanged re-poll emits nothing. If Hermes resets a
 counter, its current absolute value becomes the first delta of the new counter
 epoch and the affected names appear in `counter_reset_fields`. Consumers can
 therefore sum event values without double-counting cumulative snapshots.
+
+**Durable terminal usage semantics:** a finalized `session.ended` or
+`subagent.completed` event projected from `state.db:sessions` sets
+`payload.usage_semantics` to `"cumulative_total"`. Its available API-call,
+token, and cost fields are the authoritative whole-session totals, not
+additive event-stream deltas. Consumers must not add them to
+`model.usage_recorded` deltas. Optional telemetry columns and SQL `NULL`
+values are omitted, while an explicit numeric zero is preserved. When
+available, the terminal also carries `actual_cost_usd`, `cost_status`, and
+`cost_source`. Partial terminals do not claim cumulative totals and omit
+these usage and cost fields. This additive v1 payload extension is prospective:
+the append-only outbox does not rewrite terminal events captured before the
+field existed, so consumers must tolerate a terminal without the marker.
 
 **Invocation content projection:** the live `hook:agent:start` and
 `hook:agent:end` records are immediate, partial, metadata-only bookends.
@@ -258,7 +311,45 @@ operation and never emits `knowledge.record_compacted`.
 A `knowledge.record_written` event is dedup-keyed on its `state.db` message row,
 as other message-derived events are. A store version is identified by its
 `(artifact_id, seq)` and its content manifest, so a restart, a re-scan, or a
-re-poll produces no duplicate version and no duplicate event.
+re-poll produces no duplicate version and no duplicate event. Its complete
+encrypted after-state uses inline content when it fits and the chunked content
+representation above when it does not; either form restores the same bytes.
+
+### Knowledge content bundle v1
+
+The complete encrypted after-state of a non-tombstone store event is a UTF-8
+JSON document with `format="knowledge.bundle.v1"`. The plaintext payload also
+sets `content_format="knowledge.bundle.v1"` so a keyless consumer can select the
+correct parser without inspecting ciphertext. Inline and chunked transport
+decrypt to the same document:
+
+```json
+{
+  "format": "knowledge.bundle.v1",
+  "artifact_id": "skill:deploy",
+  "version_seq": 1,
+  "manifest_hash": "sha256:…",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "byte_count": 37,
+      "content_hash": "sha256:…",
+      "content_b64": "IyBEZXBsb3kKLi4u"
+    }
+  ]
+}
+```
+
+`artifact_id`, `version_seq`, and `manifest_hash` repeat the parent event
+identity and must match it exactly. `files` is ordered lexicographically by
+safe, artifact-relative POSIX path. Paths are unique and never absolute, empty,
+dot segments, or parent traversals. `byte_count` is the decoded byte length and
+`content_hash` is `sha256:` plus the lowercase SHA-256 digest of those bytes.
+The manifest hash is the existing store digest over the canonical ordered
+`[{"blob_hash": content_hash, "path": path}, …]` manifest. Consumers must verify
+all of these invariants before rendering any member as a complete artifact.
+Tombstones keep the parent metadata but carry neither encrypted content nor a
+`content_format`.
 
 ## Event-type surface
 
@@ -279,8 +370,8 @@ re-poll produces no duplicate version and no duplicate event.
 `tool.approval_responded`, `delegation.delivered`, `delegation.progress`,
 `cron.definition_changed`, `command.invoked`, `handoff.state_changed`,
 `task.created`, `task.claimed`, `task.completed`, `task.blocked`,
-`task.failed_terminal`, `task.attempt_ended`, `knowledge.record_written`,
-`knowledge.record_compacted`.
+`task.failed_terminal`, `task.attempt_ended`, `runtime.content_chunk_recorded`,
+`knowledge.record_written`, `knowledge.record_compacted`.
 
 ## Ordering model
 
@@ -327,8 +418,9 @@ its payload.
   `last_heartbeat_at`, `block_kind`, `run_outcome`, `attempt_disposition`),
   knowledge artifact metadata (`artifact_kind`, `action`, `skill_name`,
   `category`, memory `target`, the relative artifact `path`, `provenance`,
-  `origin`, `artifact_version_ref`, and file and byte counts), `content_hash`,
-  and `key_version`.
+  `origin`, `artifact_version_ref`, and file and byte counts), inline
+  `content_hash`, chunk-set `content_plaintext_hash`, chunk indexes and byte
+  counts, and `key_version`.
 - **Encrypted on the host:** user and assistant text, tool arguments and
   results, the system prompt, reasoning, agent and subagent goals and
   summaries, cron output, error messages, task title/body/result and run

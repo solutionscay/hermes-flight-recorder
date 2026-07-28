@@ -14,8 +14,13 @@ Key properties:
 - The high-water mark lives in the database, so it survives a restart.
 - Dedup on a caller-supplied stable key stops a re-captured row from
   appending twice, and does not consume a sequence number.
-- Content is encrypted before write with a local dev key (POC only; real
-  key custody is deferred).
+- Content is encrypted before write with a per-process data key (DEK) that
+  is sealed to the fleet operator public key; the plaintext DEK stays in
+  memory only and its wrapped form is stored in ``content_keys``. Reading
+  content back needs the operator private key (see :mod:`content_crypto` and
+  :mod:`keystore`). Content too large for one ingest request is
+  encrypted in bounded runtime chunk records and committed by its logical
+  parent record.
 - Retention can remove acknowledged event rows, but never sequence or meta
   state. Compact non-content tombstones preserve deduplication and
   reconciliation identity. The independent high-water mark therefore remains
@@ -38,17 +43,18 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
-
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from typing import Any, Iterable, Iterator
 
 from ..envelope import SCHEMA_VERSION, parse, serialize, validate
+from . import content_crypto as cc
+from . import keystore
 from ._common import (
     FLIGHT_RECORDER_DIR_NAME,
     default_flight_recorder_home,
     resolve_flight_recorder_home,
     resolve_hermes_home,
 )
+from .sync import MAX_INGEST_BATCH_BYTES, singleton_batch_size
 
 __all__ = [
     "OUTBOX_SCHEMA_VERSION",
@@ -59,7 +65,17 @@ __all__ = [
 ]
 
 OUTBOX_SCHEMA_VERSION = "1"
-_KEY_VERSION = "aesgcm256:dev"
+_CONTENT_CHUNK_BYTES = 2 * 1024 * 1024
+_CONTENT_CHUNK_EVENT = "runtime.content_chunk_recorded"
+_CONTENT_FIELDS = (
+    "content_ciphertext",
+    "content_nonce",
+    "content_hash",
+    "key_version",
+)
+# ``old_version: (new_version, method_name)``. Each method runs inside the
+# transaction that also advances the durable schema version.
+_MIGRATIONS: dict[str, tuple[str, str]] = {}
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -95,6 +111,13 @@ CREATE TABLE IF NOT EXISTS knowledge_blob (
     content_nonce      TEXT NOT NULL,
     key_version        TEXT NOT NULL,
     byte_len           INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS content_keys (
+    key_version     TEXT PRIMARY KEY,
+    operator_key_id TEXT NOT NULL,
+    wrapped_dek     TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    shipped_at      REAL
 );
 CREATE TABLE IF NOT EXISTS knowledge_artifact (
     artifact_id TEXT PRIMARY KEY,
@@ -177,9 +200,15 @@ class Outbox:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_DDL)
-        self._content_key: bytes | None = None
-        self._aead: AESGCM | None = None
+        # The per-process data key (plaintext, in memory only) and the
+        # key_version that identifies its wrapped form in ``content_keys``.
+        self._dek: bytes | None = None
+        self._key_version: str | None = None
+        # Cache of DEKs unwrapped for reads this process, keyed by key_version,
+        # so decrypting many records under one epoch unwraps once.
+        self._dek_by_version: dict[str, bytes] = {}
         self._installation_id: str | None = None
+        self._apply_migrations()
 
     # --- construction ---------------------------------------------------
     @classmethod
@@ -205,10 +234,13 @@ class Outbox:
         return cls(home / "outbox.sqlite")
 
     def initialize(self) -> str:
-        """Create the installation identity and content key once.
+        """Create the installation identity once.
 
         Idempotent: an already-initialized outbox keeps its
-        ``installation_id`` and key. Returns the ``installation_id``.
+        ``installation_id``. Returns the ``installation_id``. The operator key
+        that content is sealed to lives in the keystore (minted by ``install``
+        / ``keygen``); the per-process data key is minted lazily on the first
+        content write, so nothing key-related is created here.
         """
         self._conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES('installation_id', ?)",
@@ -218,8 +250,34 @@ class Outbox:
             "INSERT OR IGNORE INTO meta(key, value) VALUES('outbox_schema_version', ?)",
             (OUTBOX_SCHEMA_VERSION,),
         )
-        self._ensure_content_key()
+        self._apply_migrations()
         return self.installation_id
+
+    def _apply_migrations(self) -> None:
+        """Apply registered schema migrations transactionally and in order."""
+        version = self.get_meta("outbox_schema_version")
+        if version is None:
+            return
+        while version != OUTBOX_SCHEMA_VERSION:
+            migration = _MIGRATIONS.get(version)
+            if migration is None:
+                raise OutboxError(
+                    f"unsupported outbox schema version {version!r}; "
+                    f"this build supports {OUTBOX_SCHEMA_VERSION!r}"
+                )
+            next_version, method_name = migration
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                getattr(self, method_name)()
+                self._conn.execute(
+                    "UPDATE meta SET value=? WHERE key='outbox_schema_version'",
+                    (next_version,),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            version = next_version
 
     # --- identity -------------------------------------------------------
     @property
@@ -235,59 +293,201 @@ class Outbox:
             self._installation_id = row[0]
         return self._installation_id
 
-    # --- content key ----------------------------------------------------
-    @property
-    def _key_path(self) -> Path:
-        return self._flight_recorder_home / "content-dev.key"
+    # --- content keys ---------------------------------------------------
+    # Writing needs only the operator *public* key: content is encrypted with
+    # a per-process data key (DEK) that is sealed to that public key. The
+    # plaintext DEK stays in memory; its wrapped form is persisted in
+    # ``content_keys`` so a reader with the operator private key can recover
+    # it. Reading is in the decryption section below and needs the private key.
+    def _operator_public(self) -> cc.OperatorPublicKey:
+        """The operator public key this installation seals content to.
 
-    def _ensure_content_key(self) -> bytes:
-        if self._content_key is not None:
-            return self._content_key
-        if self._key_path.exists():
-            self._content_key = self._key_path.read_bytes()
-        else:
-            key = AESGCM.generate_key(bit_length=256)
-            self._key_path.write_bytes(key)
-            os.chmod(self._key_path, 0o600)
-            self._content_key = key
-        return self._content_key
+        Solo bootstrap mirrors the old auto-generated dev key: if neither key
+        half exists yet, mint a solo operator keypair (both halves local). A
+        fleet agent already holds ``operator.pub`` and no private key; its
+        public key is used and no key is minted.
+        """
+        home = self._flight_recorder_home
+        if not keystore.has_public(home) and not keystore.has_secret(home):
+            keystore.ensure_solo_keypair(home)
+        return keystore.load_public_key(home)
 
-    def _cipher(self) -> AESGCM:
-        # One AESGCM instance (one key schedule) per outbox, not per record.
-        if self._aead is None:
-            self._aead = AESGCM(self._ensure_content_key())
-        return self._aead
+    def _current_dek(self) -> tuple[str, bytes]:
+        """Return this process's ``(key_version, dek)``, minting once.
+
+        A fresh DEK per process/epoch is sealed to the operator public key and
+        its wrapped form recorded in ``content_keys`` keyed by ``key_version``.
+        The plaintext DEK never leaves memory. ``key_version`` ties a record to
+        the operator key epoch (``operator_key_id``) plus this process's DEK.
+        """
+        if self._dek is not None and self._key_version is not None:
+            return self._key_version, self._dek
+        public = self._operator_public()
+        dek = cc.generate_dek()
+        wrapped = cc.wrap_dek(public, dek)
+        key_version = f"{public.key_id}#{uuid.uuid4().hex[:16]}"
+        self._conn.execute(
+            "INSERT OR IGNORE INTO content_keys("
+            "key_version, operator_key_id, wrapped_dek, created_at) "
+            "VALUES(?,?,?,?)",
+            (
+                key_version,
+                public.key_id,
+                base64.b64encode(wrapped).decode("ascii"),
+                time.time(),
+            ),
+        )
+        self._dek = dek
+        self._key_version = key_version
+        return key_version, dek
 
     def _encrypt_content(self, content: str | bytes) -> dict[str, str]:
-        raw = content.encode("utf-8") if isinstance(content, str) else content
-        nonce = os.urandom(12)
-        ciphertext = self._cipher().encrypt(nonce, raw, None)
+        key_version, dek = self._current_dek()
+        ciphertext, nonce, content_hash = cc.encrypt_content(dek, content)
         return {
             "content_ciphertext": base64.b64encode(ciphertext).decode("ascii"),
             "content_nonce": base64.b64encode(nonce).decode("ascii"),
-            "content_hash": "sha256:" + hashlib.sha256(raw).hexdigest(),
-            "key_version": _KEY_VERSION,
+            "content_hash": content_hash,
+            "key_version": key_version,
         }
 
-    def decrypt_content(self, record: dict[str, Any]) -> bytes:
-        """Decrypt a record's content. For tooling and tests only.
+    # --- wrapped DEK shipping -------------------------------------------
+    # The wrapped DEKs are a small keyless side-channel: each is an opaque
+    # blob sealed to the operator public key, shipped out of band so a reader
+    # with the operator private key can unwrap it (the server never can). They
+    # travel to the ingestion service's wrapped-DEK endpoint separately from
+    # events; ``shipped_at`` records a durable ack so a later pass skips them.
+    # Delivery is idempotent server-side by (installation_id, key_version).
+    def iter_unshipped_content_keys(self) -> Iterator[dict[str, Any]]:
+        """Yield wrapped-DEK records not yet acknowledged by the service.
 
-        The POC observe command never calls this; content stays encrypted
-        at rest and in the console.
+        ``recipient_key_id`` is the operator key epoch the DEK was sealed to;
+        ``wrapped_dek`` is opaque base64 already. ``installation_id`` ties each
+        record to this installation, exactly as an event does.
+        """
+        inst = self.installation_id
+        rows = self._conn.execute(
+            "SELECT key_version, operator_key_id, wrapped_dek FROM content_keys "
+            "WHERE shipped_at IS NULL ORDER BY created_at, key_version"
+        ).fetchall()
+        for key_version, operator_key_id, wrapped_dek in rows:
+            yield {
+                "installation_id": inst,
+                "key_version": key_version,
+                "recipient_key_id": operator_key_id,
+                "wrapped_dek": wrapped_dek,
+            }
+
+    def mark_content_keys_shipped(self, key_versions: Iterable[str]) -> None:
+        """Record that wrapped-DEK records were durably accepted."""
+        now = time.time()
+        self._conn.executemany(
+            "UPDATE content_keys SET shipped_at=? WHERE key_version=?",
+            [(now, kv) for kv in key_versions],
+        )
+
+    # --- reading (operator private key required) ------------------------
+    def _resolve_keypair(self, keypair: cc.OperatorKeyPair | None) -> cc.OperatorKeyPair:
+        """The keypair to decrypt with: the caller's, else the solo keystore's.
+
+        Passing an explicit keypair supports the operator console, which holds
+        the private key off-host. Falling back to the keystore keeps solo
+        tooling and tests key-free. On a fleet agent (no private key) this
+        raises, which is the intended posture: writes but no reads.
+        """
+        if keypair is not None:
+            return keypair
+        return keystore.load_keypair(self._flight_recorder_home)
+
+    def _dek_for_version(
+        self, key_version: str, keypair: cc.OperatorKeyPair
+    ) -> bytes:
+        """Unwrap (and cache) the DEK for ``key_version`` via the private key."""
+        cached = self._dek_by_version.get(key_version)
+        if cached is not None:
+            return cached
+        row = self._conn.execute(
+            "SELECT wrapped_dek FROM content_keys WHERE key_version=?",
+            (key_version,),
+        ).fetchone()
+        if row is None:
+            raise OutboxError(
+                f"no wrapped data key stored for key_version {key_version!r}"
+            )
+        dek = cc.unwrap_dek(keypair, base64.b64decode(row[0]))
+        self._dek_by_version[key_version] = dek
+        return dek
+
+    def decrypt_content(
+        self,
+        record: dict[str, Any],
+        keypair: cc.OperatorKeyPair | None = None,
+    ) -> bytes:
+        """Decrypt a record's content with the operator private key.
+
+        For tooling and tests on a solo or operator machine only — reading
+        requires the private key. The POC observe command never calls this;
+        content stays encrypted at rest and in the console. Inline content
+        decrypts directly. Chunked content is reconstructed from its preceding
+        encrypted chunk records and verified against the parent record's byte
+        count and hash. Pass ``keypair`` to decrypt with a key held off-host
+        (the operator console); omit it to use the solo keystore keypair.
         """
         ct = record.get("content_ciphertext")
         nonce = record.get("content_nonce")
-        if ct is None or nonce is None:
+        if ct is not None and nonce is not None:
+            return self._decrypt_inline_content(record, self._resolve_keypair(keypair))
+
+        payload = record.get("payload", {})
+        if payload.get("content_storage") != "chunked":
             raise OutboxError("record has no encrypted content")
-        return self._cipher().decrypt(
-            base64.b64decode(nonce), base64.b64decode(ct), None
+        resolved = self._resolve_keypair(keypair)
+        content_ref = payload.get("content_ref")
+        chunk_count = payload.get("content_chunk_count")
+        if not isinstance(content_ref, str) or not isinstance(chunk_count, int):
+            raise OutboxError("chunked content metadata is invalid")
+
+        chunks = []
+        for event in self.iter_events(record.get("installation_id")):
+            chunk_payload = event.get("payload", {})
+            if (
+                chunk_payload.get("event_type") == _CONTENT_CHUNK_EVENT
+                and chunk_payload.get("content_ref") == content_ref
+            ):
+                chunks.append(event)
+        chunks.sort(key=lambda event: event["payload"].get("chunk_index", -1))
+        indices = [event["payload"].get("chunk_index") for event in chunks]
+        if len(chunks) != chunk_count or indices != list(range(chunk_count)):
+            raise OutboxError(
+                f"chunked content {content_ref} is incomplete: "
+                f"expected {chunk_count} chunks, found {len(chunks)}"
+            )
+
+        raw = b"".join(
+            self._decrypt_inline_content(chunk, resolved) for chunk in chunks
         )
+        expected_bytes = payload.get("content_plaintext_bytes")
+        expected_hash = payload.get("content_plaintext_hash")
+        if expected_bytes != len(raw) or expected_hash != self._content_hash(raw):
+            raise OutboxError(f"chunked content {content_ref} failed verification")
+        return raw
+
+    def _decrypt_inline_content(
+        self, record: dict[str, Any], keypair: cc.OperatorKeyPair
+    ) -> bytes:
+        ct = record.get("content_ciphertext")
+        nonce = record.get("content_nonce")
+        key_version = record.get("key_version")
+        if ct is None or nonce is None or key_version is None:
+            raise OutboxError("record has no inline encrypted content")
+        dek = self._dek_for_version(key_version, keypair)
+        return cc.decrypt_content(dek, base64.b64decode(ct), base64.b64decode(nonce))
 
     # --- knowledge store ------------------------------------------------
     # A content-addressed store for Hermes-created skills and built-in
-    # memories (Phase 3). It shares the outbox's cipher and connection but
-    # its own tables, so event retention never touches knowledge state and
-    # knowledge retention never touches events.
+    # memories (Phase 3). It shares the outbox's content encryption and
+    # connection but its own tables, so event retention never touches
+    # knowledge state and knowledge retention never touches events.
     @staticmethod
     def _content_hash(raw: bytes) -> str:
         return "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -324,18 +524,23 @@ class Outbox:
         )
         return digest
 
-    def get_blob(self, content_hash: str) -> bytes:
-        """Decrypt and return a stored blob. For restore and tests."""
+    def get_blob(
+        self, content_hash: str, keypair: cc.OperatorKeyPair | None = None
+    ) -> bytes:
+        """Decrypt and return a stored blob with the operator private key.
+
+        For restore and tests on a solo or operator machine. Pass ``keypair``
+        to decrypt with an off-host key; omit it to use the solo keystore.
+        """
         row = self._conn.execute(
-            "SELECT content_ciphertext, content_nonce FROM knowledge_blob "
+            "SELECT content_ciphertext, content_nonce, key_version FROM knowledge_blob "
             "WHERE content_hash=?",
             (content_hash,),
         ).fetchone()
         if row is None:
             raise OutboxError(f"no knowledge blob for {content_hash}")
-        return self._cipher().decrypt(
-            base64.b64decode(row[1]), base64.b64decode(row[0]), None
-        )
+        dek = self._dek_for_version(row[2], self._resolve_keypair(keypair))
+        return cc.decrypt_content(dek, base64.b64decode(row[0]), base64.b64decode(row[1]))
 
     def upsert_knowledge_artifact(
         self,
@@ -539,8 +744,9 @@ class Outbox:
     ) -> tuple[dict[str, Any], bool]:
         """Implement both append APIs and return the stored record and outcome."""
         rec = dict(record)
-        if content is not None:
-            rec.update(self._encrypt_content(content))
+        raw_content = (
+            content.encode("utf-8") if isinstance(content, str) else content
+        )
         rec.setdefault("schema_version", SCHEMA_VERSION)
         rec["installation_id"] = self.installation_id
         rec["event_id"] = str(uuid.uuid4())
@@ -581,33 +787,147 @@ class Outbox:
             row = conn.execute(
                 "SELECT high_water FROM seq WHERE installation_id=?", (inst,)
             ).fetchone()
-            seq = (row[0] if row else 0) + 1
-            rec["producer_sequence"] = seq
+            high_water = row[0] if row else 0
+            rec["producer_sequence"] = high_water + 1
+
+            chunk_records: list[dict[str, Any]] = []
+            if (
+                raw_content is not None
+                and self._inline_singleton_size(rec, len(raw_content))
+                > MAX_INGEST_BATCH_BYTES
+            ):
+                chunk_records = self._content_chunk_records(
+                    rec, raw_content, high_water
+                )
+                payload = dict(rec["payload"])
+                payload.update(
+                    {
+                        "content_storage": "chunked",
+                        "content_ref": rec["event_id"],
+                        "content_chunk_count": len(chunk_records),
+                        "content_plaintext_bytes": len(raw_content),
+                        "content_plaintext_hash": self._content_hash(raw_content),
+                    }
+                )
+                rec["payload"] = payload
+                rec["producer_sequence"] = high_water + len(chunk_records) + 1
+            elif raw_content is not None:
+                rec.update(self._encrypt_content(raw_content))
 
             validate(rec)  # raises before any write on a bad record
+            if singleton_batch_size(rec) > MAX_INGEST_BATCH_BYTES:
+                raise OutboxError(
+                    "record metadata exceeds the ingestion protocol's "
+                    f"{MAX_INGEST_BATCH_BYTES}-byte limit"
+                )
 
-            conn.execute(
-                "INSERT INTO events (event_id, installation_id, producer_sequence, "
-                "dedup_key, recorded_at, envelope_json) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    rec["event_id"],
-                    inst,
-                    seq,
-                    dedup_key,
-                    rec["recorded_at"],
-                    serialize(rec),
-                ),
-            )
+            for chunk in chunk_records:
+                validate(chunk)
+                if singleton_batch_size(chunk) > MAX_INGEST_BATCH_BYTES:
+                    raise OutboxError(
+                        "content chunk exceeds the ingestion protocol's "
+                        f"{MAX_INGEST_BATCH_BYTES}-byte limit"
+                    )
+                self._insert_event(chunk, dedup_key=None)
+            self._insert_event(rec, dedup_key=dedup_key)
             conn.execute(
                 "INSERT INTO seq (installation_id, high_water) VALUES (?, ?) "
                 "ON CONFLICT(installation_id) DO UPDATE SET high_water=excluded.high_water",
-                (inst, seq),
+                (inst, rec["producer_sequence"]),
             )
             conn.execute("COMMIT")
             return rec, True
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    def _inline_singleton_size(self, record: dict[str, Any], plaintext_bytes: int) -> int:
+        """Exact singleton wire size after encrypting ``plaintext_bytes``.
+
+        AES-GCM adds a 16-byte tag. Base64 length is deterministic, and its
+        alphabet needs no JSON escaping. Measuring a record with empty content
+        fields and adding their encoded lengths avoids allocating and
+        encrypting an arbitrarily large inline candidate only to discard it.
+        The stamped ``key_version`` is this process's, so its exact length is
+        known once the DEK is minted.
+        """
+        key_version, _ = self._current_dek()
+        probe = dict(record)
+        probe.update({field: "" for field in _CONTENT_FIELDS})
+        ciphertext_bytes = plaintext_bytes + 16
+        ciphertext_b64 = 4 * ((ciphertext_bytes + 2) // 3)
+        nonce_b64 = 16  # a 12-byte AES-GCM nonce
+        content_hash = len("sha256:") + 64
+        return (
+            singleton_batch_size(probe)
+            + ciphertext_b64
+            + nonce_b64
+            + content_hash
+            + len(key_version)
+        )
+
+    def _content_chunk_records(
+        self, parent: dict[str, Any], raw: bytes, high_water: int
+    ) -> list[dict[str, Any]]:
+        """Build encrypted transport chunks that immediately precede a parent."""
+        chunk_count = (len(raw) + _CONTENT_CHUNK_BYTES - 1) // _CONTENT_CHUNK_BYTES
+        full_hash = self._content_hash(raw)
+        records = []
+        for index, offset in enumerate(
+            range(0, len(raw), _CONTENT_CHUNK_BYTES)
+        ):
+            piece = raw[offset : offset + _CONTENT_CHUNK_BYTES]
+            chunk = {
+                "schema_version": parent["schema_version"],
+                "event_id": str(uuid.uuid4()),
+                "producer_sequence": high_water + index + 1,
+                "occurred_at": parent["occurred_at"],
+                "recorded_at": parent["recorded_at"],
+                "installation_id": parent["installation_id"],
+                "tenant_id": parent["tenant_id"],
+                "profile": parent["profile"],
+                "runtime": parent["runtime"],
+                "correlation_id": parent["correlation_id"],
+                "source": "outbox:content-chunker",
+                "capture_method": "derive:outbox-content-chunk",
+                "payload": {
+                    "event_type": _CONTENT_CHUNK_EVENT,
+                    "content_ref": parent["event_id"],
+                    "chunk_index": index,
+                    "chunk_count": chunk_count,
+                    "chunk_plaintext_bytes": len(piece),
+                    "content_plaintext_bytes": len(raw),
+                    "content_plaintext_hash": full_hash,
+                },
+                "partial": False,
+                **self._encrypt_content(piece),
+            }
+            for field in (
+                "session_id",
+                "session_key",
+                "parent_session_id",
+                "invocation_id",
+            ):
+                if field in parent:
+                    chunk[field] = parent[field]
+            records.append(chunk)
+        return records
+
+    def _insert_event(
+        self, record: dict[str, Any], *, dedup_key: str | None
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO events (event_id, installation_id, producer_sequence, "
+            "dedup_key, recorded_at, envelope_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                record["event_id"],
+                record["installation_id"],
+                record["producer_sequence"],
+                dedup_key,
+                record["recorded_at"],
+                serialize(record),
+            ),
+        )
 
     # --- poll cursors ---------------------------------------------------
     # Producers (the state adapter) keep an incremental cursor per source in

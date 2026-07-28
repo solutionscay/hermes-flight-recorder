@@ -82,6 +82,7 @@ RESERVED_EVENT_TYPES = frozenset(
         "task.blocked",
         "task.failed_terminal",
         "task.attempt_ended",
+        "runtime.content_chunk_recorded",
         "knowledge.record_written",
         "knowledge.record_compacted",
     }

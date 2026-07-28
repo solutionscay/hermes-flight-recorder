@@ -70,6 +70,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
         ({"retention": {"enabled": "yes"}}, "retention.enabled"),
         ({"retention": {"vacuum": "never"}}, "retention.vacuum"),
         ({"sync": {"max_records": 1.5}}, "sync.max_records"),
+        ({"sync": {"max_bytes": 4 * 1024 * 1024 + 1}}, "sync.max_bytes"),
         ({"capture": {"message_roles": "user"}}, "message_roles"),
         ({"capture": {"sources": {"hook": "yes"}}}, "capture.sources"),
         ({"knowledge": {"history": "some"}}, "knowledge.history"),

@@ -31,6 +31,22 @@ from typing import TYPE_CHECKING, Any, Callable
 # a crash-loop, a hung pass).
 CAPTURE_HEARTBEAT_KEY = "capture:last_success_at"
 
+def _capture_since(outbox: Any) -> float | None:
+    """The capture horizon epoch, or None when backfill is enabled (default).
+
+    Returns the ``installed_at`` marker only when backfill is explicitly off, so
+    collectors emit nothing that occurred before the recorder was installed.
+    """
+    from ._common import CAPTURE_BACKFILL_META_KEY, INSTALLED_AT_META_KEY
+
+    if outbox.get_meta(CAPTURE_BACKFILL_META_KEY) != "false":
+        return None
+    raw = outbox.get_meta(INSTALLED_AT_META_KEY)
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
 # A durable-store poll may hit a transient fault that is not a missing file: the
 # Hermes DB is momentarily locked (``sqlite3.OperationalError`` while Hermes
 # checkpoints), unreadable (``PermissionError``), or malformed mid-write. These
@@ -73,6 +89,8 @@ def run_pass(
     from . import cron_db, gateway_log, kanban_db, knowledge_store, state_db
     from .hook import drain as drain_hook_spool
 
+    since = _capture_since(outbox)
+
     totals: Counter[str] = Counter()
     sources: tuple[
         tuple[str, Callable[[], dict[str, int]], tuple[type[Exception], ...]], ...
@@ -81,13 +99,13 @@ def run_pass(
         (
             "state.db",
             lambda: state_db.poll(
-                outbox, hermes_home, capture_config=capture_config
+                outbox, hermes_home, capture_config=capture_config, since=since
             ),
             _DURABLE_STORE_ERRORS,
         ),
-        ("cron", lambda: cron_db.poll(outbox, hermes_home), _DURABLE_STORE_ERRORS),
-        ("kanban", lambda: kanban_db.poll(outbox, hermes_home), _DURABLE_STORE_ERRORS),
-        ("gateway log", lambda: gateway_log.poll(outbox, hermes_home), _DURABLE_STORE_ERRORS),
+        ("cron", lambda: cron_db.poll(outbox, hermes_home, since=since), _DURABLE_STORE_ERRORS),
+        ("kanban", lambda: kanban_db.poll(outbox, hermes_home, since=since), _DURABLE_STORE_ERRORS),
+        ("gateway log", lambda: gateway_log.poll(outbox, hermes_home, since=since), _DURABLE_STORE_ERRORS),
         (
             "knowledge",
             lambda: knowledge_store.poll(
