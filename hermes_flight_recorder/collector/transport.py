@@ -161,6 +161,9 @@ class HttpsTransport:
         if status != 202:
             raise _classify_status(status, payload.decode("utf-8", "replace"))
 
+        text = payload.decode("utf-8", "replace")
+        if _looks_like_cloudflare_access_login(text):
+            raise AuthError("ingest returned Cloudflare Access login page")
         return payload
 
 
@@ -247,6 +250,12 @@ def push(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOutcome:
     return PushOutcome(ok=True, reason="ok", result=result)
 
 
+def _looks_like_cloudflare_access_login(detail: str) -> bool:
+    """True when Cloudflare Access returned an HTML login page as a 200."""
+    lower = detail.lower()
+    return "cloudflare access" in lower and "sign in" in lower
+
+
 def push_content_keys(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOutcome:
     """Ship pending wrapped DEKs, tolerating network and auth failure like push.
 
@@ -269,6 +278,8 @@ def push_content_keys(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOu
 
 
 def _classify_status(status: int, detail: str) -> TransportError:
+    if _looks_like_cloudflare_access_login(detail):
+        return AuthError("ingest returned Cloudflare Access login page")
     message = f"ingest returned {status}: {detail.strip()[:500]}"
     if status in (401, 403):
         return AuthError(message)

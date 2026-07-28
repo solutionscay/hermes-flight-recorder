@@ -226,6 +226,18 @@ def test_malformed_ack_is_terminal():
         transport.send(a_batch())
 
 
+def test_cloudflare_access_login_page_is_auth_error():
+    html = b"""<!DOCTYPE html>
+<html><head><title>Sign in \xe3\x83\xbb Cloudflare Access</title></head></html>"""
+    transport = HttpsTransport(
+        "https://x/ingest",
+        {},
+        _urlopen=urlopen_returning(_FakeResponse(200, html)),
+    )
+    with pytest.raises(AuthError, match="Cloudflare Access login page"):
+        transport.send(a_batch())
+
+
 # --------------------------------------------------------------------------
 # RetryingTransport
 # --------------------------------------------------------------------------
