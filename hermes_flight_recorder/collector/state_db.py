@@ -128,6 +128,7 @@ def poll(
     hermes_home: str | Path | None = None,
     *,
     capture_config: CaptureConfig | None = None,
+    knowledge_config: Any = None,
     since: float | None = None,
 ) -> dict[str, int]:
     """One read-only poll pass over ``state.db``. Returns per-type counts.
@@ -165,6 +166,7 @@ def poll(
             counts,
             home_mode,
             capture,
+            knowledge_config,
             since,
         )
         _poll_model_usage(
@@ -268,6 +270,7 @@ def _poll_messages(
     counts,
     home_mode,
     capture_config,
+    knowledge_config,
     since=None,
 ) -> None:
     cursor = int(outbox.get_cursor(_MESSAGE_CURSOR) or 0)
@@ -291,6 +294,7 @@ def _poll_messages(
                 "content",
                 "timestamp",
                 "finish_reason",
+                "tool_calls",
             )
         )
         rows = conn.execute(
@@ -399,6 +403,17 @@ def _poll_messages(
             record,
             content=limited_content,
             dedup_key=f"state.db:tool:{r['id']}",
+        )
+        _capture_knowledge_mutation(
+            outbox,
+            conn,
+            r,
+            corr,
+            invocation_id,
+            profile_of.get(sid, "default"),
+            home_mode,
+            counts,
+            knowledge_config,
         )
 
     outbox.set_cursor(_MESSAGE_CURSOR, last_seen_id)
@@ -756,6 +771,123 @@ def _derive_tool_status(content: str | None) -> str:
     if obj.get("error"):
         return "error"
     return str(obj.get("status") or "ok")
+
+
+def _capture_knowledge_mutation(
+    outbox: Any,
+    conn: Any,
+    tool_row: Any,
+    correlation_id: str,
+    invocation_id: str | None,
+    profile: str,
+    home_mode: str,
+    counts: dict[str, int],
+    knowledge_config: Any,
+) -> None:
+    """Pair one knowledge tool result with its assistant tool-call arguments."""
+    tool_name = tool_row["tool_name"]
+    tool_call_id = tool_row["tool_call_id"]
+    if (
+        tool_name not in {"skill_manage", "memory"}
+        or not isinstance(tool_call_id, str)
+        or not tool_call_id
+        or not _table_has_column(conn, "messages", "tool_calls")
+    ):
+        return
+    result = safe_json_dict(tool_row["content"])
+    if result.get("success") is not True or result.get("staged") is True:
+        return
+
+    paired = _find_tool_call(
+        conn,
+        session_id=tool_row["session_id"],
+        before_row_id=int(tool_row["id"]),
+        tool_call_id=tool_call_id,
+    )
+    if paired is None:
+        return
+    assistant_row_id, paired_name, arguments_text, arguments = paired
+    if paired_name != tool_name:
+        return
+
+    from . import knowledge_mutation
+
+    emitted = knowledge_mutation.capture(
+        outbox,
+        tool_name=tool_name,
+        arguments_text=arguments_text,
+        arguments=arguments,
+        result=result,
+        assistant_row_id=assistant_row_id,
+        tool_result_row_id=int(tool_row["id"]),
+        tool_call_id=tool_call_id,
+        occurred_at=float(tool_row["timestamp"] or 0.0),
+        home_mode=home_mode,
+        correlation_id=correlation_id,
+        session_id=tool_row["session_id"],
+        invocation_id=invocation_id,
+        profile=profile,
+        knowledge_config=knowledge_config,
+    )
+    for event_type, count in emitted.items():
+        counts[event_type] += count
+
+
+def _find_tool_call(
+    conn: Any,
+    *,
+    session_id: str,
+    before_row_id: int,
+    tool_call_id: str,
+) -> tuple[int, str, str, dict[str, Any]] | None:
+    """Find a tool call by its durable ID in earlier assistant rows."""
+    rows = conn.execute(
+        "SELECT id, tool_calls FROM messages "
+        "WHERE session_id=? AND role='assistant' AND id < ? "
+        "AND tool_calls IS NOT NULL ORDER BY id DESC",
+        (session_id, before_row_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            calls = json.loads(row["tool_calls"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = call.get("id") or call.get("call_id")
+            if call_id != tool_call_id:
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                return None
+            name = function.get("name")
+            raw_arguments = function.get("arguments")
+            if not isinstance(name, str):
+                return None
+            if isinstance(raw_arguments, str):
+                arguments_text = raw_arguments
+                try:
+                    arguments = json.loads(raw_arguments)
+                except (TypeError, ValueError):
+                    return None
+            elif isinstance(raw_arguments, dict):
+                arguments = raw_arguments
+                arguments_text = json.dumps(
+                    raw_arguments, ensure_ascii=False, separators=(",", ":")
+                )
+            else:
+                return None
+            if not isinstance(arguments, dict):
+                return None
+            return int(row["id"]), name, arguments_text, arguments
+    return None
+
+
+def _table_has_column(conn: Any, table: str, column: str) -> bool:
+    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
 def _delegation_content(event: dict[str, Any], result_json: str | None) -> str | None:

@@ -99,7 +99,11 @@ def run_pass(
         (
             "state.db",
             lambda: state_db.poll(
-                outbox, hermes_home, capture_config=capture_config, since=since
+                outbox,
+                hermes_home,
+                capture_config=capture_config,
+                knowledge_config=knowledge_config,
+                since=since,
             ),
             _DURABLE_STORE_ERRORS,
         ),
