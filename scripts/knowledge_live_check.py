@@ -19,8 +19,9 @@ Two legs, the same shape as ``scripts/kanban_live_check.py`` and
   background edit (one file, blob-deduped, ``origin='background'``), a memory
   ``add``, and a delete (a tombstone whose prior version still restores).
 
-Leg A proves the scanner/reconciler hold against genuine Hermes artifacts; Leg B
-proves the create → capture → restore → delete round-trip end to end.
+Leg A proves the scanner/reconciler hold against genuine Hermes artifacts. Leg B
+proves the scanner round-trip. Leg C proves a foreground create and delete when
+no final artifact remains on disk.
 
 Usage:  python scripts/knowledge_live_check.py [--hermes-home PATH] [-v]
 Exit:   0 if every non-skipped assertion passes, 1 otherwise.
@@ -28,6 +29,8 @@ Exit:   0 if every non-skipped assertion passes, 1 otherwise.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import sys
 from functools import partial
 from pathlib import Path
@@ -37,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _gate import run_gate
-from hermes_flight_recorder.collector import knowledge_store
+from hermes_flight_recorder.collector import knowledge_store, state_db
 from hermes_flight_recorder.collector._common import (
     hermes_created_skills,
     memory_files,
@@ -274,9 +277,151 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+# --- Leg C: foreground lifecycle with no final disk artifact -------------
+def leg_c_foreground_lifecycle(_home: Path, tmp: Path) -> list[str]:
+    fails: list[str] = []
+    disposable = tmp / "foreground-home"
+    disposable.mkdir()
+    content = "---\nname: transient-probe\n---\n\n# Transient probe\n"
+    _write_foreground_state_db(disposable, content)
+    ob = _new_outbox(tmp)
+    try:
+        state_db.poll(ob, disposable)
+        events = [
+            event
+            for event in ob.iter_events()
+            if event["payload"]["event_type"] == "knowledge.record_written"
+        ]
+        actions = [event["payload"]["action"] for event in events]
+        if actions != ["create", "delete"]:
+            fails.append(
+                f"Leg C: foreground actions are {actions}, want create then delete"
+            )
+            return fails
+
+        versions = ob.knowledge_versions("skill:live/transient-probe")
+        if len(versions) != 2 or not versions[-1]["is_tombstone"]:
+            fails.append("Leg C: foreground lifecycle did not end in a v2 tombstone")
+        restored = knowledge_store.restore_version(
+            ob, "skill:live/transient-probe", 1
+        )
+        if restored != {"SKILL.md": content.encode()}:
+            fails.append("Leg C: the transient create version did not restore")
+        if (disposable / "skills" / "live" / "transient-probe").exists():
+            fails.append("Leg C: the transient skill unexpectedly exists on disk")
+        if any(event["payload"]["origin"] != "foreground" for event in events):
+            fails.append("Leg C: a foreground event has the wrong origin")
+        if not fails:
+            _log(
+                "Leg C: create and delete survived with no final artifact on disk"
+            )
+    finally:
+        ob.close()
+    return fails
+
+
+def _write_foreground_state_db(home: Path, content: str) -> None:
+    db = sqlite3.connect(home / "state.db")
+    db.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
+            message_count INT, tool_call_count INT, input_tokens INT,
+            output_tokens INT, estimated_cost_usd REAL, started_at REAL,
+            ended_at REAL, end_reason TEXT, profile_name TEXT,
+            expiry_finalized INT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT,
+            tool_call_id TEXT, tool_calls TEXT, tool_name TEXT,
+            effect_disposition TEXT, timestamp REAL NOT NULL,
+            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+            reasoning_content TEXT, reasoning_details TEXT,
+            codex_reasoning_items TEXT, codex_message_items TEXT,
+            platform_message_id TEXT, observed INTEGER DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            compacted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE session_model_usage (
+            session_id TEXT, model TEXT, task TEXT, api_call_count INT,
+            input_tokens INT, output_tokens INT, cache_read_tokens INT,
+            reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT,
+            last_seen REAL
+        );
+        CREATE TABLE async_delegations (
+            delegation_id TEXT, origin_session TEXT, parent_session_id TEXT,
+            state TEXT, delivery_state TEXT, owner_pid INT, dispatched_at REAL,
+            event_json TEXT, result_json TEXT
+        );
+        """
+    )
+    db.execute(
+        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("S", "cli", None, "m", 4, 2, 0, 0, 0.0, 1000.0, None, None,
+         "default", 0),
+    )
+    calls = [
+        (
+            "call-create",
+            {
+                "action": "create",
+                "name": "transient-probe",
+                "category": "live",
+                "content": content,
+            },
+            {"success": True, "category": "live"},
+        ),
+        (
+            "call-delete",
+            {
+                "action": "delete",
+                "name": "transient-probe",
+                "absorbed_into": "",
+            },
+            {"success": True},
+        ),
+    ]
+    for index, (call_id, arguments, result) in enumerate(calls):
+        assistant_id = index * 2 + 1
+        tool_id = assistant_id + 1
+        tool_calls = json.dumps(
+            [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "skill_manage",
+                        "arguments": json.dumps(arguments),
+                    },
+                }
+            ]
+        )
+        db.execute(
+            "INSERT INTO messages("
+            "id,session_id,role,content,tool_calls,timestamp,finish_reason"
+            ") VALUES (?,?,?,?,?,?,?)",
+            (assistant_id, "S", "assistant", "", tool_calls,
+             1001.0 + assistant_id, "tool_calls"),
+        )
+        db.execute(
+            "INSERT INTO messages("
+            "id,session_id,role,content,tool_call_id,tool_name,timestamp"
+            ") VALUES (?,?,?,?,?,?,?)",
+            (tool_id, "S", "tool", json.dumps(result), call_id,
+             "skill_manage", 1001.0 + tool_id),
+        )
+    db.commit()
+    db.close()
+
+
 LEGS = [
     ("Leg A — live home, read-only, no false finding, no backfill", leg_a_live_readonly),
     ("Leg B — disposable home create → capture → restore → delete", leg_b_roundtrip),
+    (
+        "Leg C — foreground create → delete with no final artifact",
+        leg_c_foreground_lifecycle,
+    ),
 ]
 
 

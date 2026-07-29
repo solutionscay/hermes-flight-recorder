@@ -658,6 +658,21 @@ class Outbox:
         )
         return seq, True
 
+    def set_knowledge_version_attribution(
+        self,
+        artifact_id: str,
+        seq: int,
+        *,
+        origin: str,
+        linked_event_id: str,
+    ) -> None:
+        """Attach the foreground event to an existing knowledge version."""
+        self._conn.execute(
+            "UPDATE knowledge_version SET origin=?, linked_event_id=? "
+            "WHERE artifact_id=? AND seq=?",
+            (origin, linked_event_id, artifact_id, seq),
+        )
+
     def prune_knowledge_versions(self, artifact_id: str, *, keep: int) -> int:
         """Keep the newest ``keep`` versions of an artifact; delete older ones.
 
@@ -733,6 +748,27 @@ class Outbox:
             record, content=content, dedup_key=dedup_key, return_stored=False
         )
         return created
+
+    def event_by_dedup_key(self, dedup_key: str) -> dict[str, Any] | None:
+        """Return a retained event by its stable producer identity."""
+        row = self._conn.execute(
+            "SELECT envelope_json FROM events WHERE dedup_key=?", (dedup_key,)
+        ).fetchone()
+        return parse(row[0]) if row is not None else None
+
+    def has_dedup_key(self, dedup_key: str) -> bool:
+        """Test retained events and compact retention tombstones."""
+        if self._conn.execute(
+            "SELECT 1 FROM events WHERE dedup_key=?", (dedup_key,)
+        ).fetchone():
+            return True
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM retention_tombstones WHERE dedup_key=?",
+                (dedup_key,),
+            ).fetchone()
+            is not None
+        )
 
     def _append(
         self,
