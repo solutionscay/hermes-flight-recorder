@@ -18,6 +18,7 @@ def test_missing_or_partial_config_uses_current_defaults(tmp_path):
     missing = recorder_config.load(tmp_path)
     assert missing.capture.max_content_bytes == 65_536
     assert missing.capture.message_roles == ("user", "assistant", "tool")
+    assert missing.capture.required_sources == ("hook", "state_db")
     assert missing.retention.enabled is False
     assert missing.retention.vacuum == "auto"
     assert missing.knowledge.history == "full"
@@ -46,6 +47,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
                 "max_content_bytes": 10,
                 "message_roles": ["user"],
                 "sources": {"hook": True, "cron": False},
+                "required_sources": ["hook"],
             },
             "retention": {"enabled": False, "max_age_days": 3},
             "sync": {
@@ -64,6 +66,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     monkeypatch.setenv("HFR_SYNC_MAX_BATCHES_PER_TICK", "4")
     monkeypatch.setenv("HFR_CAPTURE_MESSAGE_ROLES", '["assistant", "tool"]')
     monkeypatch.setenv("HFR_CAPTURE_SOURCES", '{"hook": false, "knowledge": true}')
+    monkeypatch.setenv("HFR_CAPTURE_REQUIRED_SOURCES", '["knowledge"]')
     monkeypatch.setenv("HFR_KNOWLEDGE_HISTORY", "latest_only")
     monkeypatch.setenv("HFR_KNOWLEDGE_MAX_VERSIONS", "5")
     monkeypatch.setenv("HFR_KNOWLEDGE_MAX_FILE_BYTES", "1024")
@@ -75,6 +78,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     assert config.capture.max_content_bytes == 20
     assert config.capture.message_roles == ("assistant", "tool")
     assert config.capture.sources == {"hook": False, "knowledge": True}
+    assert config.capture.required_sources == ("knowledge",)
     assert config.retention.enabled is True
     assert config.knowledge.history == "latest_only"
     assert config.knowledge.max_versions == 5
@@ -99,6 +103,9 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
         ({"capture": {"message_roles": "user"}}, "message_roles"),
         ({"capture": {"sources": {"hook": "yes"}}}, "capture.sources"),
         ({"capture": {"sources": {"hooks": True}}}, "unknown source.*hooks"),
+        ({"capture": {"required_sources": "hook"}}, "required_sources"),
+        ({"capture": {"required_sources": ["hooks"]}}, "unknown source.*hooks"),
+        ({"capture": {"required_sources": ["hook", "hook"]}}, "duplicate"),
         ({"knowledge": {"history": "some"}}, "knowledge.history"),
         ({"knowledge": {"max_versions": 0}}, "knowledge.max_versions"),
         ({"knowledge": {"max_file_bytes": 0}}, "knowledge.max_file_bytes"),
@@ -114,7 +121,9 @@ def test_invalid_values_are_rejected(tmp_path, payload, match):
 
 def test_save_writes_private_file_and_round_trips(tmp_path):
     config = recorder_config.RecorderConfig(
-        capture=recorder_config.CaptureConfig(sources={"hook": False}),
+        capture=recorder_config.CaptureConfig(
+            sources={"hook": False}, required_sources=("state_db",)
+        ),
         knowledge=recorder_config.KnowledgeConfig(
             history="latest_only",
             max_versions=3,

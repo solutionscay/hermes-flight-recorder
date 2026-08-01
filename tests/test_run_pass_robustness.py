@@ -14,8 +14,10 @@ import sqlite3
 from hermes_flight_recorder.collector import (
     CAPTURE_HEARTBEAT_KEY,
     cron_db,
+    knowledge_store,
     run_pass,
 )
+from hermes_flight_recorder.collector.health import read_health, source_health_key
 from hermes_flight_recorder.collector.outbox import Outbox
 
 
@@ -97,3 +99,59 @@ def test_crashing_pass_does_not_stamp_the_heartbeat(tmp_path, monkeypatch):
         pass
 
     assert ob.get_meta(CAPTURE_HEARTBEAT_KEY) is None
+
+
+def test_source_failures_are_durable_and_reset_after_success(tmp_path, monkeypatch):
+    ob = Outbox.open(tmp_path / "bridge")
+    ob.initialize()
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cron_db, "poll", boom)
+    for _ in range(2):
+        run_pass(
+            ob,
+            tmp_path / "missing",
+            on_source_error=lambda *_: None,
+            now=100.0,
+        )
+
+    failed = read_health(ob, source_health_key("cron"))
+    assert failed["last_error_at"] == 100.0
+    assert failed["consecutive_failures"] == 2
+    assert "OperationalError" in failed["last_error"]
+
+    monkeypatch.setattr(cron_db, "poll", lambda *args, **kwargs: {})
+    run_pass(
+        ob,
+        tmp_path / "missing",
+        on_source_error=lambda *_: None,
+        now=200.0,
+    )
+    recovered = read_health(ob, source_health_key("cron"))
+    assert recovered["last_success_at"] == 200.0
+    assert recovered["last_error_at"] == 100.0
+    assert recovered["consecutive_failures"] == 0
+
+
+def test_knowledge_artifact_errors_set_source_failure(tmp_path, monkeypatch):
+    ob = Outbox.open(tmp_path / "bridge")
+    ob.initialize()
+
+    def partial_failure(*args, on_artifact_error=None, **kwargs):
+        on_artifact_error("skill:test", PermissionError("denied"))
+        return {"knowledge.record_written": 1}
+
+    monkeypatch.setattr(knowledge_store, "poll", partial_failure)
+    run_pass(
+        ob,
+        tmp_path / "missing",
+        on_source_error=lambda *_: None,
+        now=300.0,
+    )
+
+    state = read_health(ob, source_health_key("knowledge"))
+    assert state["consecutive_failures"] == 1
+    assert state["last_error_at"] == 300.0
+    assert "PermissionError" in state["last_error"]

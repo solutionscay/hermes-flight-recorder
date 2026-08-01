@@ -19,6 +19,12 @@ from pathlib import Path
 
 from hermes_flight_recorder import cli
 from hermes_flight_recorder.collector import CAPTURE_HEARTBEAT_KEY
+from hermes_flight_recorder.collector.health import (
+    RECONCILE_HEALTH_KEY,
+    record_error,
+    record_success,
+    source_health_key,
+)
 from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig
@@ -31,6 +37,9 @@ def init_home(flight_recorder_home: Path, heartbeat: float | None = None) -> Pat
     ob.initialize()
     if heartbeat is not None:
         ob.set_meta(CAPTURE_HEARTBEAT_KEY, repr(heartbeat))
+        for source in ("hook", "state_db"):
+            record_success(ob, source_health_key(source), heartbeat)
+        record_success(ob, RECONCILE_HEALTH_KEY, heartbeat)
     ob.close()
     return flight_recorder_home
 
@@ -132,3 +141,63 @@ def test_status_unreadable_heartbeat_exits_1(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert "UNREADABLE" in out
+
+
+def test_status_required_source_error_exits_1_and_shows_counter(tmp_path, capsys):
+    now = time.time() - 10.0
+    bridge = init_home(tmp_path / "b", heartbeat=now)
+    ob = Outbox.open(bridge)
+    record_error(ob, source_health_key("state_db"), now + 1, OSError("locked"))
+    record_error(ob, source_health_key("state_db"), now + 2, OSError("locked"))
+    ob.close()
+
+    code = run_status(bridge)
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "source state_db: required BROKEN" in out
+    assert "last success" in out
+    assert "last error" in out
+    assert "consecutive failures 2" in out
+
+
+def test_status_optional_source_error_does_not_flip_exit_code(tmp_path, capsys):
+    now = time.time() - 10.0
+    bridge = init_home(tmp_path / "b", heartbeat=now)
+    ob = Outbox.open(bridge)
+    record_error(ob, source_health_key("cron"), now + 1, OSError("locked"))
+    ob.close()
+
+    code = run_status(bridge)
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "source cron: optional BROKEN" in out
+
+
+def test_status_stale_required_source_exits_1(tmp_path, capsys):
+    now = time.time() - 10.0
+    bridge = init_home(tmp_path / "b", heartbeat=now)
+    ob = Outbox.open(bridge)
+    record_success(ob, source_health_key("state_db"), now - THRESHOLD - 1)
+    ob.close()
+
+    code = run_status(bridge)
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "source state_db: required STALE" in out
+
+
+def test_status_reports_stale_reconciliation(tmp_path, capsys):
+    now = time.time() - 10.0
+    bridge = init_home(tmp_path / "b", heartbeat=now)
+    ob = Outbox.open(bridge)
+    record_success(ob, RECONCILE_HEALTH_KEY, now - THRESHOLD - 1)
+    ob.close()
+
+    code = run_status(bridge)
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "reconcile:       STALE" in out

@@ -88,6 +88,7 @@ def run_pass(
     from collections import Counter
 
     from . import cron_db, gateway_log, kanban_db, knowledge_store, state_db
+    from .health import record_error, record_success, source_health_key
     from .hook import drain as drain_hook_spool
     from .recorder_config import CaptureConfig, source_enabled
 
@@ -95,6 +96,11 @@ def run_pass(
     capture = capture_config or CaptureConfig()
 
     totals: Counter[str] = Counter()
+    knowledge_errors: list[Exception] = []
+
+    def capture_knowledge_error(_artifact_id: str, exc: Exception) -> None:
+        knowledge_errors.append(exc)
+
     sources: tuple[
         tuple[
             str,
@@ -139,20 +145,35 @@ def run_pass(
             "knowledge",
             "knowledge",
             lambda: knowledge_store.poll(
-                outbox, hermes_home, knowledge_config=knowledge_config
+                outbox,
+                hermes_home,
+                knowledge_config=knowledge_config,
+                on_artifact_error=capture_knowledge_error,
             ),
             _DURABLE_STORE_ERRORS,
         ),
     )
+    health_at = time.time() if now is None else float(now)
     for source_name, label, poll, tolerated in sources:
         if not source_enabled(capture, source_name):
             continue
         try:
-            totals.update(poll())
+            source_totals = poll()
         except tolerated as exc:
+            record_error(outbox, source_health_key(source_name), health_at, exc)
             if on_source_error is None:
                 raise
             on_source_error(label, exc)
+        else:
+            totals.update(source_totals)
+            if source_name == "knowledge" and knowledge_errors:
+                error = knowledge_errors[-1]
+                record_error(outbox, source_health_key(source_name), health_at, error)
+                if on_source_error is not None:
+                    for exc in knowledge_errors:
+                        on_source_error(label, exc)
+            else:
+                record_success(outbox, source_health_key(source_name), health_at)
 
     # Stamp the capture heartbeat once the pass completes. A pass that reached
     # here is a live capture loop even if a source degraded to a skip (the next

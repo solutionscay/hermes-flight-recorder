@@ -39,6 +39,7 @@ CAPTURE_SOURCE_NAMES = (
     "gateway_log",
     "knowledge",
 )
+DEFAULT_REQUIRED_CAPTURE_SOURCES = ("hook", "state_db")
 
 
 class RecorderConfigError(RuntimeError):
@@ -50,11 +51,13 @@ class CaptureConfig:
     max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES
     message_roles: tuple[str, ...] = DEFAULT_MESSAGE_ROLES
     sources: dict[str, bool] = field(default_factory=dict)
+    required_sources: tuple[str, ...] = DEFAULT_REQUIRED_CAPTURE_SOURCES
     # How often `serve` runs a capture pass. One-shot `run` ignores this.
     interval_seconds: float = DEFAULT_CAPTURE_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         _validate_sources(self.sources)
+        _validate_required_sources(self.required_sources)
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,15 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 )
             ),
             sources=_sources(_value("HFR_CAPTURE_SOURCES", capture, "sources", {})),
+            required_sources=_source_names(
+                _value(
+                    "HFR_CAPTURE_REQUIRED_SOURCES",
+                    capture,
+                    "required_sources",
+                    DEFAULT_REQUIRED_CAPTURE_SOURCES,
+                ),
+                "capture.required_sources",
+            ),
             interval_seconds=_positive_float(
                 _value(
                     "HFR_CAPTURE_INTERVAL_SECONDS",
@@ -263,6 +275,7 @@ def save(
             "max_content_bytes": config.capture.max_content_bytes,
             "message_roles": list(config.capture.message_roles),
             "sources": config.capture.sources,
+            "required_sources": list(config.capture.required_sources),
             "interval_seconds": config.capture.interval_seconds,
         },
         "retention": {
@@ -428,6 +441,38 @@ def _validate_sources(value: Any) -> None:
         )
 
 
+def _source_names(value: Any, name: str) -> tuple[str, ...]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError as exc:
+            raise RecorderConfigError(f"{name} must be a JSON array") from exc
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(source, str) and source for source in value
+    ):
+        raise RecorderConfigError(f"{name} must be an array of source names")
+    result = tuple(value)
+    _validate_required_sources(result)
+    return result
+
+
+def _validate_required_sources(value: Any) -> None:
+    if not isinstance(value, tuple) or not all(
+        isinstance(source, str) and source for source in value
+    ):
+        raise RecorderConfigError("capture.required_sources must be a tuple of source names")
+    if len(set(value)) != len(value):
+        raise RecorderConfigError("capture.required_sources contains duplicate source names")
+    unknown = sorted(set(value) - set(CAPTURE_SOURCE_NAMES))
+    if unknown:
+        names = ", ".join(repr(name) for name in unknown)
+        supported = ", ".join(CAPTURE_SOURCE_NAMES)
+        raise RecorderConfigError(
+            "capture.required_sources contains unknown source(s): "
+            f"{names}; supported: {supported}"
+        )
+
+
 def source_enabled(config: CaptureConfig, name: str) -> bool:
     """Return whether a supported capture source is enabled.
 
@@ -439,9 +484,15 @@ def source_enabled(config: CaptureConfig, name: str) -> bool:
     return config.sources.get(name, True)
 
 
+def source_required(config: CaptureConfig, name: str) -> bool:
+    """Return whether an enabled source must be healthy."""
+    return source_enabled(config, name) and name in config.required_sources
+
+
 __all__ = [
     "CAPTURE_SOURCE_NAMES",
     "CONFIG_FILENAME",
+    "DEFAULT_REQUIRED_CAPTURE_SOURCES",
     "DEFAULT_CAPTURE_INTERVAL_SECONDS",
     "DEFAULT_MAX_CONTENT_BYTES",
     "DEFAULT_RECONCILE_INTERVAL_SECONDS",
@@ -453,8 +504,9 @@ __all__ = [
     "RecorderConfigError",
     "RetentionConfig",
     "SyncRuntimeConfig",
+    "source_enabled",
+    "source_required",
     "config_path",
     "load",
     "save",
-    "source_enabled",
 ]
