@@ -303,33 +303,81 @@ def uninstall(
     Preserves all recorder data by default (only the hook and the runtime lock
     go); ``purge_data`` also deletes the recorder home (outbox, key, config).
     Refuses while a ``serve`` process holds the runtime lock. Idempotent and
-    never touches any other Hermes state. Raises :class:`UninstallError` only
-    when it is unsafe to proceed.
+    never touches any other Hermes state. Raises :class:`UninstallError` when
+    it is unsafe to proceed or a requested path remains after removal.
     """
     hermes = resolve_hermes_home(hermes_home)
     fr_home = resolve_flight_recorder_home(flight_recorder_home, hermes_home)
 
     _refuse_if_serving(fr_home)
 
+    remaining: list[tuple[Path, OSError | None]] = []
     hook_dir = hermes / "hooks" / HOOK_DIR_NAME
     if hook_dir.exists():
-        shutil.rmtree(hook_dir, ignore_errors=True)
-        log(f"hook removed:     {hook_dir}")
+        error = _remove_tree(hook_dir)
+        remains, check_error = _path_remains(hook_dir)
+        if remains:
+            remaining.append((hook_dir, error or check_error))
+        else:
+            log(f"hook removed:     {hook_dir}")
     else:
         log(f"hook absent:      {hook_dir}")
 
     if purge_data:
         if fr_home.exists():
-            shutil.rmtree(fr_home, ignore_errors=True)
-            log(f"recorder purged:  {fr_home}")
+            error = _remove_tree(fr_home)
+            remains, check_error = _path_remains(fr_home)
+            if remains:
+                remaining.append((fr_home, error or check_error))
+            else:
+                log(f"recorder purged:  {fr_home}")
         else:
             log(f"recorder absent:  {fr_home}")
     else:
         # Drop only the runtime lock; keep the outbox, key, and configuration.
         lock = fr_home / LOCK_FILENAME
         if lock.exists():
-            lock.unlink()
+            error = _remove_file(lock)
+            remains, check_error = _path_remains(lock)
+            if remains:
+                remaining.append((lock, error or check_error))
         log(f"recorder data preserved at {fr_home} (use --purge-data to remove)")
+
+    if remaining:
+        details = []
+        for path, error in remaining:
+            suffix = f": {error}" if error is not None else ""
+            details.append(f"  {path}{suffix}")
+        raise UninstallError("requested paths remain:\n" + "\n".join(details))
+
+
+def _remove_tree(path: Path) -> OSError | None:
+    """Try to remove a directory tree and return its deletion error."""
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        return exc
+    return None
+
+
+def _remove_file(path: Path) -> OSError | None:
+    """Try to remove a file and return its deletion error."""
+    try:
+        path.unlink()
+    except OSError as exc:
+        return exc
+    return None
+
+
+def _path_remains(path: Path) -> tuple[bool, OSError | None]:
+    """Check a removal target without treating a stat error as absence."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False, None
+    except OSError as exc:
+        return True, exc
+    return True, None
 
 
 def _refuse_if_serving(fr_home: Path) -> None:
