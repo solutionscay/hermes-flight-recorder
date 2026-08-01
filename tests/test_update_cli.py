@@ -13,7 +13,11 @@ import pytest
 from hermes_flight_recorder import cli
 from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.hook import baked_flight_recorder_build
-from hermes_flight_recorder.collector.outbox import Outbox, OutboxError
+from hermes_flight_recorder.collector.outbox import (
+    OUTBOX_SCHEMA_VERSION,
+    Outbox,
+    OutboxError,
+)
 from hermes_flight_recorder.collector.runtime_lock import RuntimeLock, RuntimeLockError
 from hermes_flight_recorder.collector.update import (
     INSTALLED_VERSION_FILENAME,
@@ -262,7 +266,7 @@ def test_complete_update_preserves_state_and_refreshes_hook(tmp_path):
         assert updated.count() == 1
         assert updated.get_meta("cursor:delivery") == "1"
         assert updated.get_meta("capture:test") == "42"
-        assert updated.get_meta("outbox_schema_version") == "1"
+        assert updated.get_meta("outbox_schema_version") == OUTBOX_SCHEMA_VERSION
         assert updated.get_meta("installed_build") == build_identity()
     finally:
         updated.close()
@@ -316,6 +320,47 @@ def test_registered_migration_failure_rolls_back_schema_and_version(
         ).fetchone() is None
     finally:
         conn.close()
+
+
+def test_schema_v1_migrates_knowledge_omissions(tmp_path):
+    hermes, fr_home = _hermes(tmp_path)
+    database = fr_home / "outbox.sqlite"
+    conn = sqlite3.connect(database)
+    conn.executescript(
+        """
+        ALTER TABLE knowledge_version RENAME TO knowledge_version_v2;
+        CREATE TABLE knowledge_version (
+            artifact_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            manifest_json TEXT NOT NULL,
+            manifest_hash TEXT NOT NULL,
+            occurred_at REAL NOT NULL,
+            origin TEXT NOT NULL,
+            linked_event_id TEXT,
+            is_tombstone INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (artifact_id, seq)
+        );
+        INSERT INTO knowledge_version
+        SELECT artifact_id, seq, manifest_json, manifest_hash, occurred_at,
+               origin, linked_event_id, is_tombstone
+        FROM knowledge_version_v2;
+        DROP TABLE knowledge_version_v2;
+        UPDATE meta SET value='1' WHERE key='outbox_schema_version';
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = Outbox.open(fr_home, hermes_home=hermes)
+    try:
+        columns = {
+            row[1]
+            for row in migrated._conn.execute("PRAGMA table_info(knowledge_version)")
+        }
+        assert "skipped_json" in columns
+        assert migrated.get_meta("outbox_schema_version") == OUTBOX_SCHEMA_VERSION
+    finally:
+        migrated.close()
 
 
 def test_unknown_schema_version_is_rejected(tmp_path):

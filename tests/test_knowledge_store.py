@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -229,6 +230,104 @@ def test_max_versions_caps_the_chain(tmp_path):
 
     versions = ob.knowledge_versions("memory:memory")
     assert [v["seq"] for v in versions] == [3, 4]  # only the newest two survive
+
+
+def test_max_file_bytes_skips_large_binary_with_metadata_and_log(tmp_path, caplog):
+    home = tmp_path / "hermes"
+    skill = write_skill(home / "skills", "binary", "# binary\n")
+    asset = skill / "assets" / "large.bin"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(bytes(range(256)) * 8)
+    ob = new_outbox(tmp_path)
+    config = KnowledgeConfig(max_file_bytes=1024)
+    caplog.set_level(logging.WARNING, logger="hermes_flight_recorder.serve.knowledge")
+
+    knowledge_store.poll(ob, home, knowledge_config=config)
+
+    event = knowledge_events(ob)[0]
+    skipped = event["payload"]["skipped_files"]
+    assert skipped == [
+        {
+            "path": "assets/large.bin",
+            "reason": "max_file_bytes",
+            "byte_count": 2048,
+            "limit": 1024,
+        }
+    ]
+    assert event["partial"] is True
+    assert "path=assets/large.bin reason=max_file_bytes" in caplog.text
+    bundle = json.loads(ob.decrypt_content(event))
+    assert [item["path"] for item in bundle["files"]] == ["SKILL.md"]
+    assert bundle["skipped_files"] == skipped
+
+
+def test_max_file_count_skips_files_after_the_limit(tmp_path):
+    home = tmp_path / "hermes"
+    write_skill(
+        home / "skills",
+        "many",
+        files={"references/a.md": "a", "references/b.md": "b"},
+    )
+    ob = new_outbox(tmp_path)
+
+    knowledge_store.poll(ob, home, knowledge_config=KnowledgeConfig(max_file_count=2))
+
+    event = knowledge_events(ob)[0]
+    assert event["payload"]["file_count"] == 2
+    assert event["payload"]["skipped_files"] == [
+        {
+            "path": "references/b.md",
+            "reason": "max_file_count",
+            "byte_count": 1,
+            "limit": 2,
+        }
+    ]
+
+
+def test_file_count_includes_a_file_skipped_for_size(tmp_path):
+    home = tmp_path / "hermes"
+    write_skill(
+        home / "skills",
+        "many",
+        files={"references/a.md": "too large", "references/b.md": "b"},
+    )
+    ob = new_outbox(tmp_path)
+    config = KnowledgeConfig(max_file_bytes=8, max_file_count=2)
+
+    knowledge_store.poll(ob, home, knowledge_config=config)
+
+    skipped = knowledge_events(ob)[0]["payload"]["skipped_files"]
+    assert [item["reason"] for item in skipped] == [
+        "max_file_bytes",
+        "max_file_count",
+    ]
+
+
+def test_max_artifact_bytes_bounds_the_complete_bundle(tmp_path):
+    home = tmp_path / "hermes"
+    write_skill(
+        home / "skills",
+        "bounded",
+        "12345678",
+        files={"assets/a.bin": "abcdefgh", "assets/b.bin": "ijklmnop"},
+    )
+    ob = new_outbox(tmp_path)
+    config = KnowledgeConfig(max_file_bytes=16, max_artifact_bytes=16)
+
+    knowledge_store.poll(ob, home, knowledge_config=config)
+
+    event = knowledge_events(ob)[0]
+    assert event["payload"]["byte_count"] == 16
+    assert event["payload"]["skipped_files"] == [
+        {
+            "path": "assets/b.bin",
+            "reason": "max_artifact_bytes",
+            "byte_count": 8,
+            "limit": 16,
+        }
+    ]
+    bundle = json.loads(ob.decrypt_content(event))
+    assert sum(item["byte_count"] for item in bundle["files"]) <= 16
 
 
 # --- transport: store versions -> knowledge.record_written events ----------
