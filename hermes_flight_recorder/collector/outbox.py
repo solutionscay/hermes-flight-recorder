@@ -207,6 +207,9 @@ class Outbox:
         # Cache of DEKs unwrapped for reads this process, keyed by key_version,
         # so decrypting many records under one epoch unwraps once.
         self._dek_by_version: dict[str, bytes] = {}
+        # Keep the current knowledge state in process memory. A fleet host can
+        # use it for consecutive mutations without a private decryption key.
+        self._knowledge_plaintext: dict[str, dict[str, bytes]] = {}
         self._installation_id: str | None = None
         self._apply_migrations()
 
@@ -226,12 +229,35 @@ class Outbox:
                 f"recorder home; use its namespaced '{FLIGHT_RECORDER_DIR_NAME}' "
                 f"child or set SC_HERMES_FLIGHT_RECORDER_HOME"
             )
-        home.mkdir(parents=True, exist_ok=True)
+        home.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             os.chmod(home, 0o700)
-        except OSError:
-            pass
-        return cls(home / "outbox.sqlite")
+        except OSError as exc:
+            raise OutboxError(
+                f"cannot make flight recorder home private: {home}"
+            ) from exc
+        database = home / "outbox.sqlite"
+        if database.is_symlink():
+            raise OutboxError(f"refusing symbolic link for recorder database: {database}")
+        outbox = cls(database)
+        try:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                path = Path(f"{database}{suffix}")
+                if path.is_symlink():
+                    raise OutboxError(
+                        f"refusing symbolic link for recorder database file: {path}"
+                    )
+                if path.exists():
+                    os.chmod(path, 0o600)
+        except OSError as exc:
+            outbox.close()
+            raise OutboxError(
+                f"cannot make flight recorder database private: {home}"
+            ) from exc
+        except OutboxError:
+            outbox.close()
+            raise
+        return outbox
 
     def initialize(self) -> str:
         """Create the installation identity once.

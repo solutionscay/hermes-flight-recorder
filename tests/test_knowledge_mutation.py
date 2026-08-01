@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from hermes_flight_recorder.collector import knowledge_store, state_db
+import pytest
+
+from hermes_flight_recorder.collector import keystore, knowledge_store, state_db
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.envelope import validate
 
@@ -370,3 +372,120 @@ def test_restart_and_cursor_reset_do_not_duplicate_events_or_versions(tmp_path):
     assert reopened.count() == event_count
     assert len(reopened.knowledge_versions("skill:brief")) == 2
     assert len(knowledge_events(reopened)) == 2
+
+
+def test_fleet_foreground_mutations_work_with_public_key_only(tmp_path):
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    keypair = keystore.mint_operator_keypair(operator)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    keystore.write_public_key(bridge, keypair.public)
+    home = tmp_path / "hermes"
+    home.mkdir()
+    make_state_db(
+        home,
+        [
+            (
+                "skill_manage",
+                {"action": "create", "name": "fleet", "content": "# Fleet\nv1\n"},
+                {"success": True},
+            ),
+            (
+                "skill_manage",
+                {"action": "edit", "name": "fleet", "content": "# Fleet\nv2\n"},
+                {"success": True},
+            ),
+        ],
+    )
+    outbox = new_outbox(tmp_path)
+
+    counts = state_db.poll(outbox, home)
+
+    assert counts["knowledge.record_written"] == 2
+    assert not keystore.has_secret(bridge)
+    assert [version["seq"] for version in outbox.knowledge_versions("skill:fleet")] == [
+        1,
+        2,
+    ]
+    encrypted_events = knowledge_events(outbox)
+    assert len(encrypted_events) == 2
+    assert all(outbox.decrypt_content(event, keypair=keypair) for event in encrypted_events)
+
+
+def test_fleet_mutation_uses_disk_after_state_after_restart(tmp_path, monkeypatch):
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    keypair = keystore.mint_operator_keypair(operator)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    keystore.write_public_key(bridge, keypair.public)
+    home = tmp_path / "hermes"
+    home.mkdir()
+    make_state_db(
+        home,
+        [
+            (
+                "skill_manage",
+                {"action": "create", "name": "fleet", "content": "# Fleet\nv1\n"},
+                {"success": True},
+            )
+        ],
+    )
+    outbox = new_outbox(tmp_path)
+    state_db.poll(outbox, home)
+    outbox.close()
+
+    skill = home / "skills" / "fleet"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Fleet\nv2\n")
+    arguments = {
+        "action": "patch",
+        "name": "fleet",
+        "old_string": "v1",
+        "new_string": "v2",
+    }
+    tool_calls = json.dumps(
+        [
+            {
+                "id": "call-2",
+                "call_id": "call-2",
+                "type": "function",
+                "function": {
+                    "name": "skill_manage",
+                    "arguments": json.dumps(arguments),
+                },
+            }
+        ]
+    )
+    database = sqlite3.connect(home / "state.db")
+    database.execute(
+        "INSERT INTO messages("
+        "id,session_id,role,content,tool_calls,timestamp,finish_reason"
+        ") VALUES (?,?,?,?,?,?,?)",
+        (3, "S", "assistant", "", tool_calls, 1003.0, "tool_calls"),
+    )
+    database.execute(
+        "INSERT INTO messages("
+        "id,session_id,role,content,tool_call_id,tool_name,timestamp"
+        ") VALUES (?,?,?,?,?,?,?)",
+        (4, "S", "tool", '{"success":true}', "call-2", "skill_manage", 1004.0),
+    )
+    database.commit()
+    database.close()
+
+    reopened = Outbox.open(bridge)
+    monkeypatch.setattr(
+        reopened,
+        "get_blob",
+        lambda *_args, **_kwargs: pytest.fail("fleet mutation tried to decrypt a blob"),
+    )
+    counts = state_db.poll(reopened, home)
+
+    assert counts["knowledge.record_written"] == 1
+    versions = reopened.knowledge_versions("skill:fleet")
+    assert [version["seq"] for version in versions] == [1, 2]
+    assert versions[-1]["manifest"][0]["blob_hash"] == reopened._content_hash(
+        b"# Fleet\nv2\n"
+    )
+    assert not keystore.has_secret(bridge)

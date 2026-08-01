@@ -45,6 +45,7 @@ from ._common import (
     resolve_hermes_home,
     runtime_stamp,
 )
+from .keystore import has_secret
 
 KNOWLEDGE_EVENT = "knowledge.record_written"
 KNOWLEDGE_BUNDLE_FORMAT = "knowledge.bundle.v1"
@@ -69,14 +70,26 @@ def poll(
     config = knowledge_config or KnowledgeConfig()
     home = resolve_hermes_home(hermes_home)
     home_mode = read_home_mode(hermes_home)
+    runtime = runtime_stamp("knowledge", home_mode=home_mode)
 
     seen: set[str] = set()
+    emitted = 0
     for artifact_id, kind, name, category, files in _iter_artifacts(home):
         # Mark seen BEFORE the read so a transient I/O error on one artifact does
         # not make it look deleted (which would record a spurious tombstone).
         seen.add(artifact_id)
         try:
-            _capture(outbox, config, artifact_id, kind, name, category, files)
+            created = _capture(
+                outbox,
+                config,
+                artifact_id,
+                kind,
+                name,
+                category,
+                files,
+                runtime=runtime,
+            )
+            emitted += int(created)
         except OSError:
             # A live file can vanish or become unreadable between listing and
             # reading (TOCTOU), or hit a permission error. Isolate it: one bad
@@ -84,7 +97,7 @@ def poll(
             continue
     _tombstone_vanished(outbox, config, seen)
 
-    emitted = _emit_pending_events(outbox, home_mode)
+    emitted += _emit_pending_events(outbox, home_mode)
     return {KNOWLEDGE_EVENT: emitted} if emitted else {}
 
 
@@ -161,11 +174,17 @@ def heal_artifact(
     not immediately read as an un-emitted store→event gap. Returns whether a new
     version landed.
     """
-    created = _capture(outbox, config, artifact_id, kind, name, category, files)
-    if created:
-        runtime = runtime_stamp("knowledge", home_mode=home_mode)
-        _emit_artifact_events(outbox, runtime, artifact_id)
-    return created
+    runtime = runtime_stamp("knowledge", home_mode=home_mode)
+    return _capture(
+        outbox,
+        config,
+        artifact_id,
+        kind,
+        name,
+        category,
+        files,
+        runtime=runtime,
+    )
 
 
 def _iter_artifacts(
@@ -175,10 +194,16 @@ def _iter_artifacts(
 
     ``files`` is a list of ``(relative_path, absolute_path)``.
     """
+    memory_root = home / "memories"
     for target, path in memory_files(home):
+        if not _safe_regular_file(path, memory_root):
+            continue
         kind = "user_profile" if target == "user" else "memory"
         yield f"memory:{target}", kind, target, None, [(path.name, path)]
+    skills_root = home / "skills"
     for name, category, skill_dir in hermes_created_skills(home):
+        if not _safe_directory(skill_dir, skills_root):
+            continue
         artifact_id = f"skill:{category}/{name}" if category else f"skill:{name}"
         yield artifact_id, "skill", name, category, _skill_files(skill_dir)
 
@@ -187,17 +212,47 @@ def _skill_files(skill_dir: Path) -> list[tuple[str, Path]]:
     """A skill's files: ``SKILL.md`` plus the four supporting subdirectories."""
     files: list[tuple[str, Path]] = []
     skill_md = skill_dir / "SKILL.md"
-    if skill_md.is_file():
+    if _safe_regular_file(skill_md, skill_dir):
         files.append(("SKILL.md", skill_md))
     for sub in SKILL_SUBDIRS:
         directory = skill_dir / sub
-        if directory.is_dir():
+        if _safe_directory(directory, skill_dir):
             for path in sorted(directory.rglob("*")):
-                if path.is_file():
+                if _safe_regular_file(path, skill_dir):
                     relative = path.relative_to(skill_dir).as_posix()
                     if _safe_bundle_path(relative):
                         files.append((relative, path))
     return files
+
+
+def _safe_directory(path: Path, root: Path) -> bool:
+    """Return true for a real directory below ``root`` with no link components."""
+    return _safe_path(path, root) and path.is_dir()
+
+
+def _safe_regular_file(path: Path, root: Path) -> bool:
+    """Return true for a real file below ``root`` with no link components."""
+    return _safe_path(path, root) and path.is_file()
+
+
+def _safe_path(path: Path, root: Path) -> bool:
+    """Reject links and paths that resolve outside an artifact root."""
+    try:
+        relative = path.relative_to(root)
+        resolved_root = root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+        resolved_path.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return False
+
+    current = root
+    if current.is_symlink():
+        return False
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return True
 
 
 def _safe_bundle_path(path: str) -> bool:
@@ -222,12 +277,17 @@ def _capture(
     name: str,
     category: str | None,
     files: list[tuple[str, Path]],
+    *,
+    runtime: dict[str, Any] | None = None,
 ) -> bool:
     """Record a new version of one artifact if its content changed."""
     manifest: list[dict[str, str]] = []
+    plaintext_files: dict[str, bytes] = {}
     occurred_at = 0.0
     for rel_path, path in files:
-        manifest.append({"path": rel_path, "blob_hash": outbox.put_blob(path.read_bytes())})
+        raw = path.read_bytes()
+        plaintext_files[rel_path] = raw
+        manifest.append({"path": rel_path, "blob_hash": outbox.put_blob(raw)})
         occurred_at = max(occurred_at, path.stat().st_mtime)
     if not manifest:
         return False
@@ -241,11 +301,26 @@ def _capture(
         provenance="agent",
         first_seen=occurred_at,
     )
-    _seq, created = outbox.append_knowledge_version(
+    seq, created = outbox.append_knowledge_version(
         artifact_id, manifest=manifest, occurred_at=occurred_at, origin="background"
     )
     if created:
         _apply_retention(outbox, config, artifact_id)
+        if runtime is not None:
+            artifact = outbox.knowledge_artifact(artifact_id)
+            version = next(
+                item
+                for item in outbox.knowledge_versions(artifact_id)
+                if item["seq"] == seq
+            )
+            _emit_version_event(
+                outbox,
+                runtime,
+                artifact,
+                version,
+                plaintext_files=plaintext_files,
+            )
+            outbox.set_meta(f"knowledge:emitted:{artifact_id}", str(seq))
     return created
 
 
@@ -320,6 +395,13 @@ def _emit_artifact_events(outbox: Any, runtime: dict[str, Any], artifact_id: str
     for version in outbox.knowledge_versions(artifact_id):
         if version["seq"] <= last_emitted:
             continue
+        if not version["is_tombstone"] and not has_secret(
+            outbox._flight_recorder_home
+        ):
+            # A fleet agent cannot reconstruct an old bundle from encrypted
+            # blobs. New versions emit from the plaintext captured in the same
+            # pass and advance this cursor before they reach this fallback.
+            continue
         if _emit_version_event(outbox, runtime, artifact, version):
             emitted += 1
         outbox.set_meta(cursor_key, str(version["seq"]))
@@ -327,7 +409,12 @@ def _emit_artifact_events(outbox: Any, runtime: dict[str, Any], artifact_id: str
 
 
 def _emit_version_event(
-    outbox: Any, runtime: dict[str, Any], artifact: dict[str, Any], version: dict[str, Any]
+    outbox: Any,
+    runtime: dict[str, Any],
+    artifact: dict[str, Any],
+    version: dict[str, Any],
+    *,
+    plaintext_files: dict[str, bytes] | None = None,
 ) -> bool:
     """Build and append one knowledge event; return whether a new row landed."""
     kind = artifact["kind"]
@@ -343,7 +430,10 @@ def _emit_version_event(
         files = []
         byte_count = 0
         for entry in version["manifest"]:
-            raw = outbox.get_blob(entry["blob_hash"])
+            if plaintext_files is None:
+                raw = outbox.get_blob(entry["blob_hash"])
+            else:
+                raw = plaintext_files[entry["path"]]
             byte_count += len(raw)
             files.append(
                 {

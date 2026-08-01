@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import threading
 from pathlib import Path
 
@@ -62,6 +64,45 @@ def test_outbox_lives_at_flight_recorder_path(tmp_path):
     assert ob.path == tmp_path.resolve() / "outbox.sqlite"
     assert ob.path.exists()
     ob.close()
+
+
+def test_open_makes_new_home_and_database_private_with_public_umask(tmp_path):
+    home = tmp_path / "flight-recorder"
+    previous_umask = os.umask(0o022)
+    try:
+        ob = Outbox.open(home)
+    finally:
+        os.umask(previous_umask)
+
+    try:
+        assert stat.S_IMODE(home.stat().st_mode) == 0o700
+        for path in home.glob("outbox.sqlite*"):
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        ob.close()
+
+
+def test_open_repairs_public_permissions_on_existing_home(tmp_path):
+    home = tmp_path / "flight-recorder"
+    home.mkdir(mode=0o755)
+    os.chmod(home, 0o755)
+
+    ob = Outbox.open(home)
+    try:
+        assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    finally:
+        ob.close()
+
+
+def test_open_rejects_database_symlink(tmp_path):
+    home = tmp_path / "flight-recorder"
+    home.mkdir()
+    target = tmp_path / "outside.sqlite"
+    target.touch()
+    (home / "outbox.sqlite").symlink_to(target)
+
+    with pytest.raises(OutboxError, match="symbolic link"):
+        Outbox.open(home)
 
 
 def test_flight_recorder_home_env_overrides_default(tmp_path, monkeypatch):
