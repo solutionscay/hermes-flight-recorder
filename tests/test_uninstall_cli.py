@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from hermes_flight_recorder import cli
+from hermes_flight_recorder.collector import lifecycle
 from hermes_flight_recorder.collector.runtime_lock import RuntimeLock
 
 
@@ -84,3 +85,64 @@ def test_purge_leaves_other_hermes_state_untouched(tmp_path):
 
     assert (hermes / "state.db").read_text() == "hermes owns this"
     assert (other_hook / "HOOK.yaml").exists()  # only our hook is removed
+
+
+def test_reports_hook_deletion_failure(tmp_path, capsys, monkeypatch):
+    hermes, fr = _install(tmp_path)
+    hook = hermes / "hooks" / "hermes-flight-recorder"
+
+    real_rmtree = lifecycle.shutil.rmtree
+
+    def fail_hook(path):
+        if Path(path) == hook:
+            raise PermissionError("hook is read-only")
+        real_rmtree(path)
+
+    monkeypatch.setattr(lifecycle.shutil, "rmtree", fail_hook)
+
+    rc = cli.main(["uninstall", "--hermes-home", str(hermes)])
+
+    assert rc == 2
+    assert hook.exists()
+    assert fr.exists()
+    error = capsys.readouterr().err
+    assert str(hook) in error
+    assert "hook is read-only" in error
+
+
+def test_reports_data_deletion_failure_after_hook_removal(
+    tmp_path, capsys, monkeypatch
+):
+    hermes, fr = _install(tmp_path)
+    hook = hermes / "hooks" / "hermes-flight-recorder"
+
+    real_rmtree = lifecycle.shutil.rmtree
+
+    def fail_data(path):
+        if Path(path) == fr:
+            raise PermissionError("recorder data is read-only")
+        real_rmtree(path)
+
+    monkeypatch.setattr(lifecycle.shutil, "rmtree", fail_data)
+
+    rc = cli.main(["uninstall", "--hermes-home", str(hermes), "--purge-data"])
+
+    assert rc == 2
+    assert not hook.exists()
+    assert fr.exists()
+    error = capsys.readouterr().err
+    assert str(fr) in error
+    assert "recorder data is read-only" in error
+
+
+def test_reports_all_requested_paths_that_remain(tmp_path, capsys, monkeypatch):
+    hermes, fr = _install(tmp_path)
+    hook = hermes / "hooks" / "hermes-flight-recorder"
+    monkeypatch.setattr(lifecycle.shutil, "rmtree", lambda path: None)
+
+    rc = cli.main(["uninstall", "--hermes-home", str(hermes), "--purge-data"])
+
+    assert rc == 2
+    error = capsys.readouterr().err
+    assert str(hook) in error
+    assert str(fr) in error
