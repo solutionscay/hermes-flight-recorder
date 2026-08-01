@@ -246,6 +246,7 @@ def test_message_role_configuration_filters_state_capture(tmp_path):
     assert counts.get("invocation.started") == 1
     assert "invocation.completed" not in counts
     assert "tool.call_completed" not in counts
+    assert outbox.get_cursor("state.db:messages:v2") == "3"
 
 
 def test_versioned_message_cursor_backfills_rows_skipped_by_tool_only_releases(tmp_path):

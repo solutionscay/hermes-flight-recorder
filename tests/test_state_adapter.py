@@ -336,10 +336,12 @@ def test_message_insert_during_poll_is_captured_on_next_pass(tmp_path):
 
     ob.append_if_new = append_with_concurrent_insert
     first = state_db.poll(ob, hh)
+    cursor_after_first = ob.get_cursor("state.db:messages:v2")
     second = state_db.poll(ob, hh)
     writer.close()
 
     assert first.get("invocation.started") == 1
+    assert cursor_after_first == "1"
     assert second.get("invocation.completed") == 1
     assert ob.get_cursor("state.db:messages:v2") == "2"
 
