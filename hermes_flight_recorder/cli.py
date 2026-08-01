@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from typing import Any
 
 from .version import build_identity
 
@@ -409,12 +410,28 @@ def _cmd_status(args: argparse.Namespace) -> int:
     can gate on the exit code: 0 healthy, 1 unhealthy (capture stale or never
     recorded a success).
     """
-    from .collector import CAPTURE_HEARTBEAT_KEY
+    from .collector import CAPTURE_HEARTBEAT_KEY, recorder_config
+    from .collector.health import (
+        RECONCILE_HEALTH_KEY,
+        read_health,
+        source_health_key,
+    )
     from .collector.reconcile import ReconcileConfig
+    from .collector.recorder_config import (
+        CAPTURE_SOURCE_NAMES,
+        source_enabled,
+        source_required,
+    )
     from .collector.sync import delivery_cursor
 
     threshold = ReconcileConfig().capture_stale_after
     now = time.time()
+
+    try:
+        runtime_config = recorder_config.load(_flight_recorder_home(args))
+    except recorder_config.RecorderConfigError as exc:
+        print(f"status not configured: {exc}", file=sys.stderr)
+        return 2
 
     outbox = _open_outbox(args)
     try:
@@ -475,9 +492,82 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     f"capture:         {verdict} — last success {stamp} "
                     f"({int(age)}s ago, threshold {int(threshold)}s)"
                 )
+
+        for source in CAPTURE_SOURCE_NAMES:
+            if not source_enabled(runtime_config.capture, source):
+                continue
+            required = source_required(runtime_config.capture, source)
+            state = read_health(outbox, source_health_key(source))
+            verdict, source_healthy = _health_verdict(state, now, threshold)
+            if required and not source_healthy:
+                healthy = False
+            policy = "required" if required else "optional"
+            print(
+                f"source {source}: {policy} {verdict}; "
+                f"{_health_details(state, now)}"
+            )
+
+        reconcile_threshold = max(
+            threshold, runtime_config.reconcile.interval_seconds * 3
+        )
+        reconcile_state = read_health(outbox, RECONCILE_HEALTH_KEY)
+        verdict, reconcile_healthy = _health_verdict(
+            reconcile_state, now, reconcile_threshold
+        )
+        if not reconcile_healthy:
+            healthy = False
+        print(
+            f"reconcile:       {verdict}; "
+            f"{_health_details(reconcile_state, now)}"
+        )
     finally:
         outbox.close()
     return 0 if healthy else 1
+
+
+def _health_verdict(
+    state: dict[str, Any], now: float, stale_after: float
+) -> tuple[str, bool]:
+    if "unreadable" in state:
+        return "UNREADABLE", False
+    failures = state.get("consecutive_failures", 0)
+    try:
+        if int(failures) > 0:
+            return "BROKEN", False
+    except (TypeError, ValueError):
+        return "UNREADABLE", False
+    last = state.get("last_success_at")
+    try:
+        age = now - float(last)
+    except (TypeError, ValueError):
+        return "NO SUCCESS RECORDED", False
+    if age > stale_after:
+        return "STALE", False
+    return "OK", True
+
+
+def _health_details(state: dict[str, Any], now: float) -> str:
+    if "unreadable" in state:
+        return f"state {state['unreadable']!r}"
+
+    last_success = _health_time(state.get("last_success_at"), now)
+    last_error = _health_time(state.get("last_error_at"), now)
+    error = state.get("last_error")
+    failures = state.get("consecutive_failures", 0)
+    error_text = f"{last_error} ({error})" if error else "never"
+    return (
+        f"last success {last_success}; last error {error_text}; "
+        f"consecutive failures {failures}"
+    )
+
+
+def _health_time(value: Any, now: float) -> str:
+    try:
+        when = float(value)
+    except (TypeError, ValueError):
+        return "never"
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
+    return f"{stamp} ({int(now - when)}s ago)"
 
 
 def _sync_summary(outbox, before_cursor: int) -> tuple[int, int, int]:

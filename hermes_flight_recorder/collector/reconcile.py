@@ -78,6 +78,7 @@ from ._common import (
     to_epoch,
 )
 from .cron_schedule import expected_instants
+from .health import RECONCILE_HEALTH_KEY, record_success
 from .recorder_config import CaptureConfig, KnowledgeConfig, source_enabled
 
 _SOURCE = "reconciler"
@@ -189,6 +190,7 @@ def reconcile(
     _detect_capture_stale(outbox, counts, when, cfg)
     if source_enabled(capture, "knowledge"):
         _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
+    record_success(outbox, RECONCILE_HEALTH_KEY, when)
     return dict(counts)
 
 

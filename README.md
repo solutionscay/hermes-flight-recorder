@@ -298,7 +298,7 @@ and verify the hook before restarting services.
 | `uninstall` | Remove the hook; add `--purge-data` to also delete the recorder home. |
 | `serve` | Run capture, reconcile, and optional sync in one process. |
 | `configure-sync` | Write the cloud endpoint and the Cloudflare Access token. |
-| `status` | Show capture freshness and delivery lag. |
+| `status` | Show source health, reconciliation freshness, and delivery lag. |
 | `observe` | Show the captured log locally (stream, tree, report). |
 | `run` | Run one capture pass (for an external scheduler). |
 | `reconcile` | Run one reconcile pass (for an external scheduler). |

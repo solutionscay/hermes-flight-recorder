@@ -35,7 +35,7 @@ import heapq
 import json
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,7 @@ def poll(
     hermes_home: str | Path | None = None,
     *,
     knowledge_config: Any = None,
+    on_artifact_error: Callable[[str, Exception], None] | None = None,
 ) -> dict[str, int]:
     """One read-only scan of the knowledge surface.
 
@@ -94,10 +95,12 @@ def poll(
                 runtime=runtime,
             )
             emitted += int(created)
-        except OSError:
+        except OSError as exc:
             # A live file can vanish or become unreadable between listing and
             # reading (TOCTOU), or hit a permission error. Isolate it: one bad
             # artifact must not sink the rest of the pass. The next tick re-scans.
+            if on_artifact_error is not None:
+                on_artifact_error(artifact_id, exc)
             continue
     _tombstone_vanished(outbox, config, seen)
 

@@ -127,6 +127,7 @@ managing it yourself.
       "gateway_log": true,
       "knowledge": true
     },
+    "required_sources": ["hook", "state_db"],
     "interval_seconds": 15
   },
   "retention": {
@@ -161,6 +162,12 @@ managing it yourself.
 `hook`, `state_db`, `cron`, `kanban`, `gateway_log`, and `knowledge`. Each key
 defaults to `true` when it is absent. Set a key to `false` to stop that collector
 and its related reconciliation checks. Unknown keys are configuration errors.
+`capture.required_sources` selects the enabled sources that must stay healthy.
+It defaults to `hook` and `state_db`. All other enabled sources are optional.
+The `status` command reports the last success, the last error, and the repeated
+failure count for each enabled source. A stale or broken required source makes
+`status` return 1. A broken optional source appears in the output but does not
+change the exit code.
 `capture.max_content_bytes` limits each encrypted body by UTF-8 byte length
 (64 KiB by default). A capped event records `content_truncated`,
 `content_original_bytes`, and `content_captured_bytes` in plaintext metadata,

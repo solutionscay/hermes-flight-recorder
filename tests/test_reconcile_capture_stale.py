@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections import Counter
 
 from hermes_flight_recorder.collector import CAPTURE_HEARTBEAT_KEY
+from hermes_flight_recorder.collector.health import RECONCILE_HEALTH_KEY, read_health
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
@@ -70,6 +71,16 @@ def test_fresh_heartbeat_emits_nothing(tmp_path):
 
     assert counts.get("reconcile.capture_stale", 0) == 0
     assert stale_findings(ob) == []
+
+
+def test_reconcile_records_its_success_time(tmp_path):
+    ob = new_outbox(tmp_path)
+
+    reconcile(ob, tmp_path / "no-hermes", now=B)
+
+    state = read_health(ob, RECONCILE_HEALTH_KEY)
+    assert state["last_success_at"] == B
+    assert state["consecutive_failures"] == 0
 
 
 def test_boundary_is_not_stale(tmp_path):
