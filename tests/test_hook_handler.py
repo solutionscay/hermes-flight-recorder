@@ -102,7 +102,7 @@ def test_handle_never_raises_when_spool_path_unwritable(tmp_path: Path, monkeypa
     assert errlog.exists() and "handler error" in errlog.read_text()
 
 
-def test_over_cap_still_appends_event(tmp_path: Path, monkeypatch) -> None:
+def test_over_cap_still_appends_event_until_drain_rotates(tmp_path: Path, monkeypatch) -> None:
     bridge = tmp_path / "bridge"
     bridge.mkdir()
     spool = bridge / SPOOL_FILENAME
@@ -112,6 +112,23 @@ def test_over_cap_still_appends_event(tmp_path: Path, monkeypatch) -> None:
     handler.handle("agent:start", {"session_id": "s1", "message": "hi"})
     assert spool.stat().st_size > 4096
     assert b'"event_type":"agent:start"' in spool.read_bytes()
+
+
+def test_error_log_rotates_at_its_size_limit(tmp_path: Path, monkeypatch) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / SPOOL_FILENAME).mkdir()
+    handler = load_handler(tmp_path, monkeypatch, bridge)
+    monkeypatch.setattr(handler, "_MAX_ERRLOG_BYTES", 160)
+
+    for _ in range(8):
+        handler.handle("session:start", {"session_id": "s1"})
+
+    current = bridge / ERRLOG_FILENAME
+    rotated = bridge / f"{ERRLOG_FILENAME}.1"
+    assert current.stat().st_size <= 160
+    assert rotated.exists()
+    assert rotated.stat().st_size <= 160
 
 
 def test_runtime_flight_recorder_home_env_overrides_baked(tmp_path: Path, monkeypatch) -> None:

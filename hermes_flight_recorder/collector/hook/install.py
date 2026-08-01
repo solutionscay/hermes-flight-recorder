@@ -17,11 +17,14 @@ import os
 from pathlib import Path
 
 from ...version import build_identity
-from . import ERRLOG_FILENAME, HOOK_DIR_NAME, HOOK_EVENTS, SPOOL_FILENAME
-
-# Retained for installed-handler compatibility. The handler no longer drops
-# events at this size. The drain compacts fully consumed spool generations.
-MAX_SPOOL_BYTES = 64 * 1024 * 1024  # 64 MiB
+from . import (
+    ERRLOG_FILENAME,
+    HOOK_DIR_NAME,
+    HOOK_EVENTS,
+    MAX_ERRLOG_BYTES,
+    MAX_SPOOL_BYTES,
+    SPOOL_FILENAME,
+)
 
 _MANIFEST = (
     f"name: {HOOK_DIR_NAME}\n"
@@ -48,6 +51,7 @@ _FLIGHT_RECORDER_BUILD = @@BUILD@@
 _SPOOL_FILENAME = @@SPOOL@@
 _ERRLOG_FILENAME = @@ERRLOG@@
 _MAX_SPOOL_BYTES = @@MAXBYTES@@
+_MAX_ERRLOG_BYTES = @@MAXERRBYTES@@
 
 
 def _flight_recorder_home():
@@ -56,8 +60,18 @@ def _flight_recorder_home():
 
 def _log_error(message):
     try:
-        with open(os.path.join(_flight_recorder_home(), _ERRLOG_FILENAME), "a", encoding="utf-8") as fh:
-            fh.write("%f %s\\n" % (time.time(), message))
+        path = os.path.join(_flight_recorder_home(), _ERRLOG_FILENAME)
+        data = ("%f %s\\n" % (time.time(), message)).encode("utf-8", "replace")
+        if len(data) > _MAX_ERRLOG_BYTES:
+            data = data[: _MAX_ERRLOG_BYTES - 1] + b"\\n"
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if size + len(data) > _MAX_ERRLOG_BYTES:
+            os.replace(path, path + ".1")
+        with open(path, "ab") as fh:
+            fh.write(data)
     except Exception:
         pass
 
@@ -114,6 +128,7 @@ def render_handler(
         .replace("@@SPOOL@@", json.dumps(SPOOL_FILENAME))
         .replace("@@ERRLOG@@", json.dumps(ERRLOG_FILENAME))
         .replace("@@MAXBYTES@@", str(MAX_SPOOL_BYTES))
+        .replace("@@MAXERRBYTES@@", str(MAX_ERRLOG_BYTES))
     )
 
 

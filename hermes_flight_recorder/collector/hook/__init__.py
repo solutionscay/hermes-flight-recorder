@@ -29,6 +29,8 @@ HOOK_DIR_NAME = "hermes-flight-recorder"
 # ($HERMES_HOME/flight-recorder by default).
 SPOOL_FILENAME = "hook-spool.jsonl"
 ERRLOG_FILENAME = "hook-errors.log"
+MAX_SPOOL_BYTES = 64 * 1024 * 1024  # 64 MiB
+MAX_ERRLOG_BYTES = 1024 * 1024  # 1 MiB
 # The outbox meta cursor that records how far the drain has read.
 CURSOR_NAME = "hook-spool"
 # The Hermes gateway events the hook subscribes to.

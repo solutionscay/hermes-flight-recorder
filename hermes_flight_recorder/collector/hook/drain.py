@@ -7,11 +7,12 @@ assigns the ``producer_sequence`` via the outbox, and appends with a dedup
 key. Invocation hooks are metadata-only; complete user/assistant content is
 captured later from ``state.db``.
 
-Durability model (issue #4): at-least-once with dedup at the drain. The read
-cursor is a byte offset stored in the outbox meta. A spool generation makes
-the byte offset unique after compaction. On a Flight Recorder stop between an
-append and the cursor commit, the next drain re-reads the same generation and
-deduplicates it. A partial trailing line stays for the next drain.
+Durability model (issue #4): at-least-once with dedup at the drain. The outbox
+stores the read offset, file identity, and generation. The generation makes
+an offset unique after replacement, truncation, or compaction. On a Flight
+Recorder stop between an append and the cursor commit, the next drain re-reads
+the same generation and deduplicates it. A partial trailing line stays for the
+next drain.
 
 Fields the hook context does not carry are synthesized here, best-effort:
 ``invocation_id`` (minted on ``agent:start`` from the line offset, then
@@ -33,9 +34,10 @@ from pathlib import Path
 from typing import Any
 
 from .._common import append_and_count, build_record, gateway_runtime_stamp, runtime_stamp
-from . import CURSOR_NAME, SPOOL_FILENAME
+from . import CURSOR_NAME, MAX_SPOOL_BYTES, SPOOL_FILENAME
 
 _GENERATION_META = "hook-spool:generation"
+_IDENTITY_META = "hook-spool:identity"
 _SEGMENT_PREFIX = f"{SPOOL_FILENAME}.segment."
 
 
@@ -54,20 +56,50 @@ def drain(outbox: Any, flight_recorder_home: str | Path | None = None) -> dict[s
     if not spool.exists():
         return dict(counts)
 
+    stat = spool.stat()
+    identity = f"{stat.st_dev}:{stat.st_ino}"
     cursor = int(outbox.get_cursor(CURSOR_NAME) or 0)
-    size = spool.stat().st_size
-    if size < cursor:
-        cursor = 0  # spool was truncated or rotated; restart from the top
-    elif size == cursor:
-        if size:
-            _rotate_consumed_spool(outbox, spool, cursor)
+    saved_identity = outbox.get_meta(_IDENTITY_META)
+    generation = outbox.get_meta(_GENERATION_META)
+
+    if saved_identity is None:
+        if stat.st_size < cursor:
+            cursor = 0
+            generation = uuid.uuid4().hex
+            outbox.set_cursor(CURSOR_NAME, cursor)
+        else:
+            # Preserve the old offset-only key during the first pass after an
+            # upgrade. New installations start with a generation key.
+            generation = generation or ("legacy" if cursor else uuid.uuid4().hex)
+        outbox.set_meta(_IDENTITY_META, identity)
+        outbox.set_meta(_GENERATION_META, generation)
+    elif saved_identity != identity or stat.st_size < cursor:
+        # Replacement changes the inode. Truncation can keep the inode but
+        # moves the end before the cursor. Both cases start a new generation.
+        cursor = 0
+        generation = uuid.uuid4().hex
+        outbox.set_cursor(CURSOR_NAME, cursor)
+        outbox.set_meta(_IDENTITY_META, identity)
+        outbox.set_meta(_GENERATION_META, generation)
+    elif generation is None:
+        generation = uuid.uuid4().hex
+        outbox.set_meta(_GENERATION_META, generation)
+
+    if stat.st_size == cursor:
+        if cursor >= MAX_SPOOL_BYTES:
+            _rotate_consumed_spool(outbox, spool, cursor, generation)
         return dict(counts)
 
-    generation = outbox.get_meta(_GENERATION_META) or "legacy"
     consumed, _complete = _drain_path(
         outbox, spool, cursor, generation, counts, session_ids
     )
-    outbox.set_cursor(CURSOR_NAME, cursor + consumed)
+    cursor += consumed
+    outbox.set_cursor(CURSOR_NAME, cursor)
+    # Rotate after a size-limited generation is drained. This condition does
+    # not need a quiet pass, so continuous writes cannot pin the active spool
+    # above the cap.
+    if cursor >= MAX_SPOOL_BYTES:
+        _rotate_consumed_spool(outbox, spool, cursor, generation)
     return dict(counts)
 
 
@@ -116,15 +148,17 @@ def _drain_path(
     return consumed, complete
 
 
-def _rotate_consumed_spool(outbox: Any, spool: Path, cursor: int) -> None:
+def _rotate_consumed_spool(
+    outbox: Any, spool: Path, cursor: int, generation: str
+) -> None:
     """Move a consumed spool aside and start a new offset generation."""
-    generation = outbox.get_meta(_GENERATION_META) or "legacy"
     segment = spool.with_name(
         f"{_SEGMENT_PREFIX}{generation}.{cursor}.{uuid.uuid4().hex}"
     )
     spool.replace(segment)
-    outbox.set_meta(_GENERATION_META, uuid.uuid4().hex)
     outbox.set_cursor(CURSOR_NAME, 0)
+    outbox.delete_meta(_IDENTITY_META)
+    outbox.delete_meta(_GENERATION_META)
 
 
 def _drain_segments(

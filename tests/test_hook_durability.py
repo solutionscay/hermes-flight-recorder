@@ -12,11 +12,15 @@ rather than sinking the pass.
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
 from pathlib import Path
 
 from hermes_flight_recorder.collector.hook import CURSOR_NAME, SPOOL_FILENAME, drain
 from hermes_flight_recorder.collector.outbox import Outbox
+
+drain_module = importlib.import_module("hermes_flight_recorder.collector.hook.drain")
 
 
 def new_outbox(flight_recorder_home: Path) -> Outbox:
@@ -76,12 +80,45 @@ def test_redrain_of_same_lines_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_truncated_spool_resets_cursor(tmp_path: Path) -> None:
+    spool = tmp_path / SPOOL_FILENAME
     ob = new_outbox(tmp_path)
-    # Cursor points past the end of a now-smaller spool (as after a rotation).
-    ob.set_cursor(CURSOR_NAME, 10_000)
-    (tmp_path / SPOOL_FILENAME).write_text(line("gateway:startup", {"platforms": []}) + "\n")
-    counts = drain(ob)
-    assert counts == {"runtime.gateway_started": 1}
+    spool.write_text(
+        line(
+            "session:start",
+            {"session_id": "session-with-a-long-id", "session_key": "key"},
+        )
+        + "\n"
+    )
+    assert drain(ob) == {"session.created": 1}
+
+    # write_text truncates the same inode and reuses offset 0.
+    spool.write_text(line("gateway:startup", {"platforms": []}) + "\n")
+    assert drain(ob) == {"runtime.gateway_started": 1}
+    assert ob.count() == 2
+    ob.close()
+
+
+def test_replaced_spool_reuses_offset_without_dedup_collision(tmp_path: Path) -> None:
+    spool = tmp_path / SPOOL_FILENAME
+    ob = new_outbox(tmp_path)
+    spool.write_text(line("gateway:startup", {"platforms": []}, 1.0) + "\n")
+    assert drain(ob) == {"runtime.gateway_started": 1}
+    first_generation = ob.get_meta("hook-spool:generation")
+
+    replacement = tmp_path / "replacement"
+    replacement.write_text(
+        line(
+            "session:start",
+            {"session_id": "s1", "session_key": "k1"},
+            2.0,
+        )
+        + "\n"
+    )
+    os.replace(replacement, spool)
+
+    assert drain(ob) == {"session.created": 1}
+    assert ob.count() == 2
+    assert ob.get_meta("hook-spool:generation") != first_generation
     ob.close()
 
 
@@ -114,14 +151,17 @@ def test_incremental_drain_across_calls(tmp_path: Path) -> None:
     ob.close()
 
 
-def test_compaction_reuses_offsets_without_dropping_new_events(tmp_path: Path) -> None:
+def test_compaction_reuses_offsets_without_dropping_new_events(
+    tmp_path: Path, monkeypatch
+) -> None:
     spool = tmp_path / SPOOL_FILENAME
     ob = new_outbox(tmp_path)
 
     spool.write_text(line("gateway:startup", {"platforms": []}, 1.0) + "\n")
     assert drain(ob) == {"runtime.gateway_started": 1}
 
-    # A no-work pass compacts the fully consumed generation and resets offset 0.
+    # A pass at the cap compacts the consumed generation and resets offset 0.
+    monkeypatch.setattr(drain_module, "MAX_SPOOL_BYTES", 1)
     assert drain(ob) == {}
     spool.write_text(
         line("session:start", {"session_id": "s1", "session_key": "k1"}, 2.0)
@@ -130,5 +170,53 @@ def test_compaction_reuses_offsets_without_dropping_new_events(tmp_path: Path) -
 
     assert drain(ob) == {"session.created": 1}
     assert ob.count() == 2
-    assert int(ob.get_cursor(CURSOR_NAME)) == spool.stat().st_size
+    assert int(ob.get_cursor(CURSOR_NAME)) == 0
+    assert not spool.exists()
+    ob.close()
+
+
+def test_continuous_writes_rotate_without_a_quiet_pass(
+    tmp_path: Path, monkeypatch
+) -> None:
+    spool = tmp_path / SPOOL_FILENAME
+    ob = new_outbox(tmp_path)
+    assert drain_module.MAX_SPOOL_BYTES == 64 * 1024 * 1024
+    monkeypatch.setattr(drain_module, "MAX_SPOOL_BYTES", 300)
+
+    for index in range(20):
+        with spool.open("a") as fh:
+            fh.write(
+                line(
+                    "session:start",
+                    {"session_id": f"s{index}", "session_key": f"k{index}"},
+                    float(index),
+                )
+                + "\n"
+            )
+        assert drain(ob) == {"session.created": 1}
+        assert not spool.exists() or spool.stat().st_size < 300
+
+    drain(ob)
+    assert ob.count() == 20
+    assert not list(tmp_path.glob(f"{SPOOL_FILENAME}.segment.*"))
+    ob.close()
+
+
+def test_partial_line_survives_cap_rotation(tmp_path: Path, monkeypatch) -> None:
+    spool = tmp_path / SPOOL_FILENAME
+    ob = new_outbox(tmp_path)
+    complete = line("gateway:startup", {"platforms": []}, 1.0) + "\n"
+    partial = line(
+        "session:start", {"session_id": "s1", "session_key": "k1"}, 2.0
+    )
+    spool.write_text(complete + partial)
+    monkeypatch.setattr(drain_module, "MAX_SPOOL_BYTES", len(complete.encode()))
+
+    assert drain(ob) == {"runtime.gateway_started": 1}
+    segment = next(tmp_path.glob(f"{SPOOL_FILENAME}.segment.*"))
+    with segment.open("a") as fh:
+        fh.write("\n")
+
+    assert drain(ob) == {"session.created": 1}
+    assert not segment.exists()
     ob.close()
