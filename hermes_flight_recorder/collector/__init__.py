@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 # Meta key holding the wall-clock epoch of the last completed capture pass.
 # The reconciler reads it to prove the capture loop is still ticking; a frozen
@@ -88,29 +89,54 @@ def run_pass(
 
     from . import cron_db, gateway_log, kanban_db, knowledge_store, state_db
     from .hook import drain as drain_hook_spool
+    from .recorder_config import CaptureConfig, source_enabled
 
     since = _capture_since(outbox)
+    capture = capture_config or CaptureConfig()
 
     totals: Counter[str] = Counter()
     sources: tuple[
-        tuple[str, Callable[[], dict[str, int]], tuple[type[Exception], ...]], ...
+        tuple[
+            str,
+            str,
+            Callable[[], dict[str, int]],
+            tuple[type[Exception], ...],
+        ],
+        ...,
     ] = (
-        ("hook drain", lambda: drain_hook_spool(outbox), (Exception,)),
+        ("hook", "hook drain", lambda: drain_hook_spool(outbox), (Exception,)),
         (
+            "state_db",
             "state.db",
             lambda: state_db.poll(
                 outbox,
                 hermes_home,
-                capture_config=capture_config,
+                capture_config=capture,
                 knowledge_config=knowledge_config,
                 since=since,
             ),
             _DURABLE_STORE_ERRORS,
         ),
-        ("cron", lambda: cron_db.poll(outbox, hermes_home, since=since), _DURABLE_STORE_ERRORS),
-        ("kanban", lambda: kanban_db.poll(outbox, hermes_home, since=since), _DURABLE_STORE_ERRORS),
-        ("gateway log", lambda: gateway_log.poll(outbox, hermes_home, since=since), _DURABLE_STORE_ERRORS),
         (
+            "cron",
+            "cron",
+            lambda: cron_db.poll(outbox, hermes_home, since=since),
+            _DURABLE_STORE_ERRORS,
+        ),
+        (
+            "kanban",
+            "kanban",
+            lambda: kanban_db.poll(outbox, hermes_home, since=since),
+            _DURABLE_STORE_ERRORS,
+        ),
+        (
+            "gateway_log",
+            "gateway log",
+            lambda: gateway_log.poll(outbox, hermes_home, since=since),
+            _DURABLE_STORE_ERRORS,
+        ),
+        (
+            "knowledge",
             "knowledge",
             lambda: knowledge_store.poll(
                 outbox, hermes_home, knowledge_config=knowledge_config
@@ -118,7 +144,9 @@ def run_pass(
             _DURABLE_STORE_ERRORS,
         ),
     )
-    for label, poll, tolerated in sources:
+    for source_name, label, poll, tolerated in sources:
+        if not source_enabled(capture, source_name):
+            continue
         try:
             totals.update(poll())
         except tolerated as exc:

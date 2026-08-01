@@ -119,7 +119,14 @@ managing it yourself.
   "capture": {
     "max_content_bytes": 65536,
     "message_roles": ["user", "assistant", "tool"],
-    "sources": {"hook": true},
+    "sources": {
+      "hook": true,
+      "state_db": true,
+      "cron": true,
+      "kanban": true,
+      "gateway_log": true,
+      "knowledge": true
+    },
     "interval_seconds": 15
   },
   "retention": {
@@ -143,6 +150,10 @@ managing it yourself.
 
 `capture.message_roles` selects which supported `state.db` message roles
 (`user`, `assistant`, and `tool`) become encrypted events.
+`capture.sources` selects the collectors that run. The supported keys are
+`hook`, `state_db`, `cron`, `kanban`, `gateway_log`, and `knowledge`. Each key
+defaults to `true` when it is absent. Set a key to `false` to stop that collector
+and its related reconciliation checks. Unknown keys are configuration errors.
 `capture.max_content_bytes` limits each encrypted body by UTF-8 byte length
 (64 KiB by default). A capped event records `content_truncated`,
 `content_original_bytes`, and `content_captured_bytes` in plaintext metadata,

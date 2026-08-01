@@ -50,8 +50,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import CAPTURE_HEARTBEAT_KEY, knowledge_store
 from ..envelope import SESSION_START_TYPES
+from . import CAPTURE_HEARTBEAT_KEY, knowledge_store
 from ._common import (
     INSTALLED_AT_META_KEY,
     append_and_count,
@@ -78,7 +78,7 @@ from ._common import (
     to_epoch,
 )
 from .cron_schedule import expected_instants
-from .recorder_config import CaptureConfig, KnowledgeConfig
+from .recorder_config import CaptureConfig, KnowledgeConfig, source_enabled
 
 _SOURCE = "reconciler"
 _CAPTURE = "derive:reconciler"
@@ -160,8 +160,10 @@ def reconcile(
     # subjects from looking like capture loss without restoring event bodies.
     events = list(outbox.iter_events(installation_id))
     events.extend(outbox.iter_pruned_summaries(installation_id))
-    # Snapshot the cron executions once too; three detectors read them.
-    exec_rows = _load_execution_rows(home)
+    # Snapshot the cron executions once too; its enabled detectors share it.
+    exec_rows = (
+        _load_execution_rows(home) if source_enabled(capture, "cron") else []
+    )
     counts: dict[str, int] = defaultdict(int)
 
     _detect_sequence_gaps(
@@ -176,12 +178,17 @@ def reconcile(
     _detect_coverage_gaps(
         outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
     )
-    _detect_missing_terminals(outbox, events, counts, when, cfg, horizon)
-    _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon)
-    _detect_gateway_start_failed(outbox, home, counts, when)
-    _detect_stale_task_leases(outbox, home, counts, when, cfg)
+    if source_enabled(capture, "hook"):
+        _detect_missing_terminals(outbox, events, counts, when, cfg, horizon)
+    if source_enabled(capture, "gateway_log"):
+        _detect_gateway_start_failed(outbox, home, counts, when)
+    if source_enabled(capture, "cron"):
+        _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon)
+    if source_enabled(capture, "kanban"):
+        _detect_stale_task_leases(outbox, home, counts, when, cfg)
     _detect_capture_stale(outbox, counts, when, cfg)
-    _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
+    if source_enabled(capture, "knowledge"):
+        _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
     return dict(counts)
 
 
@@ -265,7 +272,7 @@ def _detect_coverage_gaps(
     parent_map = {}
 
     state_path = state_db_path(home)
-    if state_path.exists():
+    if source_enabled(capture_config, "state_db") and state_path.exists():
         conn = open_sqlite_read_only(state_path)
         try:
             session_cols = sqlite_table_columns(conn, "sessions")
@@ -306,19 +313,21 @@ def _detect_coverage_gaps(
         finally:
             conn.close()
 
-    for r in exec_rows:
-        if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
-            continue
-        if r["id"] in captured["executions"]:
-            _clear_coverage_pending(outbox, "execution", r["id"])
-            continue
-        _emit_coverage(
-            outbox, counts, when,
-            subject_type="execution", subject_id=r["id"],
-            source_table="cron:executions.db", correlation_id=r["job_id"],
-            grace=config.coverage_grace,
-        )
-    _coverage_kanban(outbox, home, captured, counts, when, config, horizon)
+    if source_enabled(capture_config, "cron"):
+        for r in exec_rows:
+            if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
+                continue
+            if r["id"] in captured["executions"]:
+                _clear_coverage_pending(outbox, "execution", r["id"])
+                continue
+            _emit_coverage(
+                outbox, counts, when,
+                subject_type="execution", subject_id=r["id"],
+                source_table="cron:executions.db", correlation_id=r["job_id"],
+                grace=config.coverage_grace,
+            )
+    if source_enabled(capture_config, "kanban"):
+        _coverage_kanban(outbox, home, captured, counts, when, config, horizon)
 
 
 def _coverage_sessions(
