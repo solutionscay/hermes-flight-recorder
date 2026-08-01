@@ -147,6 +147,7 @@ def _completion_command(
     *,
     flight_recorder_home: str | os.PathLike[str] | None,
     hermes_home: str | os.PathLike[str] | None,
+    guard_owner_pid: int | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -159,7 +160,57 @@ def _completion_command(
         command.extend(["--flight-recorder-home", str(flight_recorder_home)])
     if hermes_home is not None:
         command.extend(["--hermes-home", str(hermes_home)])
+    if guard_owner_pid is not None:
+        command.extend(["--guard-owner-pid", str(guard_owner_pid)])
     return command
+
+
+def _prepare_update_locked(
+    fr_home: Path,
+    hermes: Path,
+    *,
+    source: str = DEFAULT_SOURCE,
+    ref: str | None = None,
+    editable: bool = False,
+    guard_owner_pid: int | None = None,
+) -> tuple[Path, list[str], list[str]]:
+    """Back up an installation while the caller holds its runtime lock."""
+    if not hermes.is_dir():
+        raise UpdateError(f"Hermes home {hermes} does not exist")
+    fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    requirement, is_local = _requirement(source, ref)
+    if editable and not is_local:
+        raise UpdateError("--editable requires a local --source directory")
+    backup = _backup_installation(fr_home, hermes)
+    pending = {
+        "state": "prepared",
+        "prepared_at": time.time(),
+        "previous": current_version().to_dict(),
+        "target": {
+            "source": requirement,
+            "requested_ref": ref,
+            "editable": editable,
+        },
+        "backup": str(backup),
+    }
+    if guard_owner_pid is not None:
+        pending["guard_owner_pid"] = guard_owner_pid
+    _write_json(backup / "update.json", pending)
+    _write_json(fr_home / PENDING_UPDATE_FILENAME, pending)
+
+    pip_command = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    if editable:
+        pip_command.append("--editable")
+    pip_command.append(requirement)
+    return (
+        backup,
+        pip_command,
+        _completion_command(
+            flight_recorder_home=fr_home,
+            hermes_home=hermes,
+            guard_owner_pid=guard_owner_pid,
+        ),
+    )
 
 
 def prepare_update(
@@ -175,43 +226,18 @@ def prepare_update(
         flight_recorder_home, hermes_home
     ).resolve()
     hermes = resolve_hermes_home(hermes_home).resolve()
-    if not hermes.is_dir():
-        raise UpdateError(f"Hermes home {hermes} does not exist")
     fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = _refuse_if_serving(fr_home)
     try:
-        requirement, is_local = _requirement(source, ref)
-        if editable and not is_local:
-            raise UpdateError("--editable requires a local --source directory")
-        backup = _backup_installation(fr_home, hermes)
-        pending = {
-            "state": "prepared",
-            "prepared_at": time.time(),
-            "previous": current_version().to_dict(),
-            "target": {
-                "source": requirement,
-                "requested_ref": ref,
-                "editable": editable,
-            },
-            "backup": str(backup),
-        }
-        _write_json(backup / "update.json", pending)
-        _write_json(fr_home / PENDING_UPDATE_FILENAME, pending)
+        return _prepare_update_locked(
+            fr_home,
+            hermes,
+            source=source,
+            ref=ref,
+            editable=editable,
+        )
     finally:
         lock.release()
-
-    pip_command = [sys.executable, "-m", "pip", "install", "--upgrade"]
-    if editable:
-        pip_command.append("--editable")
-    pip_command.append(requirement)
-    return (
-        backup,
-        pip_command,
-        _completion_command(
-            flight_recorder_home=flight_recorder_home,
-            hermes_home=hermes_home,
-        ),
-    )
 
 
 def _run(
@@ -241,31 +267,72 @@ def update(
     log=print,
 ) -> Path:
     """Install selected package source, then complete with the new package."""
-    backup, pip_command, completion_command = prepare_update(
-        flight_recorder_home,
-        hermes_home,
-        source=source,
-        ref=ref,
-        editable=editable,
-    )
-    log(f"backup created:       {backup}")
-    log("updating package...")
+    fr_home = resolve_flight_recorder_home(
+        flight_recorder_home, hermes_home
+    ).resolve()
+    hermes = resolve_hermes_home(hermes_home).resolve()
+    fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = _refuse_if_serving(fr_home)
     try:
+        backup, pip_command, completion_command = _prepare_update_locked(
+            fr_home,
+            hermes,
+            source=source,
+            ref=ref,
+            editable=editable,
+            guard_owner_pid=os.getpid(),
+        )
+        log(f"backup created:       {backup}")
+        log("updating package...")
+        _set_pending_state(fr_home, "package-replacement", "package_started_at")
         _run(pip_command, runner=runner)
         log("completing installation with the updated package...")
         _run(completion_command, runner=runner)
     except UpdateError:
-        fr_home = resolve_flight_recorder_home(
-            flight_recorder_home, hermes_home
-        ).resolve()
-        pending_path = fr_home / PENDING_UPDATE_FILENAME
-        if pending_path.exists():
-            pending = _read_json(pending_path)
-            pending["state"] = "failed"
-            pending["failed_at"] = time.time()
-            _write_json(pending_path, pending)
+        _mark_update_failed(fr_home)
         raise
+    finally:
+        lock.release()
     return backup
+
+
+def _set_pending_state(fr_home: Path, state: str, timestamp_key: str) -> None:
+    pending_path = fr_home / PENDING_UPDATE_FILENAME
+    pending = _read_json(pending_path)
+    pending["state"] = state
+    pending[timestamp_key] = time.time()
+    _write_json(pending_path, pending)
+
+
+def _mark_update_failed(fr_home: Path, exc: Exception | None = None) -> None:
+    pending_path = fr_home / PENDING_UPDATE_FILENAME
+    if not pending_path.exists():
+        return
+    pending = _read_json(pending_path)
+    pending["failed_stage"] = pending.get("state")
+    pending["state"] = "failed"
+    pending["failed_at"] = time.time()
+    if exc is not None:
+        pending["failure"] = str(exc)
+    _write_json(pending_path, pending)
+
+
+def _check_parent_guard(fr_home: Path, pending: dict[str, Any], owner_pid: int) -> None:
+    expected_pid = pending.get("guard_owner_pid")
+    if expected_pid != owner_pid:
+        raise UpdateError("update completion guard does not match pending state")
+
+    probe = RuntimeLock(fr_home / LOCK_FILENAME)
+    try:
+        probe.acquire()
+    except RuntimeLockError:
+        holder = probe.holder_info
+        if holder is None or holder.split(maxsplit=1)[0] != str(owner_pid):
+            raise UpdateError("the update guard is held by an unexpected process") from None
+        return
+    else:
+        probe.release()
+        raise UpdateError("the parent update guard is no longer active")
 
 
 def write_installed_version(
@@ -288,6 +355,7 @@ def complete_update(
     flight_recorder_home: str | os.PathLike[str] | None,
     hermes_home: str | os.PathLike[str] | None,
     *,
+    guard_owner_pid: int | None = None,
     log=print,
 ) -> Path:
     """Migrate, refresh, stamp, and verify using the newly installed package."""
@@ -301,8 +369,13 @@ def complete_update(
     if not isinstance(target, dict):
         raise UpdateError(f"invalid target in {pending_path}")
 
-    lock = _refuse_if_serving(fr_home)
+    lock: RuntimeLock | None = None
+    if guard_owner_pid is None:
+        lock = _refuse_if_serving(fr_home)
+    else:
+        _check_parent_guard(fr_home, pending, guard_owner_pid)
     try:
+        _set_pending_state(fr_home, "completing", "completion_started_at")
         outbox = Outbox.open(fr_home, hermes_home=hermes)
         try:
             installation_id = outbox.initialize()
@@ -341,11 +414,13 @@ def complete_update(
         _write_json(fr_home / LAST_UPDATE_FILENAME, completed)
         pending_path.unlink()
     except Exception as exc:
+        _mark_update_failed(fr_home, exc)
         if isinstance(exc, UpdateError):
             raise
         raise UpdateError(f"update completion failed: {exc}") from exc
     finally:
-        lock.release()
+        if lock is not None:
+            lock.release()
 
     log(f"updated build:        {build_identity()}")
     log(f"installation id:      {installation_id}")

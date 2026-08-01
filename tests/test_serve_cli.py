@@ -194,3 +194,34 @@ def test_cli_serve_exits_two_when_uninitialized(tmp_path, capsys, monkeypatch):
     )
     assert rc == 2
     assert "not initialized" in capsys.readouterr().err.lower()
+
+
+def test_cli_serve_checks_update_guard_before_opening_outbox(
+    tmp_path, monkeypatch
+):
+    hermes = tmp_path / "hermes"
+    hermes.mkdir()
+    assert cli.main(["install", "--hermes-home", str(hermes)]) == 0
+    fr_home = hermes / "flight-recorder"
+    holder = RuntimeLock(fr_home / "runtime.lock")
+    holder.acquire()
+    monkeypatch.setattr(
+        cli,
+        "_open_outbox",
+        lambda _args: pytest.fail("serve opened the outbox while update held the guard"),
+    )
+    try:
+        rc = cli.main(
+            [
+                "serve",
+                "--flight-recorder-home",
+                str(fr_home),
+                "--hermes-home",
+                str(hermes),
+                "--no-sync",
+            ]
+        )
+    finally:
+        holder.release()
+
+    assert rc == 3

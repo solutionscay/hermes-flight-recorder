@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -13,7 +14,7 @@ from hermes_flight_recorder import cli
 from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.hook import baked_flight_recorder_build
 from hermes_flight_recorder.collector.outbox import Outbox, OutboxError
-from hermes_flight_recorder.collector.runtime_lock import RuntimeLock
+from hermes_flight_recorder.collector.runtime_lock import RuntimeLock, RuntimeLockError
 from hermes_flight_recorder.collector.update import (
     INSTALLED_VERSION_FILENAME,
     LAST_UPDATE_FILENAME,
@@ -136,6 +137,9 @@ def test_update_runs_pip_then_new_package_completion(tmp_path):
 
     def runner(command, *, check):
         assert check is False
+        restart_lock = RuntimeLock(fr_home / "runtime.lock")
+        with pytest.raises(RuntimeLockError):
+            restart_lock.acquire()
         commands.append(command)
         return subprocess.CompletedProcess(command, 0)
 
@@ -155,6 +159,37 @@ def test_update_runs_pip_then_new_package_completion(tmp_path):
         "update",
         "--complete",
     ]
+    assert commands[1][-2:] == ["--guard-owner-pid", str(os.getpid())]
+
+
+def test_guarded_completion_uses_the_parent_update_lock(tmp_path):
+    hermes, fr_home = _hermes(tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    holder = RuntimeLock(fr_home / "runtime.lock")
+    holder.acquire()
+    try:
+        from hermes_flight_recorder.collector import update as update_module
+
+        update_module._prepare_update_locked(
+            fr_home,
+            hermes,
+            source=str(checkout),
+            guard_owner_pid=os.getpid(),
+        )
+        complete_update(
+            fr_home,
+            hermes,
+            guard_owner_pid=os.getpid(),
+            log=lambda _message: None,
+        )
+    finally:
+        holder.release()
+
+    assert not (fr_home / PENDING_UPDATE_FILENAME).exists()
+    assert json.loads((fr_home / LAST_UPDATE_FILENAME).read_text())["state"] == (
+        "complete"
+    )
 
 
 def test_failed_package_update_keeps_backup_and_marks_pending_state(tmp_path):
@@ -174,9 +209,33 @@ def test_failed_package_update_keeps_backup_and_marks_pending_state(tmp_path):
 
     pending = json.loads((fr_home / PENDING_UPDATE_FILENAME).read_text())
     assert pending["state"] == "failed"
+    assert pending["failed_stage"] == "package-replacement"
     backup = Path(pending["backup"])
     assert (backup / "outbox.sqlite").is_file()
     assert json.loads((backup / "update.json").read_text())["previous"]["build"]
+
+
+def test_failed_completion_records_the_recovery_state(tmp_path, monkeypatch):
+    import hermes_flight_recorder.collector.update as update_module
+
+    hermes, fr_home = _hermes(tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    prepare_update(fr_home, hermes, source=str(checkout))
+
+    def fail_hook(*_args, **_kwargs):
+        raise OSError("hook refresh failed")
+
+    monkeypatch.setattr(update_module, "install_hook", fail_hook)
+    with pytest.raises(UpdateError, match="hook refresh failed"):
+        complete_update(fr_home, hermes, log=lambda _message: None)
+
+    pending = json.loads((fr_home / PENDING_UPDATE_FILENAME).read_text())
+    assert pending["state"] == "failed"
+    assert pending["failed_stage"] == "completing"
+    assert pending["failure"] == "hook refresh failed"
+    assert pending["completion_started_at"] <= pending["failed_at"]
+    assert Path(pending["backup"]).is_dir()
 
 
 def test_complete_update_preserves_state_and_refreshes_hook(tmp_path):
