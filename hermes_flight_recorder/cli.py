@@ -169,7 +169,11 @@ def _cmd_update(args: argparse.Namespace) -> int:
 
     try:
         if args.complete:
-            complete_update(args.flight_recorder_home, args.hermes_home)
+            complete_update(
+                args.flight_recorder_home,
+                args.hermes_home,
+                guard_owner_pid=args.guard_owner_pid,
+            )
         else:
             update(
                 args.flight_recorder_home,
@@ -186,51 +190,66 @@ def _cmd_update(args: argparse.Namespace) -> int:
 
 def _cmd_serve(args: argparse.Namespace) -> int:
     from .collector import recorder_config, sync_config
-    from .collector.runtime_lock import LOCK_FILENAME, RuntimeLock
-    from .collector.serve import SYNC_REQUEST_TIMEOUT, configure_logging, serve
+    from .collector.runtime_lock import LOCK_FILENAME, RuntimeLock, RuntimeLockError
+    from .collector.serve import (
+        SERVE_ALREADY_RUNNING,
+        SYNC_REQUEST_TIMEOUT,
+        configure_logging,
+        serve,
+    )
     from .collector.transport import HttpsTransport, RetryingTransport
 
     log = configure_logging(args.log_level)
     fr_home = _flight_recorder_home(args)
-
-    outbox = _open_outbox(args)
+    fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = RuntimeLock(fr_home / LOCK_FILENAME)
     try:
-        if not _check_initialized(outbox):
-            return 2
+        lock.acquire()
+    except RuntimeLockError as exc:
+        log.error("%s", exc)
+        return SERVE_ALREADY_RUNNING
 
+    try:
+        outbox = _open_outbox(args)
         try:
-            config = recorder_config.load(fr_home)
-        except recorder_config.RecorderConfigError as exc:
-            print(f"serve not configured: {exc}", file=sys.stderr)
-            return 2
+            if not _check_initialized(outbox):
+                return 2
 
-        transport = None
-        if not args.no_sync:
             try:
-                sync = sync_config.load(fr_home)
-                transport = RetryingTransport(
-                    HttpsTransport.from_config(
-                        sync,
-                        timeout=SYNC_REQUEST_TIMEOUT,
-                        require_https=not args.allow_insecure_url,
-                    )
-                )
-            except sync_config.SyncConfigError as exc:
-                log.info("sync disabled: %s", exc)
+                config = recorder_config.load(fr_home)
+            except recorder_config.RecorderConfigError as exc:
+                print(f"serve not configured: {exc}", file=sys.stderr)
+                return 2
 
-        return serve(
-            outbox,
-            args.hermes_home,
-            config,
-            transport=transport,
-            capture_interval=args.capture_interval,
-            reconcile_interval=args.reconcile_interval,
-            sync_interval=args.sync_interval,
-            lock=RuntimeLock(fr_home / LOCK_FILENAME),
-            logger=log,
-        )
+            transport = None
+            if not args.no_sync:
+                try:
+                    sync = sync_config.load(fr_home)
+                    transport = RetryingTransport(
+                        HttpsTransport.from_config(
+                            sync,
+                            timeout=SYNC_REQUEST_TIMEOUT,
+                            require_https=not args.allow_insecure_url,
+                        )
+                    )
+                except sync_config.SyncConfigError as exc:
+                    log.info("sync disabled: %s", exc)
+
+            return serve(
+                outbox,
+                args.hermes_home,
+                config,
+                transport=transport,
+                capture_interval=args.capture_interval,
+                reconcile_interval=args.reconcile_interval,
+                sync_interval=args.sync_interval,
+                lock=lock,
+                logger=log,
+            )
+        finally:
+            outbox.close()
     finally:
-        outbox.close()
+        lock.release()
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -772,6 +791,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_update.add_argument(
         "--complete",
         action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p_update.add_argument(
+        "--guard-owner-pid",
+        type=int,
+        default=None,
         help=argparse.SUPPRESS,
     )
     p_update.set_defaults(func=_cmd_update)

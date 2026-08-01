@@ -247,8 +247,11 @@ hermes-flight-recorder update \
   --editable
 ```
 
-The command refuses to run while `serve` holds the recorder runtime lock. Before
-it changes the package, it creates a recovery snapshot under
+The command refuses to run while `serve` holds the recorder runtime lock. It
+holds this lock until package replacement, migration, hook refresh, and
+verification are complete. A service restart refuses to start before it opens
+the outbox while the update holds the lock. Before the update changes the
+package, it creates a recovery snapshot under
 `<HERMES_HOME>/flight-recorder/update-backups/`. The snapshot contains a
 consistent SQLite backup, the operator key files, recorder and sync configuration,
 the installed-version record, and the old hook.
@@ -273,8 +276,9 @@ not built from the same revision.
 ### Update failure and rollback
 
 Keep the recorder and Hermes gateway stopped after a failed update. The command
-leaves `pending-update.json` in the recorder home and prints the recovery
-snapshot path. Inspect that file before recovery.
+leaves `pending-update.json` in the recorder home. Its state shows the failed
+update stage. The file also contains the recovery snapshot path. Inspect that
+file before recovery.
 
 To retry completion after fixing the package installation, run the same
 `update` command again. To roll back, reinstall the previous revision recorded
