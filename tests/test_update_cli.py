@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from hermes_flight_recorder import cli
+from hermes_flight_recorder.collector import update as update_module
 from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.hook import baked_flight_recorder_build
 from hermes_flight_recorder.collector.outbox import (
@@ -20,6 +21,7 @@ from hermes_flight_recorder.collector.outbox import (
 )
 from hermes_flight_recorder.collector.runtime_lock import RuntimeLock, RuntimeLockError
 from hermes_flight_recorder.collector.update import (
+    BACKUP_DIRNAME,
     INSTALLED_VERSION_FILENAME,
     LAST_UPDATE_FILENAME,
     PENDING_UPDATE_FILENAME,
@@ -28,7 +30,7 @@ from hermes_flight_recorder.collector.update import (
     prepare_update,
     update,
 )
-from hermes_flight_recorder.version import build_identity
+from hermes_flight_recorder.version import VersionInfo, build_identity
 
 
 def _hermes(tmp_path: Path) -> tuple[Path, Path]:
@@ -120,16 +122,70 @@ def test_prepare_update_refuses_while_serve_lock_is_held(tmp_path):
     assert not (fr_home / PENDING_UPDATE_FILENAME).exists()
 
 
-def test_git_ref_builds_an_exact_pip_requirement(tmp_path):
+def test_git_ref_resolves_to_an_exact_pip_requirement(tmp_path, monkeypatch):
     hermes, fr_home = _hermes(tmp_path)
+    revision = "a" * 40
+    monkeypatch.setattr(
+        update_module, "resolve_git_revision", lambda source, ref: revision
+    )
     _backup, pip_command, _completion = prepare_update(
         fr_home,
         hermes,
         source="git+https://example.test/flight-recorder.git",
         ref="feature/update-test",
     )
-    assert pip_command[-1] == (
-        "git+https://example.test/flight-recorder.git@feature/update-test"
+    assert pip_command[-1] == f"git+https://example.test/flight-recorder.git@{revision}"
+    target = json.loads((fr_home / PENDING_UPDATE_FILENAME).read_text())["target"]
+    assert target["requested_revision"] == "feature/update-test"
+    assert target["resolved_revision"] == revision
+
+
+def test_remote_update_requires_a_revision(tmp_path):
+    hermes, fr_home = _hermes(tmp_path)
+
+    with pytest.raises(UpdateError, match="requires --ref"):
+        prepare_update(fr_home, hermes)
+
+    assert not (fr_home / BACKUP_DIRNAME).exists()
+
+
+def test_revision_check_runs_before_backup(tmp_path, monkeypatch):
+    hermes, fr_home = _hermes(tmp_path)
+
+    def missing_revision(source, ref):
+        raise UpdateError("revision does not exist")
+
+    monkeypatch.setattr(update_module, "resolve_git_revision", missing_revision)
+    with pytest.raises(UpdateError, match="does not exist"):
+        prepare_update(
+            fr_home,
+            hermes,
+            source="git+https://example.test/flight-recorder.git",
+            ref="missing",
+        )
+
+    assert not (fr_home / BACKUP_DIRNAME).exists()
+
+
+def test_resolve_git_tag_uses_peeled_commit():
+    tag_object = "1" * 40
+    commit = "2" * 40
+
+    def runner(command, **_kwargs):
+        assert command[:2] == ["git", "ls-remote"]
+        output = (
+            f"{tag_object}\trefs/tags/v1.2.3\n"
+            f"{commit}\trefs/tags/v1.2.3^{{}}\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    assert (
+        update_module.resolve_git_revision(
+            "git+https://example.test/flight-recorder.git",
+            "v1.2.3",
+            runner=runner,
+        )
+        == commit
     )
 
 
@@ -179,6 +235,7 @@ def test_guarded_completion_uses_the_parent_update_lock(tmp_path):
             fr_home,
             hermes,
             source=str(checkout),
+            editable=True,
             guard_owner_pid=os.getpid(),
         )
         complete_update(
@@ -196,8 +253,60 @@ def test_guarded_completion_uses_the_parent_update_lock(tmp_path):
     )
 
 
+def test_completion_rejects_an_unexpected_installed_revision(tmp_path, monkeypatch):
+    hermes, fr_home = _hermes(tmp_path)
+    expected = "a" * 40
+    installed = "b" * 40
+    monkeypatch.setattr(
+        update_module, "resolve_git_revision", lambda source, ref: expected
+    )
+    prepare_update(
+        fr_home,
+        hermes,
+        source="git+https://example.test/flight-recorder.git",
+        ref="v1.2.3",
+    )
+    monkeypatch.setattr(
+        update_module,
+        "current_version",
+        lambda: VersionInfo("1.2.3", installed, "v1.2.3", "git+https://example.test"),
+    )
+
+    with pytest.raises(UpdateError, match="does not match resolved revision"):
+        complete_update(fr_home, hermes, log=lambda _message: None)
+
+    assert not (fr_home / LAST_UPDATE_FILENAME).exists()
+
+
+def test_completion_reports_requested_and_installed_revisions(tmp_path, monkeypatch):
+    hermes, fr_home = _hermes(tmp_path)
+    installed = update_module.current_version().revision
+    assert installed is not None
+    monkeypatch.setattr(
+        update_module, "resolve_git_revision", lambda source, ref: installed
+    )
+    prepare_update(
+        fr_home,
+        hermes,
+        source="git+https://example.test/flight-recorder.git",
+        ref="v1.2.3",
+    )
+    messages: list[str] = []
+
+    complete_update(fr_home, hermes, log=messages.append)
+
+    assert "requested revision:   v1.2.3" in messages
+    assert f"installed revision:   {installed}" in messages
+    record = json.loads((fr_home / INSTALLED_VERSION_FILENAME).read_text())
+    assert record["selected_ref"] == "v1.2.3"
+    assert record["resolved_revision"] == installed
+    assert record["installed_revision"] == installed
+
+
 def test_failed_package_update_keeps_backup_and_marks_pending_state(tmp_path):
     hermes, fr_home = _hermes(tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
 
     def runner(command, *, check):
         assert check is False
@@ -207,6 +316,8 @@ def test_failed_package_update_keeps_backup_and_marks_pending_state(tmp_path):
         update(
             fr_home,
             hermes,
+            source=str(checkout),
+            editable=True,
             runner=runner,
             log=lambda _message: None,
         )
@@ -220,12 +331,10 @@ def test_failed_package_update_keeps_backup_and_marks_pending_state(tmp_path):
 
 
 def test_failed_completion_records_the_recovery_state(tmp_path, monkeypatch):
-    import hermes_flight_recorder.collector.update as update_module
-
     hermes, fr_home = _hermes(tmp_path)
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    prepare_update(fr_home, hermes, source=str(checkout))
+    prepare_update(fr_home, hermes, source=str(checkout), editable=True)
 
     def fail_hook(*_args, **_kwargs):
         raise OSError("hook refresh failed")
@@ -257,7 +366,7 @@ def test_complete_update_preserves_state_and_refreshes_hook(tmp_path):
     config_before = (fr_home / "recorder-config.json").read_bytes()
     public_before = (fr_home / "operator.pub").read_bytes()
     secret_before = (fr_home / "operator.secret").read_bytes()
-    prepare_update(fr_home, hermes, source=str(checkout))
+    prepare_update(fr_home, hermes, source=str(checkout), editable=True)
     complete_update(fr_home, hermes, log=lambda _message: None)
 
     updated = Outbox.open(fr_home, hermes_home=hermes)
@@ -280,7 +389,7 @@ def test_complete_update_preserves_state_and_refreshes_hook(tmp_path):
     hook = hermes / "hooks" / "hermes-flight-recorder"
     assert baked_flight_recorder_build(hook) == build_identity()
 
-    prepare_update(fr_home, hermes, source=str(checkout))
+    prepare_update(fr_home, hermes, source=str(checkout), editable=True)
     complete_update(fr_home, hermes, log=lambda _message: None)
     reopened = Outbox.open(fr_home, hermes_home=hermes)
     try:

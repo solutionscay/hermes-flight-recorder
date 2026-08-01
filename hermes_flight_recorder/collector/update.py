@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from ..version import VersionInfo, build_identity, current_version
 from . import atomic_file
@@ -30,6 +33,7 @@ PENDING_UPDATE_FILENAME = "pending-update.json"
 INSTALLED_VERSION_FILENAME = "installed-version.json"
 LAST_UPDATE_FILENAME = "last-update.json"
 BACKUP_DIRNAME = "update-backups"
+_FULL_GIT_REVISION = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 
 
 class UpdateError(RuntimeError):
@@ -114,7 +118,130 @@ def _backup_installation(fr_home: Path, hermes_home: Path) -> Path:
     return backup
 
 
-def _requirement(source: str, ref: str | None) -> tuple[str, bool]:
+def _git_command(
+    command: Sequence[str],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+) -> str:
+    try:
+        result = runner(
+            list(command), check=False, capture_output=True, text=True
+        )
+    except OSError as exc:
+        raise UpdateError(f"could not run {command[0]}: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        suffix = f": {detail}" if detail else ""
+        raise UpdateError(
+            f"revision check failed with exit code {result.returncode}{suffix}"
+        )
+    return result.stdout
+
+
+def _fetch_commit(
+    git_url: str,
+    revision: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+) -> str:
+    """Check an unadvertised full commit with a temporary shallow fetch."""
+    with tempfile.TemporaryDirectory(prefix="hfr-revision-") as temporary:
+        _git_command(["git", "init", "--bare", temporary], runner=runner)
+        _git_command(
+            [
+                "git",
+                "-C",
+                temporary,
+                "fetch",
+                "--depth=1",
+                "--no-tags",
+                git_url,
+                revision,
+            ],
+            runner=runner,
+        )
+        resolved = _git_command(
+            ["git", "-C", temporary, "rev-parse", "FETCH_HEAD^{commit}"],
+            runner=runner,
+        ).strip()
+    if not _FULL_GIT_REVISION.fullmatch(resolved):
+        raise UpdateError(f"git returned an invalid revision for {revision!r}")
+    return resolved.lower()
+
+
+def resolve_git_revision(
+    source: str,
+    ref: str,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+) -> str:
+    """Resolve and check one remote branch, tag, or full commit."""
+    git_url = source.removeprefix("git+")
+    if _FULL_GIT_REVISION.fullmatch(ref):
+        return _fetch_commit(git_url, ref.lower(), runner=runner)
+
+    output = _git_command(["git", "ls-remote", git_url], runner=runner)
+    advertised: dict[str, str] = {}
+    for line in output.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) == 2 and _FULL_GIT_REVISION.fullmatch(fields[0]):
+            advertised[fields[1]] = fields[0].lower()
+
+    if ref.startswith("refs/tags/"):
+        revision = advertised.get(ref + "^{}") or advertised.get(ref)
+        if revision is None:
+            raise UpdateError(f"git revision {ref!r} does not exist at {git_url}")
+        return revision
+    if ref.startswith("refs/"):
+        revision = advertised.get(ref)
+        if revision is None:
+            raise UpdateError(f"git revision {ref!r} does not exist at {git_url}")
+        return revision
+
+    tag_revision = advertised.get(f"refs/tags/{ref}^{{}}") or advertised.get(
+        f"refs/tags/{ref}"
+    )
+    branch_revision = advertised.get(f"refs/heads/{ref}")
+    if tag_revision is None and branch_revision is None:
+        if re.fullmatch(r"[0-9a-fA-F]{7,39}", ref):
+            raise UpdateError("use the full commit hash, not an abbreviated hash")
+        raise UpdateError(f"git revision {ref!r} does not exist at {git_url}")
+    if (
+        tag_revision is not None
+        and branch_revision is not None
+        and tag_revision != branch_revision
+    ):
+        raise UpdateError(
+            f"git revision {ref!r} is ambiguous; use refs/heads/... or refs/tags/..."
+        )
+    if tag_revision is not None:
+        return tag_revision
+    assert branch_revision is not None
+    return branch_revision
+
+
+def _local_revision(source: Path) -> tuple[str | None, bool]:
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", str(source), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None, False
+    return (revision.lower() if _FULL_GIT_REVISION.fullmatch(revision) else None), dirty
+
+
+def _target(source: str, ref: str | None, *, editable: bool) -> dict[str, Any]:
     local = Path(source).expanduser()
     if local.exists():
         if ref:
@@ -122,12 +249,34 @@ def _requirement(source: str, ref: str | None) -> tuple[str, bool]:
                 "--ref cannot be combined with a local --source; check out the "
                 "desired revision in that source directory"
             )
-        return str(local.resolve()), True
-    if ref:
-        if not source.startswith("git+"):
-            raise UpdateError("--ref requires a git+ URL source")
-        return f"{source}@{ref}", False
-    return source, False
+        if not editable:
+            raise UpdateError(
+                "a local --source requires --editable and is for development only"
+            )
+        resolved, dirty = _local_revision(local.resolve())
+        return {
+            "source": str(local.resolve()),
+            "requirement": str(local.resolve()),
+            "requested_revision": "local checkout",
+            "resolved_revision": resolved,
+            "dirty": dirty,
+            "editable": True,
+        }
+    if editable:
+        raise UpdateError("--editable requires a local --source directory")
+    if not source.startswith("git+"):
+        raise UpdateError("--source must be a git+ URL or a local editable checkout")
+    if not ref:
+        raise UpdateError("a remote Git update requires --ref with a release, tag, or commit")
+    resolved = resolve_git_revision(source, ref)
+    return {
+        "source": source,
+        "requirement": f"{source}@{resolved}",
+        "requested_revision": ref,
+        "resolved_revision": resolved,
+        "dirty": False,
+        "editable": False,
+    }
 
 
 def _completion_command(
@@ -165,19 +314,13 @@ def _prepare_update_locked(
     if not hermes.is_dir():
         raise UpdateError(f"Hermes home {hermes} does not exist")
     fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    requirement, is_local = _requirement(source, ref)
-    if editable and not is_local:
-        raise UpdateError("--editable requires a local --source directory")
+    target = _target(source, ref, editable=editable)
     backup = _backup_installation(fr_home, hermes)
     pending = {
         "state": "prepared",
         "prepared_at": time.time(),
         "previous": current_version().to_dict(),
-        "target": {
-            "source": requirement,
-            "requested_ref": ref,
-            "editable": editable,
-        },
+        "target": target,
         "backup": str(backup),
     }
     if guard_owner_pid is not None:
@@ -188,7 +331,7 @@ def _prepare_update_locked(
     pip_command = [sys.executable, "-m", "pip", "install", "--upgrade"]
     if editable:
         pip_command.append("--editable")
-    pip_command.append(requirement)
+    pip_command.append(target["requirement"])
     return (
         backup,
         pip_command,
@@ -269,7 +412,13 @@ def update(
             editable=editable,
             guard_owner_pid=os.getpid(),
         )
+        pending = _read_json(fr_home / PENDING_UPDATE_FILENAME)
+        target = pending["target"]
         log(f"backup created:       {backup}")
+        log(f"requested revision:   {target['requested_revision']}")
+        resolved = target.get("resolved_revision") or "unavailable (local checkout)"
+        dirty = "-dirty" if target.get("dirty") else ""
+        log(f"resolved revision:    {resolved}{dirty}")
         log("updating package...")
         _set_pending_state(fr_home, "package-replacement", "package_started_at")
         _run(pip_command, runner=runner)
@@ -327,12 +476,15 @@ def write_installed_version(
     *,
     source: str | None = None,
     requested_ref: str | None = None,
+    resolved_revision: str | None = None,
 ) -> VersionInfo:
     info = current_version()
     value = info.to_dict() | {
         "installed_at": time.time(),
         "selected_source": source,
         "selected_ref": requested_ref,
+        "resolved_revision": resolved_revision,
+        "installed_revision": info.revision,
     }
     _write_json(fr_home / INSTALLED_VERSION_FILENAME, value)
     return info
@@ -356,6 +508,16 @@ def complete_update(
     if not isinstance(target, dict):
         raise UpdateError(f"invalid target in {pending_path}")
 
+    expected_revision = target.get("resolved_revision")
+    if expected_revision is not None and not isinstance(expected_revision, str):
+        raise UpdateError(f"invalid resolved revision in {pending_path}")
+    installed_info = current_version()
+    if expected_revision and installed_info.revision != expected_revision:
+        raise UpdateError(
+            f"installed revision {installed_info.revision!r} does not match "
+            f"resolved revision {expected_revision!r}"
+        )
+
     lock: RuntimeLock | None = None
     if guard_owner_pid is None:
         lock = _refuse_if_serving(fr_home)
@@ -374,10 +536,11 @@ def complete_update(
                     else None
                 ),
                 requested_ref=(
-                    target.get("requested_ref")
-                    if isinstance(target.get("requested_ref"), str)
+                    target.get("requested_revision")
+                    if isinstance(target.get("requested_revision"), str)
                     else None
                 ),
+                resolved_revision=expected_revision,
             )
             outbox.set_meta("installed_build", info.build)
         finally:
@@ -410,6 +573,10 @@ def complete_update(
             lock.release()
 
     log(f"updated build:        {build_identity()}")
+    requested = target.get("requested_revision") or "unspecified"
+    installed = installed_info.revision or "unknown"
+    log(f"requested revision:   {requested}")
+    log(f"installed revision:   {installed}")
     log(f"installation id:      {installation_id}")
     log(f"hook refreshed:       {hook_dir}")
     log("restart the Hermes gateway, then restart `hermes-flight-recorder serve`.")
@@ -425,6 +592,7 @@ __all__ = [
     "UpdateError",
     "complete_update",
     "prepare_update",
+    "resolve_git_revision",
     "update",
     "write_installed_version",
 ]
