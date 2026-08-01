@@ -36,6 +36,7 @@ from hermes_flight_recorder.collector.transport import (
     RetryableTransportError,
     RetryingTransport,
     TerminalTransportError,
+    TransportCancelled,
     TransportError,
     push,
 )
@@ -307,6 +308,47 @@ def test_jitter_never_exceeds_capped_ceiling():
         retrying.send(a_batch())
     assert max(delays) <= 8.0
     assert delays == [1.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0, 8.0, 8.0]
+
+
+def test_shutdown_cancels_retry_wait():
+    entered_retry = threading.Event()
+    cancel = threading.Event()
+    errors: list[Exception] = []
+
+    class _OfflineTransport:
+        calls = 0
+
+        def send(self, batch):
+            self.calls += 1
+            entered_retry.set()
+            raise RetryableTransportError("offline")
+
+    inner = _OfflineTransport()
+    retrying = RetryingTransport(
+        inner,
+        max_attempts=5,
+        base_delay=30.0,
+        max_delay=30.0,
+        rng=lambda: 1.0,
+        cancel_event=cancel,
+    )
+
+    def send() -> None:
+        try:
+            retrying.send(a_batch())
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=send)
+    thread.start()
+    assert entered_retry.wait(1.0)
+    cancel.set()
+    thread.join(1.0)
+
+    assert not thread.is_alive()
+    assert inner.calls == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], TransportCancelled)
 
 
 # --------------------------------------------------------------------------

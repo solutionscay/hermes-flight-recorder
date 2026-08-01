@@ -83,6 +83,34 @@ def test_second_sync_only_sends_records_after_delivery_cursor(tmp_path):
     outbox.close()
 
 
+def test_sync_tick_stops_after_configured_batch_limit(tmp_path):
+    outbox = new_outbox(tmp_path)
+    append_n(outbox, 7)
+    transport = InMemoryTransport()
+
+    first = sync(outbox, transport, max_records=2, max_batches=2)
+
+    assert [len(batch["records"]) for batch in transport.batches] == [2, 2]
+    assert first.records_sent == 4
+    assert first.delivery_cursor == 4
+    assert first.pending == 3
+
+    second = sync(outbox, transport, max_records=2, max_batches=2)
+
+    assert [len(batch["records"]) for batch in transport.batches] == [2, 2, 2, 1]
+    assert second.records_sent == 3
+    assert second.delivery_cursor == 7
+    assert second.pending == 0
+    outbox.close()
+
+
+def test_sync_rejects_non_positive_batch_limit(tmp_path):
+    outbox = new_outbox(tmp_path)
+    with pytest.raises(ValueError, match="max_batches"):
+        sync(outbox, InMemoryTransport(), max_batches=0)
+    outbox.close()
+
+
 class CrashBeforeAck:
     def __init__(self, sink: InMemoryTransport):
         self.sink = sink
