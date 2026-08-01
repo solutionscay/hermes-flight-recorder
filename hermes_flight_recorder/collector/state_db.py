@@ -138,7 +138,8 @@ def poll(
     session parent/profile maps are still built from every row so post-horizon
     activity in an older session keeps its attribution.
     """
-    db_path = state_db_path(resolve_hermes_home(hermes_home))
+    home = resolve_hermes_home(hermes_home)
+    db_path = state_db_path(home)
     if not db_path.exists():
         raise FileNotFoundError(f"state.db not found at {db_path}")
 
@@ -167,6 +168,7 @@ def poll(
             home_mode,
             capture,
             knowledge_config,
+            home,
             since,
         )
         _poll_model_usage(
@@ -271,6 +273,7 @@ def _poll_messages(
     home_mode,
     capture_config,
     knowledge_config,
+    hermes_home,
     since=None,
 ) -> None:
     cursor = int(outbox.get_cursor(_MESSAGE_CURSOR) or 0)
@@ -414,6 +417,7 @@ def _poll_messages(
             home_mode,
             counts,
             knowledge_config,
+            hermes_home,
         )
 
     outbox.set_cursor(_MESSAGE_CURSOR, last_seen_id)
@@ -783,6 +787,7 @@ def _capture_knowledge_mutation(
     home_mode: str,
     counts: dict[str, int],
     knowledge_config: Any,
+    hermes_home: Path,
 ) -> None:
     """Pair one knowledge tool result with its assistant tool-call arguments."""
     tool_name = tool_row["tool_name"]
@@ -828,6 +833,7 @@ def _capture_knowledge_mutation(
         invocation_id=invocation_id,
         profile=profile,
         knowledge_config=knowledge_config,
+        hermes_home=hermes_home,
     )
     for event_type, count in emitted.items():
         counts[event_type] += count

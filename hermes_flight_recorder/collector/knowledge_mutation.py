@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ._common import build_record, runtime_stamp
-from .knowledge_store import _apply_retention
+from .knowledge_store import _apply_retention, iter_disk_artifacts
+from .keystore import has_secret
 
 SKILL_ACTIONS = {
     "create",
@@ -36,6 +38,7 @@ def capture(
     invocation_id: str | None,
     profile: str,
     knowledge_config: Any,
+    hermes_home: str | Path | None = None,
 ) -> dict[str, int]:
     """Record one paired and successful ``skill_manage`` or ``memory`` call."""
     if knowledge_config is None:
@@ -73,7 +76,7 @@ def capture(
     if outbox.has_dedup_key(dedup_key):
         return {}
 
-    version = _record_version(
+    version, version_files = _record_version(
         outbox,
         artifact=artifact,
         action=action,
@@ -81,6 +84,7 @@ def capture(
         result=result,
         occurred_at=occurred_at,
         knowledge_config=knowledge_config,
+        hermes_home=hermes_home,
     )
     payload = _event_payload(
         outbox=outbox,
@@ -90,6 +94,7 @@ def capture(
         tool_result_row_id=tool_result_row_id,
         tool_call_id=tool_call_id,
         version=version,
+        version_files=version_files,
         arguments=arguments,
     )
     record = build_record(
@@ -277,10 +282,18 @@ def _record_version(
     result: dict[str, Any],
     occurred_at: float,
     knowledge_config: Any,
-) -> dict[str, Any] | None:
-    files = _after_state(outbox, artifact, action, arguments, result)
+    hermes_home: str | Path | None,
+) -> tuple[dict[str, Any] | None, dict[str, bytes] | None]:
+    files = _after_state(
+        outbox,
+        artifact,
+        action,
+        arguments,
+        result,
+        hermes_home=hermes_home,
+    )
     if files is None:
-        return None
+        return None, None
 
     manifest = [
         {"path": path, "blob_hash": outbox.put_blob(content)}
@@ -311,7 +324,11 @@ def _record_version(
         ),
         None,
     )
-    return version
+    if is_tombstone:
+        outbox._knowledge_plaintext.pop(artifact["artifact_id"], None)
+    else:
+        outbox._knowledge_plaintext[artifact["artifact_id"]] = dict(files)
+    return version, files
 
 
 def _after_state(
@@ -320,20 +337,56 @@ def _after_state(
     action: str,
     arguments: dict[str, Any],
     result: dict[str, Any],
+    *,
+    hermes_home: str | Path | None,
 ) -> dict[str, bytes] | None:
     if artifact["kind"] == "skill":
-        return _skill_after_state(outbox, artifact["artifact_id"], action, arguments)
-    return _memory_after_state(outbox, artifact, action, arguments, result)
+        return _skill_after_state(
+            outbox,
+            artifact["artifact_id"],
+            action,
+            arguments,
+            hermes_home=hermes_home,
+        )
+    return _memory_after_state(
+        outbox,
+        artifact,
+        action,
+        arguments,
+        result,
+        hermes_home=hermes_home,
+    )
 
 
 def _latest_files(outbox: Any, artifact_id: str) -> dict[str, bytes] | None:
+    cached = outbox._knowledge_plaintext.get(artifact_id)
+    if cached is not None:
+        return dict(cached)
     latest = outbox.latest_knowledge_version(artifact_id)
     if latest is None or latest["is_tombstone"]:
         return None
-    return {
+    if not has_secret(outbox._flight_recorder_home):
+        return None
+    files = {
         entry["path"]: outbox.get_blob(entry["blob_hash"])
         for entry in latest["manifest"]
     }
+    outbox._knowledge_plaintext[artifact_id] = dict(files)
+    return files
+
+
+def _disk_files(
+    hermes_home: str | Path | None, artifact_id: str
+) -> dict[str, bytes] | None:
+    """Read the current after-state when a fleet host cannot decrypt its store."""
+    if hermes_home is None:
+        return None
+    for found_id, _kind, _name, _category, files in iter_disk_artifacts(
+        Path(hermes_home)
+    ):
+        if found_id == artifact_id:
+            return {relative: path.read_bytes() for relative, path in files}
+    return None
 
 
 def _skill_after_state(
@@ -341,6 +394,8 @@ def _skill_after_state(
     artifact_id: str,
     action: str,
     arguments: dict[str, Any],
+    *,
+    hermes_home: str | Path | None,
 ) -> dict[str, bytes] | None:
     if action == "delete":
         return {}
@@ -350,7 +405,9 @@ def _skill_after_state(
 
     files = _latest_files(outbox, artifact_id)
     if files is None:
-        return None
+        # Hermes has already applied the tool call when the result reaches
+        # state.db. The disk snapshot is therefore the complete after-state.
+        return _disk_files(hermes_home, artifact_id)
     if action == "edit":
         content = arguments.get("content")
         if not isinstance(content, str):
@@ -399,9 +456,15 @@ def _memory_after_state(
     action: str,
     arguments: dict[str, Any],
     result: dict[str, Any],
+    *,
+    hermes_home: str | Path | None,
 ) -> dict[str, bytes] | None:
     filename = "USER.md" if artifact["name"] == "user" else "MEMORY.md"
+    latest = outbox.latest_knowledge_version(artifact["artifact_id"])
     files = _latest_files(outbox, artifact["artifact_id"])
+    if files is None and latest is not None and not latest["is_tombstone"]:
+        # Use Hermes's current file as the after-state on a public-only host.
+        return _disk_files(hermes_home, artifact["artifact_id"])
     had_base = files is not None and filename in files
     if had_base:
         entries = _memory_entries(files[filename])
@@ -475,6 +538,7 @@ def _event_payload(
     tool_result_row_id: int,
     tool_call_id: str,
     version: dict[str, Any] | None,
+    version_files: dict[str, bytes] | None,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -501,10 +565,7 @@ def _event_payload(
             ]
 
     if version is not None:
-        byte_count = sum(
-            len(outbox.get_blob(entry["blob_hash"]))
-            for entry in version["manifest"]
-        )
+        byte_count = sum(len(content) for content in (version_files or {}).values())
         payload.update(
             {
                 "artifact_version_ref": (

@@ -14,7 +14,9 @@ import json
 import os
 from pathlib import Path
 
-from hermes_flight_recorder.collector import knowledge_store
+import pytest
+
+from hermes_flight_recorder.collector import keystore, knowledge_store
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.recorder_config import KnowledgeConfig
 from hermes_flight_recorder.collector.sync import (
@@ -382,6 +384,92 @@ def test_bundle_excludes_paths_that_are_not_safe_relative_posix_paths(tmp_path):
 
     bundle = json.loads(ob.decrypt_content(knowledge_events(ob)[0]))
     assert [entry["path"] for entry in bundle["files"]] == ["SKILL.md"]
+
+
+def test_skill_scan_rejects_file_symlink_outside_artifact(tmp_path):
+    home = tmp_path / "hermes"
+    skill = write_skill(home / "skills", "safe", "# safe\n")
+    outside = tmp_path / "secret.txt"
+    write(outside, "must not be captured\n")
+    (skill / "assets").mkdir()
+    (skill / "assets" / "linked.txt").symlink_to(outside)
+    ob = new_outbox(tmp_path)
+
+    knowledge_store.poll(ob, home)
+
+    bundle = json.loads(ob.decrypt_content(knowledge_events(ob)[0]))
+    assert [entry["path"] for entry in bundle["files"]] == ["SKILL.md"]
+
+
+def test_skill_scan_rejects_directory_symlink_outside_artifact(tmp_path):
+    home = tmp_path / "hermes"
+    skill = write_skill(home / "skills", "safe", "# safe\n")
+    outside = tmp_path / "outside-assets"
+    write(outside / "secret.txt", "must not be captured\n")
+    (skill / "assets").symlink_to(outside, target_is_directory=True)
+    ob = new_outbox(tmp_path)
+
+    knowledge_store.poll(ob, home)
+
+    bundle = json.loads(ob.decrypt_content(knowledge_events(ob)[0]))
+    assert [entry["path"] for entry in bundle["files"]] == ["SKILL.md"]
+
+
+def test_memory_scan_rejects_symlink_outside_memory_root(tmp_path):
+    home = tmp_path / "hermes"
+    outside = tmp_path / "secret-memory.md"
+    write(outside, "must not be captured\n")
+    (home / "memories").mkdir(parents=True)
+    (home / "memories" / "MEMORY.md").symlink_to(outside)
+    ob = new_outbox(tmp_path)
+
+    assert knowledge_store.poll(ob, home) == {}
+    assert ob.knowledge_artifact_ids() == []
+
+
+def test_normal_nested_skill_files_still_restore_byte_for_byte(tmp_path):
+    home = tmp_path / "hermes"
+    binary = bytes(range(256))
+    skill = write_skill(home / "skills", "nested", "# nested\n")
+    asset = skill / "assets" / "nested" / "bytes.bin"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(binary)
+    ob = new_outbox(tmp_path)
+
+    knowledge_store.poll(ob, home)
+
+    restored = knowledge_store.restore_version(ob, "skill:nested")
+    assert restored == {
+        "SKILL.md": b"# nested\n",
+        "assets/nested/bytes.bin": binary,
+    }
+
+
+def test_fleet_agent_captures_and_sends_bundle_with_public_key_only(
+    tmp_path, monkeypatch
+):
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    keypair = keystore.mint_operator_keypair(operator)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    keystore.write_public_key(bridge, keypair.public)
+    home = tmp_path / "hermes"
+    write_skill(home / "skills", "fleet", "# fleet\n")
+    ob = new_outbox(tmp_path)
+    monkeypatch.setattr(
+        ob,
+        "get_blob",
+        lambda *_args, **_kwargs: pytest.fail("fleet capture tried to decrypt a blob"),
+    )
+
+    counts = knowledge_store.poll(ob, home)
+
+    assert counts == {knowledge_store.KNOWLEDGE_EVENT: 1}
+    assert not keystore.has_secret(bridge)
+    event = knowledge_events(ob)[0]
+    bundle = json.loads(ob.decrypt_content(event, keypair=keypair))
+    assert base64.b64decode(bundle["files"][0]["content_b64"]) == b"# fleet\n"
 
 
 def test_knowledge_bundle_v1_matches_the_compatibility_fixture(tmp_path):
