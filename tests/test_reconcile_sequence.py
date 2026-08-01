@@ -158,26 +158,41 @@ def test_contiguous_run_of_missing_integers_emits_one_finding_each(tmp_path):
         assert g["partial"] is False
 
 
-# --- no gap at the tail ------------------------------------------------------
-def test_dropped_tail_sequence_is_undetectable(tmp_path):
-    """Deleting the highest sequence leaves no trailing bracket.
-
-    _detect_sequence_gaps only scans between adjacent surviving sequence
-    numbers. If the dropped capture was the very last one appended, removing
-    it also removes the right-hand neighbor, so the hole simply vanishes from
-    the scan: a producer stopping at
-    sequence 4 is indistinguishable from a producer that also emitted (and
-    then lost) sequence 5. This is a real, inherent limitation of a
-    high-water-mark scan, not a bug: without an authoritative record of how
-    far the sequence *should* extend, "no gap at the tail" is unknowable.
-    """
+# --- range boundaries -------------------------------------------------------
+def test_dropped_first_sequence_produces_a_leading_gap(tmp_path):
     ob = new_outbox(tmp_path)
-    append_n(ob, 5)  # producer_sequence 1..5
-    delete_sequence(ob, 5)  # drop the tail entry
+    append_n(ob, 5)
+    delete_sequence(ob, 1)
 
     run_reconcile(ob, tmp_path)
 
-    assert gap_findings(ob) == []
+    gaps = gap_findings(ob)
+    assert len(gaps) == 1
+    assert gaps[0]["payload"] == {
+        "event_type": "reconcile.gap_detected",
+        "gap_kind": "sequence",
+        "missing_sequence": 1,
+        "prev_sequence": 0,
+        "next_sequence": 2,
+    }
+
+
+def test_dropped_tail_sequence_produces_a_trailing_gap(tmp_path):
+    ob = new_outbox(tmp_path)
+    append_n(ob, 5)
+    delete_sequence(ob, 5)
+
+    run_reconcile(ob, tmp_path)
+
+    gaps = gap_findings(ob)
+    assert len(gaps) == 1
+    assert gaps[0]["payload"] == {
+        "event_type": "reconcile.gap_detected",
+        "gap_kind": "sequence",
+        "missing_sequence": 5,
+        "prev_sequence": 4,
+        "next_sequence": 6,
+    }
 
 
 # --- empty / single-event outboxes ------------------------------------------
@@ -200,11 +215,50 @@ def test_single_event_outbox_produces_no_gap_findings(tmp_path):
     assert gap_findings(ob) == []
 
 
+def test_damaged_high_water_has_a_bounded_finding_count(tmp_path):
+    ob = new_outbox(tmp_path)
+    append_event(ob, "session.created")
+    ob._conn.execute(
+        "UPDATE seq SET high_water=? WHERE installation_id=?",
+        (10**12, ob.installation_id),
+    )
+
+    counts = run_reconcile(
+        ob,
+        tmp_path,
+        config=ReconcileConfig(sequence_gap_limit=3),
+    )
+
+    assert counts == {"reconcile.gap_detected": 3}
+    assert [
+        gap["payload"]["missing_sequence"] for gap in gap_findings(ob)
+    ] == [2, 3, 4]
+
+
+def test_concurrent_append_after_high_water_snapshot_is_not_a_tail_gap(
+    tmp_path, monkeypatch
+):
+    ob = new_outbox(tmp_path)
+    append_event(ob, "session.created")
+    read_high_water = ob.high_water
+
+    def append_then_read_high_water(installation_id=None):
+        append_event(ob, "session.created")
+        return read_high_water(installation_id)
+
+    monkeypatch.setattr(ob, "high_water", append_then_read_high_water)
+
+    counts = run_reconcile(ob, tmp_path)
+
+    assert counts == {}
+    assert gap_findings(ob) == []
+
+
 # --- brackets and partial flag ----------------------------------------------
 def test_prev_and_next_sequence_are_never_none_for_a_detected_gap(tmp_path):
-    """A detected hole is always strictly between lo and hi, so it always
-    has a surviving neighbour on both sides -- prev_sequence/next_sequence
-    can never be None for an emitted sequence-gap finding.
+    """A detected hole has a stored sequence or a range boundary on each side.
+
+    Thus, ``prev_sequence`` and ``next_sequence`` are always integers.
     """
     ob = new_outbox(tmp_path)
     append_n(ob, 6)  # producer_sequence 1..6

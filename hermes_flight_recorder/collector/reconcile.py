@@ -127,6 +127,10 @@ class ReconcileConfig:
     once_match_slack: float = 300.0
     # Bound the cron-expression lookback so instant expansion stays cheap.
     cron_lookback: float = 24 * 3600.0
+    # A damaged producer high-water can claim an impractically large missing
+    # range. Limit the number of sequence findings emitted in one pass so the
+    # reconciler has bounded work and cannot create an unbounded write storm.
+    sequence_gap_limit: int = 10_000
 
 
 def reconcile(
@@ -147,9 +151,12 @@ def reconcile(
     installation_id = outbox.installation_id
     horizon = _install_horizon(outbox)
 
-    # Snapshot the retained stream and compact retention summaries once,
-    # before any emission, so findings appended this pass never perturb
-    # detection. Summaries keep intentionally pruned sequences and durable
+    # Read the high-water before the stream. A concurrent append can then be
+    # present but outside this pass's range. It cannot advance the boundary
+    # after the stream snapshot and create a false trailing gap.
+    sequence_high_water = outbox.high_water(installation_id)
+    # Snapshot the retained stream and compact retention summaries once before
+    # any emission. Summaries keep intentionally pruned sequences and durable
     # subjects from looking like capture loss without restoring event bodies.
     events = list(outbox.iter_events(installation_id))
     events.extend(outbox.iter_pruned_summaries(installation_id))
@@ -157,7 +164,15 @@ def reconcile(
     exec_rows = _load_execution_rows(home)
     counts: dict[str, int] = defaultdict(int)
 
-    _detect_sequence_gaps(outbox, events, installation_id, counts, when)
+    _detect_sequence_gaps(
+        outbox,
+        events,
+        installation_id,
+        counts,
+        when,
+        sequence_high_water,
+        cfg.sequence_gap_limit,
+    )
     _detect_coverage_gaps(
         outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
     )
@@ -195,9 +210,30 @@ def _install_horizon(outbox: Any) -> float:
 
 
 # --- sequence gaps ------------------------------------------------------
-def _detect_sequence_gaps(outbox, events, installation_id, counts, when) -> None:
-    seqs = sorted(e["producer_sequence"] for e in events)
-    for prev_seq, next_seq in zip(seqs, seqs[1:]):
+def _detect_sequence_gaps(
+    outbox, events, installation_id, counts, when, high_water, finding_limit
+) -> None:
+    """Report absent sequences from 1 through the durable high-water mark.
+
+    Zero and ``high_water + 1`` are range boundaries. They keep the existing
+    integer bracket fields useful for leading and trailing gaps. The finding
+    limit bounds both iteration and writes if the durable high-water is
+    damaged.
+    """
+    if finding_limit <= 0:
+        return
+
+    high_water = max(0, high_water)
+    seqs = sorted(
+        {
+            event["producer_sequence"]
+            for event in events
+            if 1 <= event["producer_sequence"] <= high_water
+        }
+    )
+    boundaries = [0, *seqs, high_water + 1]
+    emitted = 0
+    for prev_seq, next_seq in zip(boundaries, boundaries[1:]):
         for missing in range(prev_seq + 1, next_seq):
             _emit(
                 outbox,
@@ -214,6 +250,9 @@ def _detect_sequence_gaps(outbox, events, installation_id, counts, when) -> None
                 },
                 dedup_key=f"reconcile:seq:{installation_id}:{missing}",
             )
+            emitted += 1
+            if emitted >= finding_limit:
+                return
 
 
 # --- coverage gaps ------------------------------------------------------
