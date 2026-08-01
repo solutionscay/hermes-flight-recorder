@@ -15,20 +15,22 @@ from pathlib import Path
 import pytest
 
 from hermes_flight_recorder import cli
-from hermes_flight_recorder.collector import lifecycle
 from hermes_flight_recorder.collector.hook import baked_flight_recorder_home
 from hermes_flight_recorder.collector.outbox import Outbox
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
+def _clean_env(tmp_path, monkeypatch):
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
 
 
 def _hermes(tmp_path) -> Path:
     hermes = tmp_path / "hermes"
-    hermes.mkdir()
+    hermes.mkdir(parents=True)
     (hermes / "config.yaml").write_text("terminal:\n  home_mode: auto\n")
     return hermes
 
@@ -101,16 +103,45 @@ def test_install_missing_hermes_home_fails(tmp_path, capsys):
     assert "does not exist" in capsys.readouterr().err
 
 
-def test_install_stops_on_legacy_data(tmp_path, capsys, monkeypatch):
-    hermes = _hermes(tmp_path)
-    legacy = tmp_path / "legacy"
+def test_default_install_stops_on_legacy_data(tmp_path, capsys):
+    hermes = Path.home() / ".hermes"
+    hermes.mkdir()
+    (hermes / "config.yaml").write_text("terminal:\n  home_mode: auto\n")
+    legacy = Path.home() / ".hermes-flight-recorder"
     legacy.mkdir()
     (legacy / "outbox.sqlite").write_text("legacy db")
-    monkeypatch.setattr(lifecycle, "_legacy_home", lambda: legacy)
 
-    rc = cli.main(["install", "--hermes-home", str(hermes)])
+    rc = cli.main(["install"])
     assert rc == 2
     err = capsys.readouterr().err
     assert "legacy Flight Recorder data" in err
     # Nothing was created at the target.
     assert not (hermes / "flight-recorder" / "outbox.sqlite").exists()
+
+
+def test_explicit_hermes_homes_ignore_default_legacy_data(tmp_path):
+    legacy = Path.home() / ".hermes-flight-recorder"
+    legacy.mkdir()
+    (legacy / "outbox.sqlite").write_text("legacy db")
+
+    first = _hermes(tmp_path / "first")
+    second = _hermes(tmp_path / "second")
+
+    assert cli.main(["install", "--hermes-home", str(first)]) == 0
+    assert cli.main(["install", "--hermes-home", str(second)]) == 0
+
+    first_recorder = first / "flight-recorder"
+    second_recorder = second / "flight-recorder"
+    first_outbox = Outbox.open(first_recorder)
+    second_outbox = Outbox.open(second_recorder)
+    try:
+        assert first_outbox.installation_id != second_outbox.installation_id
+    finally:
+        first_outbox.close()
+        second_outbox.close()
+    assert Path(
+        baked_flight_recorder_home(first / "hooks" / "hermes-flight-recorder")
+    ).resolve() == first_recorder.resolve()
+    assert Path(
+        baked_flight_recorder_home(second / "hooks" / "hermes-flight-recorder")
+    ).resolve() == second_recorder.resolve()
