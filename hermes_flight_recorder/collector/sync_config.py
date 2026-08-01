@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import atomic_file
 from ._common import default_flight_recorder_home
 
 CONFIG_FILENAME = "sync-config.json"
@@ -146,14 +147,10 @@ def save(
         "cf_access_client_secret": config.cf_access_client_secret,
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    # Create the file private before any bytes land in it.
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, text.encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.chmod(path, 0o600)
-    return path
+        return atomic_file.atomic_write(path, text.encode("utf-8"), mode=0o600)
+    except OSError as exc:
+        raise SyncConfigError(f"cannot write sync config at {path}: {exc}") from exc
 
 
 def configure(

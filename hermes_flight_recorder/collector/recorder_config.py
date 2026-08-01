@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import atomic_file
 from ._common import default_flight_recorder_home
 from .sync import DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS, MAX_INGEST_BATCH_BYTES
 
@@ -267,7 +268,7 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
 def save(
     config: RecorderConfig, flight_recorder_home: str | os.PathLike[str] | None = None
 ) -> Path:
-    """Write config atomically enough for local use, with mode ``0600``."""
+    """Write the config durably and atomically with mode ``0600``."""
     path = config_path(flight_recorder_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -303,13 +304,12 @@ def save(
         },
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, text.encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.chmod(path, 0o600)
-    return path
+        return atomic_file.atomic_write(path, text.encode("utf-8"), mode=0o600)
+    except OSError as exc:
+        raise RecorderConfigError(
+            f"cannot write recorder config at {path}: {exc}"
+        ) from exc
 
 
 def _read_file(path: Path) -> dict[str, Any]:

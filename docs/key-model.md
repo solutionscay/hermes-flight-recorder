@@ -90,9 +90,12 @@ removed private key if that box wrote content you still need to read.
 ## Rotation
 
 Rotation is **forward-only**. `keygen --rotate` retires the current keypair —
-both halves are moved under `retired-keys/<timestamp>/` and **never deleted** —
-then mints a fresh keypair as current. New content seals to the new key; old
-content stays sealed to the old key.
+both halves are copied under `retired-keys/<timestamp>/` and **never deleted**.
+The private file is the commit record for each key pair. If a process stops
+before it replaces the public file, the recorder rebuilds that file from the
+private key on the next load. The current pair stays in place until the retired
+copy is durable. The command then mints a fresh keypair as current. New content
+seals to the new key. Old content stays sealed to the old key.
 
 Retaining old private keys to read history is correct, not a weakness: anyone
 who already had the old key and the old ciphertext could read it, so
