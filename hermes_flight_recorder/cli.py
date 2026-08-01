@@ -871,7 +871,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_update.add_argument(
         "--ref",
         default=None,
-        help="Git branch, tag, or commit to install from a git+ source.",
+        help="Required for Git sources. Give a release tag, branch, or full commit.",
     )
     p_update.add_argument(
         "--editable",

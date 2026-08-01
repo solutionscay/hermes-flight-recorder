@@ -223,18 +223,22 @@ Stop the `serve` process through the service manager that runs it. The updater
 does not stop or restart systemd, launchd, a Windows service, or the Hermes
 gateway.
 
-Update to the default branch of the public repository:
-
-```bash
-hermes-flight-recorder update --hermes-home "<HERMES_HOME>"
-```
-
-To test a branch, tag, or commit before release, select it explicitly:
+Update to a release tag or a full commit. The updater resolves a tag to its
+full commit before it changes the package:
 
 ```bash
 hermes-flight-recorder update \
   --hermes-home "<HERMES_HOME>" \
-  --ref "<BRANCH_TAG_OR_COMMIT>"
+  --ref "<RELEASE_TAG_OR_FULL_COMMIT>"
+```
+
+You can select a branch for a test update. The updater records and installs the
+commit that the branch points to at the start of the update:
+
+```bash
+hermes-flight-recorder update \
+  --hermes-home "<HERMES_HOME>" \
+  --ref "<BRANCH>"
 ```
 
 To test the current contents of a local checkout, including uncommitted changes,
@@ -257,7 +261,8 @@ consistent SQLite backup, the operator key files, recorder and sync configuratio
 the installed-version record, and the old hook.
 
 After pip installs the selected source, a new Python process applies registered
-outbox migrations, regenerates the hook, records the exact package build, and
+outbox migrations, regenerates the hook, and records the installed revision.
+The process stops if that revision differs from the resolved revision. It then
 verifies the installation. The installation id, key, events, delivery state,
 capture cursors, and configuration remain in place unless a documented schema
 migration deliberately changes an identity.
@@ -316,5 +321,6 @@ Hermes hook, and the protocol documents are Apache-2.0. Hermes DBaaS is a
 separate hosted product.
 
 For technical detail, read the [development setup](docs/dev-setup.md), the
+[release process](docs/release.md), the
 [event envelope](docs/schema/envelope-v1.md), and the
 [ingestion protocol](docs/schema/ingestion-protocol-v1.md).
