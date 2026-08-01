@@ -282,37 +282,45 @@ def _poll_messages(
         for role in ("user", "assistant", "tool")
         if role in capture_config.message_roles
     )
-    if supported_roles:
-        placeholders = ",".join("?" for _ in supported_roles)
-        columns = sqlite_table_columns(conn, "messages")
-        select_cols = ", ".join(
-            sqlite_column_or_default(columns, name)
-            for name in (
-                "id",
-                "session_id",
-                "role",
-                "tool_name",
-                "tool_call_id",
-                "effect_disposition",
-                "content",
-                "timestamp",
-                "finish_reason",
-                "tool_calls",
-            )
+    columns = sqlite_table_columns(conn, "messages")
+    select_cols = ", ".join(
+        sqlite_column_or_default(columns, name)
+        for name in (
+            "id",
+            "session_id",
+            "role",
+            "tool_name",
+            "tool_call_id",
+            "effect_disposition",
+            "content",
+            "timestamp",
+            "finish_reason",
+            "tool_calls",
         )
-        rows = conn.execute(
-            f"SELECT {select_cols} FROM messages "
-            f"WHERE id > ? AND role IN ({placeholders}) ORDER BY id",
-            (cursor, *supported_roles),
-        ).fetchall()
-    else:
-        rows = []
+    )
 
-    last_seen_id = cursor
+    # Bind the high-water mark and selected rows to one SQLite snapshot.
+    # End the read transaction before outbox writes so Hermes writers do not
+    # wait for message processing to finish in rollback-journal mode.
+    conn.execute("BEGIN")
+    try:
+        snapshot_max = int(
+            conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
+        )
+        upper_bound = max(cursor, snapshot_max)
+        if supported_roles:
+            placeholders = ",".join("?" for _ in supported_roles)
+            rows = conn.execute(
+                f"SELECT {select_cols} FROM messages "
+                f"WHERE id > ? AND id <= ? AND role IN ({placeholders}) ORDER BY id",
+                (cursor, upper_bound, *supported_roles),
+            ).fetchall()
+        else:
+            rows = []
+    finally:
+        conn.rollback()
+
     for r in rows:
-        # Advance only through this query's snapshot. A separate MAX(id)
-        # query can see a row inserted after the snapshot and skip it forever.
-        last_seen_id = max(last_seen_id, int(r["id"]))
         if occurred_before(since, r["timestamp"]):
             continue  # predates the capture horizon; cursor still advances
         sid = r["session_id"]
@@ -420,7 +428,8 @@ def _poll_messages(
             hermes_home,
         )
 
-    outbox.set_cursor(_MESSAGE_CURSOR, last_seen_id)
+    # Move the cursor only after every row in this snapshot was processed.
+    outbox.set_cursor(_MESSAGE_CURSOR, upper_bound)
 
 
 def _poll_model_usage(
