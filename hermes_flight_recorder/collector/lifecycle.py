@@ -103,13 +103,14 @@ def install(
             f"namespaced 'flight-recorder' child"
         )
 
-    # Legacy detection guards the default-path user. An explicit
-    # --flight-recorder-home (or SC_HERMES_FLIGHT_RECORDER_HOME) is a deliberate
-    # location choice, so there is nothing to warn about.
-    using_default = not flight_recorder_home and not os.environ.get(
-        "SC_HERMES_FLIGHT_RECORDER_HOME"
-    )
-    if using_default:
+    # The legacy path belongs only to the default Hermes installation. Do not
+    # let data in one user's default home block another Hermes installation.
+    default_hermes = Path.home() / ".hermes"
+    if (
+        not flight_recorder_home
+        and not os.environ.get("SC_HERMES_FLIGHT_RECORDER_HOME")
+        and hermes.resolve() == default_hermes.resolve()
+    ):
         _stop_if_legacy_present(fr_home, log=log)
 
     fr_home.mkdir(mode=0o700, parents=True, exist_ok=True)

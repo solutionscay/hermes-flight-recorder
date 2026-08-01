@@ -16,7 +16,10 @@ from hermes_flight_recorder.collector.runtime_lock import RuntimeLock
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
+def _clean_env(tmp_path, monkeypatch):
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
 
