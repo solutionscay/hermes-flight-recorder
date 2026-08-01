@@ -39,7 +39,11 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     write_config(
         tmp_path,
         {
-            "capture": {"max_content_bytes": 10, "message_roles": ["user"]},
+            "capture": {
+                "max_content_bytes": 10,
+                "message_roles": ["user"],
+                "sources": {"hook": True, "cron": False},
+            },
             "retention": {"enabled": False, "max_age_days": 3},
             "sync": {
                 "interval_seconds": 10,
@@ -56,6 +60,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     monkeypatch.setenv("HFR_SYNC_MAX_RECORDS", "50")
     monkeypatch.setenv("HFR_SYNC_MAX_BATCHES_PER_TICK", "4")
     monkeypatch.setenv("HFR_CAPTURE_MESSAGE_ROLES", '["assistant", "tool"]')
+    monkeypatch.setenv("HFR_CAPTURE_SOURCES", '{"hook": false, "knowledge": true}')
     monkeypatch.setenv("HFR_KNOWLEDGE_HISTORY", "latest_only")
     monkeypatch.setenv("HFR_KNOWLEDGE_MAX_VERSIONS", "5")
 
@@ -63,6 +68,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
 
     assert config.capture.max_content_bytes == 20
     assert config.capture.message_roles == ("assistant", "tool")
+    assert config.capture.sources == {"hook": False, "knowledge": True}
     assert config.retention.enabled is True
     assert config.knowledge.history == "latest_only"
     assert config.knowledge.max_versions == 5
@@ -83,6 +89,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
         ({"sync": {"max_batches_per_tick": 0}}, "sync.max_batches_per_tick"),
         ({"capture": {"message_roles": "user"}}, "message_roles"),
         ({"capture": {"sources": {"hook": "yes"}}}, "capture.sources"),
+        ({"capture": {"sources": {"hooks": True}}}, "unknown source.*hooks"),
         ({"knowledge": {"history": "some"}}, "knowledge.history"),
         ({"knowledge": {"max_versions": 0}}, "knowledge.max_versions"),
     ],
@@ -104,6 +111,22 @@ def test_save_writes_private_file_and_round_trips(tmp_path):
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert recorder_config.load(tmp_path) == config
+
+
+def test_unknown_environment_source_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("HFR_CAPTURE_SOURCES", '{"cron_db": false}')
+
+    with pytest.raises(
+        recorder_config.RecorderConfigError, match="unknown source.*cron_db"
+    ):
+        recorder_config.load(tmp_path)
+
+
+def test_direct_capture_config_rejects_unknown_source():
+    with pytest.raises(
+        recorder_config.RecorderConfigError, match="unknown source.*hooks"
+    ):
+        recorder_config.CaptureConfig(sources={"hooks": False})
 
 
 # --- serve intervals (issue #101) ---------------------------------------

@@ -28,6 +28,14 @@ DEFAULT_MESSAGE_ROLES = ("user", "assistant", "tool")
 DEFAULT_CAPTURE_INTERVAL_SECONDS = 15.0
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 60.0
 DEFAULT_SYNC_MAX_BATCHES_PER_TICK = 1
+CAPTURE_SOURCE_NAMES = (
+    "hook",
+    "state_db",
+    "cron",
+    "kanban",
+    "gateway_log",
+    "knowledge",
+)
 
 
 class RecorderConfigError(RuntimeError):
@@ -41,6 +49,9 @@ class CaptureConfig:
     sources: dict[str, bool] = field(default_factory=dict)
     # How often `serve` runs a capture pass. One-shot `run` ignores this.
     interval_seconds: float = DEFAULT_CAPTURE_INTERVAL_SECONDS
+
+    def __post_init__(self) -> None:
+        _validate_sources(self.sources)
 
 
 @dataclass(frozen=True)
@@ -360,20 +371,43 @@ def _sources(value: Any) -> dict[str, bool]:
             value = json.loads(value)
         except ValueError as exc:
             raise RecorderConfigError("capture.sources must be a JSON object") from exc
+    _validate_sources(value)
+    return dict(value)
+
+
+def _validate_sources(value: Any) -> None:
     if not isinstance(value, dict) or not all(
         isinstance(k, str) and isinstance(v, bool) for k, v in value.items()
     ):
         raise RecorderConfigError("capture.sources must map source names to booleans")
-    return dict(value)
+    unknown = sorted(set(value) - set(CAPTURE_SOURCE_NAMES))
+    if unknown:
+        names = ", ".join(repr(name) for name in unknown)
+        supported = ", ".join(CAPTURE_SOURCE_NAMES)
+        raise RecorderConfigError(
+            f"capture.sources contains unknown source(s): {names}; supported: {supported}"
+        )
+
+
+def source_enabled(config: CaptureConfig, name: str) -> bool:
+    """Return whether a supported capture source is enabled.
+
+    Missing keys are enabled so older and partial configuration files retain
+    the full capture behavior.
+    """
+    if name not in CAPTURE_SOURCE_NAMES:
+        raise RecorderConfigError(f"unknown capture source: {name}")
+    return config.sources.get(name, True)
 
 
 __all__ = [
+    "CAPTURE_SOURCE_NAMES",
     "CONFIG_FILENAME",
-    "CaptureConfig",
     "DEFAULT_CAPTURE_INTERVAL_SECONDS",
     "DEFAULT_MAX_CONTENT_BYTES",
     "DEFAULT_RECONCILE_INTERVAL_SECONDS",
     "DEFAULT_SYNC_MAX_BATCHES_PER_TICK",
+    "CaptureConfig",
     "KnowledgeConfig",
     "ReconcileRuntimeConfig",
     "RecorderConfig",
@@ -383,4 +417,5 @@ __all__ = [
     "config_path",
     "load",
     "save",
+    "source_enabled",
 ]
