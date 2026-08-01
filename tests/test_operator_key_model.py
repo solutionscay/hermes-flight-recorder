@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from hermes_flight_recorder import cli
+from hermes_flight_recorder.collector import atomic_file
 from hermes_flight_recorder.collector import content_crypto as cc
 from hermes_flight_recorder.collector import keystore
 from hermes_flight_recorder.collector.outbox import Outbox, OutboxError
@@ -176,6 +177,58 @@ def test_fleet_agent_cannot_mint_its_own_identity(tmp_path):
     keystore.write_public_key(tmp_path, keypair.public)
     with pytest.raises(keystore.KeystoreError, match="fleet agent"):
         keystore.ensure_solo_keypair(tmp_path)
+
+
+def test_keypair_recovers_public_file_after_interrupted_commit(
+    tmp_path, monkeypatch
+):
+    keypair = cc.generate_operator_keypair()
+    public = keystore.public_path(tmp_path)
+    real_replace = atomic_file.os.replace
+
+    def stop_before_public(source, destination):
+        if Path(destination) == public:
+            raise OSError("stop before public commit")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(atomic_file.os, "replace", stop_before_public)
+    with pytest.raises(keystore.KeystoreError, match="cannot commit"):
+        keystore.write_keypair(tmp_path, keypair)
+
+    assert keystore.secret_path(tmp_path).exists()
+    assert not public.exists()
+
+    monkeypatch.setattr(atomic_file.os, "replace", real_replace)
+    recovered = keystore.load_public_key(tmp_path)
+
+    assert recovered.key_id == keypair.key_id
+    assert keystore.load_keypair(tmp_path).key_id == keypair.key_id
+
+
+def test_rotation_recovers_mismatched_current_pair(tmp_path, monkeypatch):
+    old = keystore.mint_operator_keypair(tmp_path)
+    current_public = keystore.public_path(tmp_path)
+    real_replace = atomic_file.os.replace
+
+    def stop_before_current_public(source, destination):
+        if Path(destination) == current_public:
+            raise OSError("stop before current public commit")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(atomic_file.os, "replace", stop_before_current_public)
+    with pytest.raises(keystore.KeystoreError, match="cannot commit"):
+        keystore.mint_operator_keypair(tmp_path, rotate=True)
+
+    new = cc.load_keypair(keystore.secret_path(tmp_path).read_text(encoding="ascii"))
+    stale_public = cc.load_public_key(current_public.read_text(encoding="ascii"))
+    assert new.key_id != old.key_id
+    assert stale_public.key_id == old.key_id
+
+    monkeypatch.setattr(atomic_file.os, "replace", real_replace)
+    assert keystore.load_public_key(tmp_path).key_id == new.key_id
+    assert [pair.key_id for pair in keystore.retired_keypairs(tmp_path)] == [
+        old.key_id
+    ]
 
 
 # --- CLI ----------------------------------------------------------------

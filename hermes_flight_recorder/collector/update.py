@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from ..version import VersionInfo, build_identity, current_version
+from . import atomic_file
 from ._common import resolve_flight_recorder_home, resolve_hermes_home
 from .hook import HOOK_DIR_NAME, install_hook
 from .outbox import Outbox
@@ -36,22 +37,8 @@ class UpdateError(RuntimeError):
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(value, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        try:
-            os.chmod(temporary, 0o600)
-        except OSError:
-            pass
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_file.atomic_write(path, data, mode=0o600)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
