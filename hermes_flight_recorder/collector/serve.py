@@ -35,6 +35,10 @@ SERVE_ALREADY_RUNNING = 3
 # Used when a sync config is present but pins no interval: ship on this cadence
 # rather than never (an explicit `sync.interval_seconds` overrides it).
 _SYNC_FALLBACK_INTERVAL = 60.0
+# A serve request cannot hold shutdown longer than this socket timeout. The
+# retry wrapper uses the stop event, so it cancels every later wait and attempt.
+SYNC_REQUEST_TIMEOUT = 5.0
+SYNC_SHUTDOWN_TIMEOUT = 6.0
 
 _LOGGER_NAME = "hermes_flight_recorder.serve"
 
@@ -75,6 +79,7 @@ def serve(
     logger: logging.Logger | None = None,
     stop_event: threading.Event | None = None,
     install_signal_handlers: bool = True,
+    sync_shutdown_timeout: float = SYNC_SHUTDOWN_TIMEOUT,
 ) -> int:
     """Run the capture/reconcile/sync loop until signalled to stop.
 
@@ -97,12 +102,20 @@ def serve(
     restore_signals = (
         _install_signal_handlers(stop, log) if install_signal_handlers else None
     )
+    sync_worker: _SyncWorker | None = None
     try:
+        sync_run = None
+        if transport is not None:
+            if hasattr(transport, "cancel_event"):
+                transport.cancel_event = stop
+            sync_worker = _SyncWorker(outbox, transport, config, log, stop)
+            sync_worker.start()
+            sync_run = sync_worker.request
         tasks = _build_tasks(
             outbox,
             hermes_home,
             config,
-            transport,
+            sync_run,
             capture_interval,
             reconcile_interval,
             sync_interval,
@@ -116,6 +129,9 @@ def serve(
         log.info("serve stopped cleanly")
         return SERVE_OK
     finally:
+        if sync_worker is not None:
+            stop.set()
+            sync_worker.stop(sync_shutdown_timeout)
         if restore_signals is not None:
             restore_signals()
         if lock is not None:
@@ -126,7 +142,7 @@ def _build_tasks(
     outbox,
     hermes_home,
     config,
-    transport,
+    sync_run,
     capture_interval,
     reconcile_interval,
     sync_interval,
@@ -145,12 +161,70 @@ def _build_tasks(
         _Task("reconcile", rec_iv, lambda: _reconcile(outbox, hermes_home, config, log), start)
     )
 
-    if transport is not None:
+    if sync_run is not None:
         sync_iv = sync_interval or config.sync.interval_seconds or _SYNC_FALLBACK_INTERVAL
         tasks.append(
-            _Task("sync", sync_iv, lambda: _sync(outbox, transport, config, log), start)
+            _Task("sync", sync_iv, sync_run, start)
         )
     return tasks
+
+
+class _SyncWorker:
+    """Run one bounded sync tick outside the capture scheduler."""
+
+    def __init__(self, outbox, transport, config, log, stop: threading.Event):
+        self._flight_recorder_home = outbox.path.parent
+        self._transport = transport
+        self._config = config
+        self._log = log
+        self._stop = stop
+        self._requested = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="hermes-flight-recorder-sync",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def request(self) -> None:
+        """Request a tick. Multiple requests collapse while a tick runs."""
+        self._requested.set()
+
+    def stop(self, timeout: float) -> None:
+        self._requested.set()
+        self._thread.join(timeout=max(0.0, timeout))
+        if self._thread.is_alive():
+            self._log.warning(
+                "sync worker exceeded the %.1fs shutdown deadline", timeout
+            )
+
+    def _run(self) -> None:
+        from .outbox import Outbox
+
+        try:
+            outbox = Outbox.open(self._flight_recorder_home)
+        except Exception as exc:
+            self._log.exception("sync worker could not open the outbox: %s", exc)
+            return
+        try:
+            while True:
+                self._requested.wait()
+                self._requested.clear()
+                if self._stop.is_set():
+                    return
+                try:
+                    _sync(
+                        outbox,
+                        self._transport,
+                        self._config,
+                        self._log,
+                    )
+                except Exception as exc:
+                    self._log.exception("sync pass failed: %s", exc)
+        finally:
+            outbox.close()
 
 
 def _run_loop(tasks: list[_Task], stop: threading.Event, log: logging.Logger) -> None:
@@ -215,6 +289,7 @@ def _sync(outbox, transport, config, log: logging.Logger) -> None:
             transport,
             max_records=config.sync.max_records,
             max_bytes=config.sync.max_bytes,
+            max_batches=config.sync.max_batches_per_tick,
         )
     except TerminalTransportError as exc:
         log.error("sync stopped: malformed batch (client defect): %s", exc)
@@ -226,18 +301,33 @@ def _sync(outbox, transport, config, log: logging.Logger) -> None:
     if not outcome.ok:
         if outcome.reason == "auth":
             log.error("sync failed: the edge rejected the service token")
+        elif outcome.reason == "cancelled":
+            log.info("sync stopped for shutdown")
         else:
             log.warning("sync failed: the ingestion service is unreachable (buffered)")
-    _sync_content_keys(outbox, transport, log)
+    if outcome.reason == "cancelled":
+        return
+    _sync_content_keys(
+        outbox,
+        transport,
+        log,
+        max_batches=config.sync.max_batches_per_tick,
+    )
     _maybe_prune(outbox, config.retention, log)
 
 
-def _sync_content_keys(outbox, transport, log: logging.Logger) -> None:
+def _sync_content_keys(
+    outbox,
+    transport,
+    log: logging.Logger,
+    *,
+    max_batches: int | None = None,
+) -> None:
     """Ship pending wrapped DEKs; best-effort and independent of event sync."""
     from .transport import TerminalTransportError, push_content_keys
 
     try:
-        outcome = push_content_keys(outbox, transport)
+        outcome = push_content_keys(outbox, transport, max_batches=max_batches)
     except TerminalTransportError as exc:
         log.error("wrapped-key sync stopped: malformed batch (client defect): %s", exc)
         return
@@ -246,6 +336,8 @@ def _sync_content_keys(outbox, transport, log: logging.Logger) -> None:
             log.info("wrapped-key sync: shipped %d", outcome.result.keys_sent)
     elif outcome.reason == "auth":
         log.error("wrapped-key sync failed: the edge rejected the service token")
+    elif outcome.reason == "cancelled":
+        log.info("wrapped-key sync stopped for shutdown")
     else:
         log.warning("wrapped-key sync failed: the service is unreachable (buffered)")
 
@@ -295,4 +387,11 @@ def _install_signal_handlers(stop: threading.Event, log: logging.Logger):
     return restore
 
 
-__all__ = ["serve", "configure_logging", "SERVE_OK", "SERVE_ALREADY_RUNNING"]
+__all__ = [
+    "serve",
+    "configure_logging",
+    "SERVE_OK",
+    "SERVE_ALREADY_RUNNING",
+    "SYNC_REQUEST_TIMEOUT",
+    "SYNC_SHUTDOWN_TIMEOUT",
+]

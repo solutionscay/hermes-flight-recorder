@@ -13,6 +13,7 @@ the cursor stays in place and the next pass sends the same records again.
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Protocol, TypedDict
@@ -45,7 +46,7 @@ class KeyBatch(TypedDict):
     """
 
     protocol_version: str
-    keys: list[dict[str, Any]]
+    records: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -149,7 +150,7 @@ class InMemoryTransport:
 
         accepted = 0
         duplicates = 0
-        for record in stored_batch["keys"]:
+        for record in stored_batch["records"]:
             identity = (record["installation_id"], record["key_version"])
             if identity in self._key_ids:
                 duplicates += 1
@@ -246,6 +247,7 @@ def sync(
     *,
     max_records: int = DEFAULT_MAX_RECORDS,
     max_bytes: int = DEFAULT_MAX_BYTES,
+    max_batches: int | None = None,
 ) -> SyncResult:
     """Run one outbox-to-transport sync pass.
 
@@ -254,6 +256,9 @@ def sync(
     after, and only after, a complete valid acknowledgement for each batch.
     Transport exceptions propagate so an operator can detect a failed pass.
     """
+    if max_batches is not None and max_batches < 1:
+        raise ValueError("max_batches must be at least 1")
+
     start_cursor = delivery_cursor(outbox)
     installation_id = outbox.installation_id
     producer_high_water = outbox.high_water(installation_id)
@@ -264,11 +269,14 @@ def sync(
     batches_sent = 0
     records_sent = 0
     cursor = start_cursor
-    for batch in build_batches(
+    batches = build_batches(
         pending,
         max_records=max_records,
         max_bytes=max_bytes,
-    ):
+    )
+    if max_batches is not None:
+        batches = itertools.islice(batches, max_batches)
+    for batch in batches:
         ack = transport.send(batch)
         _validate_ack(ack, batch)
 
@@ -291,6 +299,7 @@ def sync_content_keys(
     transport: Transport,
     *,
     max_records: int = DEFAULT_MAX_RECORDS,
+    max_batches: int | None = None,
 ) -> KeySyncResult:
     """Ship wrapped DEKs that the ingestion service has not yet acknowledged.
 
@@ -300,18 +309,24 @@ def sync_content_keys(
     it. Delivery is idempotent server-side by ``(installation_id, key_version)``,
     so a resend after a lost ack is harmless. Transport exceptions propagate.
     """
+    if max_batches is not None and max_batches < 1:
+        raise ValueError("max_batches must be at least 1")
+
     pending = list(outbox.iter_unshipped_content_keys())
 
     batches_sent = 0
     keys_sent = 0
-    for batch in _build_key_batches(pending, max_records=max_records):
+    batches = _build_key_batches(pending, max_records=max_records)
+    if max_batches is not None:
+        batches = itertools.islice(batches, max_batches)
+    for batch in batches:
         ack = transport.send_keys(batch)
         _validate_key_ack(ack, batch)
         outbox.mark_content_keys_shipped(
-            record["key_version"] for record in batch["keys"]
+            record["key_version"] for record in batch["records"]
         )
         batches_sent += 1
-        keys_sent += len(batch["keys"])
+        keys_sent += len(batch["records"])
 
     return KeySyncResult(batches_sent=batches_sent, keys_sent=keys_sent)
 
@@ -356,7 +371,7 @@ def _validate_key_ack(ack: KeyAck, batch: KeyBatch) -> None:
         raise SyncError("transport returned an invalid key acknowledgement")
     if ack.accepted < 0 or ack.duplicates < 0:
         raise SyncError("acknowledgement counts cannot be negative")
-    if ack.accepted + ack.duplicates != len(batch["keys"]):
+    if ack.accepted + ack.duplicates != len(batch["records"]):
         raise SyncError("acknowledgement does not cover the complete key batch")
 
 
@@ -365,7 +380,7 @@ def _batch(records: list[dict[str, Any]]) -> Batch:
 
 
 def _key_batch(keys: list[dict[str, Any]]) -> KeyBatch:
-    return {"protocol_version": PROTOCOL_VERSION, "keys": keys}
+    return {"protocol_version": PROTOCOL_VERSION, "records": keys}
 
 
 def _validate_ack(ack: Ack, batch: Batch) -> None:

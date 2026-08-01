@@ -132,7 +132,8 @@ managing it yourself.
   "sync": {
     "interval_seconds": null,
     "max_records": 500,
-    "max_bytes": 1048576
+    "max_bytes": 1048576,
+    "max_batches_per_tick": 1
   },
   "reconcile": {
     "interval_seconds": 60
@@ -184,12 +185,19 @@ reconciliation from reporting intentional retention as capture loss.
 
 `capture.interval_seconds` (default 15) and `reconcile.interval_seconds`
 (default 60) set the `serve` cadences; the one-shot `run` and `reconcile`
-commands ignore them. `sync.max_records` and `sync.max_bytes` are active now;
-`sync.max_bytes` controls batching but never raises the 4 MiB protocol ceiling.
+commands ignore them. `sync.max_records` and `sync.max_bytes` control each batch.
+`sync.max_bytes` never raises the 4 MiB protocol ceiling.
+`sync.max_batches_per_tick` limits the network work for each `serve` sync tick.
+The default is one batch. The one-shot `sync` command still drains the backlog.
 `sync.interval_seconds` is `null` by default, preserving the one-pass `sync`
 behavior; under `serve`, a `null` sync interval falls back to 60s when a sync
 config is present. An explicit `sync --interval` or `serve --sync-interval`
 takes precedence over the file value.
+
+`serve` runs sync work in a separate worker. A blocked endpoint does not delay
+capture or reconciliation. Retry waits stop when `serve` receives a shutdown
+signal. Each `serve` network request has a five-second timeout. The service
+uses a six-second deadline to stop the sync worker.
 
 The environment equivalents are `HFR_CAPTURE_MAX_CONTENT_BYTES`,
 `HFR_CAPTURE_MESSAGE_ROLES` (a JSON array), `HFR_CAPTURE_SOURCES` (a JSON
@@ -197,7 +205,8 @@ object), `HFR_CAPTURE_INTERVAL_SECONDS`, `HFR_RETENTION_ENABLED`,
 `HFR_RETENTION_MAX_AGE_DAYS`, `HFR_RETENTION_MAX_BYTES`,
 `HFR_RETENTION_REQUIRE_DELIVERED`, `HFR_RETENTION_VACUUM`,
 `HFR_RECONCILE_INTERVAL_SECONDS`, `HFR_SYNC_INTERVAL_SECONDS`,
-`HFR_SYNC_MAX_RECORDS`, and `HFR_SYNC_MAX_BYTES`. The ingest URL and Cloudflare
+`HFR_SYNC_MAX_RECORDS`, `HFR_SYNC_MAX_BYTES`, and
+`HFR_SYNC_MAX_BATCHES_PER_TICK`. The ingest URL and Cloudflare
 Access credentials remain
 in the separate private `sync-config.json` or their existing environment
 variables, so credentials do not mix with operational configuration.

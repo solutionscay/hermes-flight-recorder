@@ -25,11 +25,13 @@ def test_missing_or_partial_config_uses_current_defaults(tmp_path):
     assert missing.sync.interval_seconds is None
     assert missing.sync.max_records == 500
     assert missing.sync.max_bytes == 1024 * 1024
+    assert missing.sync.max_batches_per_tick == 1
 
     write_config(tmp_path, {"sync": {"max_records": 25}})
     partial = recorder_config.load(tmp_path)
     assert partial.sync.max_records == 25
     assert partial.sync.max_bytes == 1024 * 1024
+    assert partial.sync.max_batches_per_tick == 1
     assert partial.capture == missing.capture
 
 
@@ -39,7 +41,12 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
         {
             "capture": {"max_content_bytes": 10, "message_roles": ["user"]},
             "retention": {"enabled": False, "max_age_days": 3},
-            "sync": {"interval_seconds": 10, "max_records": 10, "max_bytes": 100},
+            "sync": {
+                "interval_seconds": 10,
+                "max_records": 10,
+                "max_bytes": 100,
+                "max_batches_per_tick": 3,
+            },
         },
     )
     monkeypatch.setenv("HFR_CAPTURE_MAX_CONTENT_BYTES", "20")
@@ -47,6 +54,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     monkeypatch.setenv("HFR_RETENTION_VACUUM", "auto")
     monkeypatch.setenv("HFR_SYNC_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("HFR_SYNC_MAX_RECORDS", "50")
+    monkeypatch.setenv("HFR_SYNC_MAX_BATCHES_PER_TICK", "4")
     monkeypatch.setenv("HFR_CAPTURE_MESSAGE_ROLES", '["assistant", "tool"]')
     monkeypatch.setenv("HFR_KNOWLEDGE_HISTORY", "latest_only")
     monkeypatch.setenv("HFR_KNOWLEDGE_MAX_VERSIONS", "5")
@@ -61,6 +69,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
     assert config.sync.interval_seconds == 2.5
     assert config.sync.max_records == 50
     assert config.sync.max_bytes == 100
+    assert config.sync.max_batches_per_tick == 4
 
 
 @pytest.mark.parametrize(
@@ -71,6 +80,7 @@ def test_environment_overrides_file_values(tmp_path, monkeypatch):
         ({"retention": {"vacuum": "never"}}, "retention.vacuum"),
         ({"sync": {"max_records": 1.5}}, "sync.max_records"),
         ({"sync": {"max_bytes": 4 * 1024 * 1024 + 1}}, "sync.max_bytes"),
+        ({"sync": {"max_batches_per_tick": 0}}, "sync.max_batches_per_tick"),
         ({"capture": {"message_roles": "user"}}, "message_roles"),
         ({"capture": {"sources": {"hook": "yes"}}}, "capture.sources"),
         ({"knowledge": {"history": "some"}}, "knowledge.history"),

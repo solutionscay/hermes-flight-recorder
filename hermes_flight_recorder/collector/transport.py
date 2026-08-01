@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -72,6 +73,10 @@ class AuthError(TransportError):
 
 class TerminalTransportError(TransportError):
     """The server rejected the batch as malformed. A client defect."""
+
+
+class TransportCancelled(TransportError):
+    """The service requested shutdown before another transport attempt."""
 
 
 # A seam for tests: the same shape as ``urllib.request.urlopen``.
@@ -185,6 +190,7 @@ class RetryingTransport:
     max_delay: float = DEFAULT_MAX_DELAY
     sleep: Callable[[float], None] = time.sleep
     rng: Callable[[], float] = random.random
+    cancel_event: threading.Event | None = None
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
@@ -199,13 +205,19 @@ class RetryingTransport:
     def _with_retry(self, call: Callable[[], Any]) -> Any:
         attempt = 0
         while True:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise TransportCancelled("transport cancelled during shutdown")
             try:
                 return call()
             except RetryableTransportError:
                 attempt += 1
                 if attempt >= self.max_attempts:
                     raise
-                self.sleep(self._delay(attempt))
+                delay = self._delay(attempt)
+                if self.cancel_event is None:
+                    self.sleep(delay)
+                elif self.cancel_event.wait(delay):
+                    raise TransportCancelled("transport cancelled during shutdown")
 
     def _delay(self, attempt: int) -> float:
         # Full jitter: uniform(0, min(cap, base * 2**(attempt-1))).
@@ -247,6 +259,10 @@ def push(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOutcome:
         return PushOutcome(
             ok=False, reason="auth", result=None, detail=str(exc)
         )
+    except TransportCancelled as exc:
+        return PushOutcome(
+            ok=False, reason="cancelled", result=None, detail=str(exc)
+        )
     return PushOutcome(ok=True, reason="ok", result=result)
 
 
@@ -273,6 +289,10 @@ def push_content_keys(outbox: Any, transport: Any, **sync_kwargs: Any) -> PushOu
     except AuthError as exc:
         return PushOutcome(
             ok=False, reason="auth", result=None, detail=str(exc)
+        )
+    except TransportCancelled as exc:
+        return PushOutcome(
+            ok=False, reason="cancelled", result=None, detail=str(exc)
         )
     return PushOutcome(ok=True, reason="ok", result=result)
 
@@ -348,6 +368,7 @@ __all__ = [
     "RetryableTransportError",
     "RetryingTransport",
     "TerminalTransportError",
+    "TransportCancelled",
     "TransportError",
     "push",
     "push_content_keys",

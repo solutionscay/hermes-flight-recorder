@@ -27,6 +27,7 @@ DEFAULT_MESSAGE_ROLES = ("user", "assistant", "tool")
 # diffs the durable stores less often. These match the retired systemd timers.
 DEFAULT_CAPTURE_INTERVAL_SECONDS = 15.0
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 60.0
+DEFAULT_SYNC_MAX_BATCHES_PER_TICK = 1
 
 
 class RecorderConfigError(RuntimeError):
@@ -75,6 +76,7 @@ class SyncRuntimeConfig:
     interval_seconds: float | None = None
     max_records: int = DEFAULT_MAX_RECORDS
     max_bytes: int = DEFAULT_MAX_BYTES
+    max_batches_per_tick: int = DEFAULT_SYNC_MAX_BATCHES_PER_TICK
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,15 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 "sync.max_bytes",
                 maximum=MAX_INGEST_BATCH_BYTES,
             ),
+            max_batches_per_tick=_positive_int(
+                _value(
+                    "HFR_SYNC_MAX_BATCHES_PER_TICK",
+                    sync,
+                    "max_batches_per_tick",
+                    DEFAULT_SYNC_MAX_BATCHES_PER_TICK,
+                ),
+                "sync.max_batches_per_tick",
+            ),
         ),
         reconcile=ReconcileRuntimeConfig(
             interval_seconds=_positive_float(
@@ -222,6 +233,7 @@ def save(
             "interval_seconds": config.sync.interval_seconds,
             "max_records": config.sync.max_records,
             "max_bytes": config.sync.max_bytes,
+            "max_batches_per_tick": config.sync.max_batches_per_tick,
         },
         "reconcile": {
             "interval_seconds": config.reconcile.interval_seconds,
@@ -361,6 +373,7 @@ __all__ = [
     "DEFAULT_CAPTURE_INTERVAL_SECONDS",
     "DEFAULT_MAX_CONTENT_BYTES",
     "DEFAULT_RECONCILE_INTERVAL_SECONDS",
+    "DEFAULT_SYNC_MAX_BATCHES_PER_TICK",
     "KnowledgeConfig",
     "ReconcileRuntimeConfig",
     "RecorderConfig",

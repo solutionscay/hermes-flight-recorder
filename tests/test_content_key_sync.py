@@ -161,7 +161,7 @@ class _FlakyKeyTransport:
             self.fail_times -= 1
             raise RetryableTransportError("network down")
         self.sent.append(batch)
-        return KeyAck(accepted=len(batch["keys"]), duplicates=0)
+        return KeyAck(accepted=len(batch["records"]), duplicates=0)
 
 
 def test_offline_leaves_records_unshipped_for_next_pass(tmp_path):
@@ -222,18 +222,53 @@ def test_https_send_keys_posts_to_keys_url_and_parses_ack():
         _urlopen=urlopen_returning(_FakeResponse(202, body), capture=captured),
     )
 
-    ack = t.send_keys({"protocol_version": "1", "keys": [{"installation_id": "i", "key_version": "k1", "recipient_key_id": "opk1:x", "wrapped_dek": "w"}]})
+    ack = t.send_keys(
+        {
+            "protocol_version": "1",
+            "records": [
+                {
+                    "installation_id": "i",
+                    "key_version": "k1",
+                    "recipient_key_id": "opk1:x",
+                    "wrapped_dek": "w",
+                }
+            ],
+        }
+    )
 
     assert ack == KeyAck(accepted=2, duplicates=1)
     assert captured[0].full_url == "https://host/ingest/keys"
     assert captured[0].get_header("Cf-access-client-id") == "cid"  # auth reused
+    assert json.loads(captured[0].data) == {
+        "protocol_version": "1",
+        "records": [
+            {
+                "installation_id": "i",
+                "key_version": "k1",
+                "recipient_key_id": "opk1:x",
+                "wrapped_dek": "w",
+            }
+        ],
+    }
 
 
 def test_retrying_transport_retries_send_keys():
     inner = _FlakyKeyTransport(fail_times=2)
     retrying = RetryingTransport(inner, max_attempts=5, sleep=lambda _s: None, rng=lambda: 0.0)
 
-    ack = retrying.send_keys({"protocol_version": "1", "keys": [{"installation_id": "i", "key_version": "k", "recipient_key_id": "r", "wrapped_dek": "w"}]})
+    ack = retrying.send_keys(
+        {
+            "protocol_version": "1",
+            "records": [
+                {
+                    "installation_id": "i",
+                    "key_version": "k",
+                    "recipient_key_id": "r",
+                    "wrapped_dek": "w",
+                }
+            ],
+        }
+    )
 
     assert ack.accepted == 1
     assert inner.fail_times == 0  # exhausted the transient failures

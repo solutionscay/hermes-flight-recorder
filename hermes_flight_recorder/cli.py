@@ -187,7 +187,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
 def _cmd_serve(args: argparse.Namespace) -> int:
     from .collector import recorder_config, sync_config
     from .collector.runtime_lock import LOCK_FILENAME, RuntimeLock
-    from .collector.serve import configure_logging, serve
+    from .collector.serve import SYNC_REQUEST_TIMEOUT, configure_logging, serve
     from .collector.transport import HttpsTransport, RetryingTransport
 
     log = configure_logging(args.log_level)
@@ -210,7 +210,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 sync = sync_config.load(fr_home)
                 transport = RetryingTransport(
                     HttpsTransport.from_config(
-                        sync, require_https=not args.allow_insecure_url
+                        sync,
+                        timeout=SYNC_REQUEST_TIMEOUT,
+                        require_https=not args.allow_insecure_url,
                     )
                 )
             except sync_config.SyncConfigError as exc:

@@ -11,13 +11,19 @@ once it has fired enough times, which is how a real signal would end the loop.
 
 from __future__ import annotations
 
+import signal
 import threading
+import time
 
 import pytest
 
 from hermes_flight_recorder import cli
 from hermes_flight_recorder.collector import recorder_config, serve as S
+from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.sync import Ack
 from hermes_flight_recorder.collector.runtime_lock import RuntimeLock
+
+from test_outbox import base_record
 
 
 class _DummyOutbox:
@@ -76,6 +82,80 @@ def test_failing_capture_does_not_stop_reconcile(monkeypatch):
     rc = _run_serve(monkeypatch, capture=capture, reconcile=reconcile, stop=stop)
     assert rc == S.SERVE_OK  # a raising pass never crashes the daemon
     assert recs["n"] >= 3
+
+
+def test_blocked_sync_does_not_delay_capture_or_shutdown(tmp_path, monkeypatch):
+    outbox = Outbox.open(tmp_path / "fr")
+    outbox.initialize()
+    outbox.append(base_record())
+    stop = threading.Event()
+    sync_started = threading.Event()
+    release_sync = threading.Event()
+    sync_finished = threading.Event()
+    captures = {"n": 0}
+
+    class _BlockedTransport:
+        def send(self, batch):
+            sync_started.set()
+            release_sync.wait(2.0)
+            sync_finished.set()
+            return Ack(
+                accepted=len(batch["records"]),
+                duplicates=0,
+                high_water=batch["records"][-1]["producer_sequence"],
+            )
+
+        def send_keys(self, batch):
+            raise AssertionError("no wrapped keys expected")
+
+    def capture(*args):
+        captures["n"] += 1
+        if sync_started.is_set() and captures["n"] >= 3:
+            stop.set()
+
+    monkeypatch.setattr(S, "_capture", capture)
+    monkeypatch.setattr(S, "_reconcile", lambda *args: None)
+
+    started = time.monotonic()
+    rc = S.serve(
+        outbox,
+        "unused-hermes-home",
+        recorder_config.RecorderConfig(),
+        transport=_BlockedTransport(),
+        capture_interval=0.001,
+        reconcile_interval=0.001,
+        sync_interval=0.001,
+        stop_event=stop,
+        install_signal_handlers=False,
+        sync_shutdown_timeout=0.02,
+    )
+    elapsed = time.monotonic() - started
+
+    assert rc == S.SERVE_OK
+    assert sync_started.is_set()
+    assert captures["n"] >= 3
+    assert elapsed < 0.5
+
+    release_sync.set()
+    assert sync_finished.wait(1.0)
+    outbox.close()
+
+
+def test_sigterm_handler_sets_the_sync_cancellation_event(monkeypatch):
+    stop = threading.Event()
+    handlers = {}
+
+    def install(sig, handler):
+        handlers[sig] = handler
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(S.signal, "signal", install)
+    restore = S._install_signal_handlers(stop, S.configure_logging())
+
+    handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    assert stop.is_set()
+    restore()
 
 
 def test_serve_exits_when_lock_held(tmp_path, monkeypatch):
