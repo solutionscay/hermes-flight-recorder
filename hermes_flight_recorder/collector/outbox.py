@@ -64,7 +64,7 @@ __all__ = [
     "default_flight_recorder_home",
 ]
 
-OUTBOX_SCHEMA_VERSION = "1"
+OUTBOX_SCHEMA_VERSION = "2"
 _CONTENT_CHUNK_BYTES = 2 * 1024 * 1024
 _CONTENT_CHUNK_EVENT = "runtime.content_chunk_recorded"
 _CONTENT_FIELDS = (
@@ -75,7 +75,9 @@ _CONTENT_FIELDS = (
 )
 # ``old_version: (new_version, method_name)``. Each method runs inside the
 # transaction that also advances the durable schema version.
-_MIGRATIONS: dict[str, tuple[str, str]] = {}
+_MIGRATIONS: dict[str, tuple[str, str]] = {
+    "1": ("2", "_migrate_knowledge_skipped_files"),
+}
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -136,6 +138,7 @@ CREATE TABLE IF NOT EXISTS knowledge_version (
     origin          TEXT NOT NULL,
     linked_event_id TEXT,
     is_tombstone    INTEGER NOT NULL DEFAULT 0,
+    skipped_json    TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (artifact_id, seq)
 );
 """
@@ -304,6 +307,13 @@ class Outbox:
                 self._conn.execute("ROLLBACK")
                 raise
             version = next_version
+
+    def _migrate_knowledge_skipped_files(self) -> None:
+        """Add durable omission metadata to knowledge versions."""
+        self._conn.execute(
+            "ALTER TABLE knowledge_version ADD COLUMN skipped_json "
+            "TEXT NOT NULL DEFAULT '[]'"
+        )
 
     # --- identity -------------------------------------------------------
     @property
@@ -568,6 +578,16 @@ class Outbox:
         dek = self._dek_for_version(row[2], self._resolve_keypair(keypair))
         return cc.decrypt_content(dek, base64.b64decode(row[0]), base64.b64decode(row[1]))
 
+    def knowledge_blob_size(self, content_hash: str) -> int:
+        """Return a stored blob's plaintext byte length without decrypting it."""
+        row = self._conn.execute(
+            "SELECT byte_len FROM knowledge_blob WHERE content_hash=?",
+            (content_hash,),
+        ).fetchone()
+        if row is None:
+            raise OutboxError(f"no knowledge blob for {content_hash}")
+        return int(row[0])
+
     def upsert_knowledge_artifact(
         self,
         artifact_id: str,
@@ -623,11 +643,12 @@ class Outbox:
             "origin": row[5],
             "linked_event_id": row[6],
             "is_tombstone": bool(row[7]),
+            "skipped_files": json.loads(row[8]),
         }
 
     _VERSION_COLUMNS = (
         "artifact_id, seq, manifest_json, manifest_hash, occurred_at, origin, "
-        "linked_event_id, is_tombstone"
+        "linked_event_id, is_tombstone, skipped_json"
     )
 
     def latest_knowledge_version(self, artifact_id: str) -> dict[str, Any] | None:
@@ -655,6 +676,7 @@ class Outbox:
         origin: str,
         linked_event_id: str | None = None,
         is_tombstone: bool = False,
+        skipped_files: list[dict[str, Any]] | None = None,
     ) -> tuple[int, bool]:
         """Append a version unless the manifest equals the artifact's latest.
 
@@ -663,14 +685,20 @@ class Outbox:
         earlier state is a genuine new version (it differs from the latest).
         """
         manifest_hash = self._manifest_hash(manifest)
+        skipped = skipped_files or []
         latest = self.latest_knowledge_version(artifact_id)
-        if latest is not None and latest["manifest_hash"] == manifest_hash:
+        if (
+            latest is not None
+            and latest["manifest_hash"] == manifest_hash
+            and latest["skipped_files"] == skipped
+            and latest["is_tombstone"] == is_tombstone
+        ):
             return latest["seq"], False
         seq = latest["seq"] + 1 if latest is not None else 1
         self._conn.execute(
             "INSERT INTO knowledge_version("
             "artifact_id, seq, manifest_json, manifest_hash, occurred_at, origin, "
-            "linked_event_id, is_tombstone) VALUES(?,?,?,?,?,?,?,?)",
+            "linked_event_id, is_tombstone, skipped_json) VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 artifact_id,
                 seq,
@@ -680,6 +708,7 @@ class Outbox:
                 origin,
                 linked_event_id,
                 1 if is_tombstone else 0,
+                json.dumps(skipped, separators=(",", ":")),
             ),
         )
         return seq, True

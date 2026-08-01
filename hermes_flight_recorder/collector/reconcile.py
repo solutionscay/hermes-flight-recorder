@@ -1147,19 +1147,24 @@ def _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge_config) ->
 def _detect_knowledge_drift(
     outbox, home, home_mode, counts, when, cfg, knowledge_config
 ) -> None:
-    for artifact_id, kind, name, category, files in knowledge_store.iter_disk_artifacts(home):
+    for artifact_id, kind, name, category, files in knowledge_store.iter_disk_artifacts(
+        home, knowledge_config
+    ):
         try:
-            manifest, occurred_at = knowledge_store.read_manifest(outbox, files)
+            manifest, occurred_at, skipped_files = knowledge_store.read_snapshot(
+                outbox, files, knowledge_config
+            )
         except OSError:
             continue  # a live file vanished/locked between listing and read
-        if not manifest:
+        if not manifest and not skipped_files:
             continue
         disk_hash = outbox._manifest_hash(manifest)
         latest = outbox.latest_knowledge_version(artifact_id)
         stored_hash = (
             None if (latest is None or latest["is_tombstone"]) else latest["manifest_hash"]
         )
-        if stored_hash == disk_hash:
+        stored_skipped = [] if latest is None else latest.get("skipped_files", [])
+        if stored_hash == disk_hash and stored_skipped == skipped_files:
             continue  # the store already reflects disk — no drift
         if when - occurred_at <= cfg.knowledge_drift_grace:
             continue  # too fresh — a healthy capture would still be catching up

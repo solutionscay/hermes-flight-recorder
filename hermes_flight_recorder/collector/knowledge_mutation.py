@@ -6,7 +6,12 @@ from pathlib import Path
 from typing import Any
 
 from ._common import build_record, runtime_stamp
-from .knowledge_store import _apply_retention, iter_disk_artifacts
+from .knowledge_store import (
+    _apply_retention,
+    iter_disk_artifacts,
+    limit_plaintext_files,
+    log_skipped_files,
+)
 from .keystore import has_secret
 
 SKILL_ACTIONS = {
@@ -108,6 +113,7 @@ def capture(
         invocation_id=invocation_id,
         profile=profile,
         payload=payload,
+        partial=bool(version and version.get("skipped_files")),
     )
     stored = outbox.append(record, content=arguments_text, dedup_key=dedup_key)
     counts = {"knowledge.record_written": 1}
@@ -295,6 +301,12 @@ def _record_version(
     if files is None:
         return None, None
 
+    files, skipped_files = limit_plaintext_files(
+        knowledge_config,
+        artifact["artifact_id"],
+        files,
+    )
+
     manifest = [
         {"path": path, "blob_hash": outbox.put_blob(content)}
         for path, content in sorted(files.items())
@@ -308,13 +320,16 @@ def _record_version(
         provenance="agent",
         first_seen=occurred_at,
     )
-    seq, _created = outbox.append_knowledge_version(
+    seq, created = outbox.append_knowledge_version(
         artifact["artifact_id"],
         manifest=manifest,
         occurred_at=occurred_at,
         origin="foreground",
         is_tombstone=is_tombstone,
+        skipped_files=skipped_files,
     )
+    if created:
+        log_skipped_files(artifact["artifact_id"], skipped_files)
     _apply_retention(outbox, knowledge_config, artifact["artifact_id"])
     version = next(
         (
@@ -578,6 +593,10 @@ def _event_payload(
                 "byte_count": byte_count,
             }
         )
+        skipped_files = version.get("skipped_files", [])
+        payload["skipped_file_count"] = len(skipped_files)
+        if skipped_files:
+            payload["skipped_files"] = skipped_files
     return payload
 
 

@@ -23,6 +23,9 @@ from .sync import DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS, MAX_INGEST_BATCH_BYTES
 CONFIG_FILENAME = "recorder-config.json"
 DEFAULT_MAX_CONTENT_BYTES = 65_536
 DEFAULT_MESSAGE_ROLES = ("user", "assistant", "tool")
+DEFAULT_KNOWLEDGE_MAX_FILE_BYTES = 4 * 1024 * 1024
+DEFAULT_KNOWLEDGE_MAX_FILE_COUNT = 256
+DEFAULT_KNOWLEDGE_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 # Foreground `serve` cadences. Capture polls the fast path often; reconcile
 # diffs the durable stores less often. These match the retired systemd timers.
 DEFAULT_CAPTURE_INTERVAL_SECONDS = 15.0
@@ -78,6 +81,12 @@ class KnowledgeConfig:
     # git. ``max_versions`` caps the chain under ``full``; None keeps all.
     history: str = "full"
     max_versions: int | None = None
+    # These limits bound each scan and the complete knowledge bundle that the
+    # collector builds in memory. Files outside the limits remain on disk and
+    # appear as explicit omissions in the event metadata.
+    max_file_bytes: int = DEFAULT_KNOWLEDGE_MAX_FILE_BYTES
+    max_file_count: int = DEFAULT_KNOWLEDGE_MAX_FILE_COUNT
+    max_artifact_bytes: int = DEFAULT_KNOWLEDGE_MAX_ARTIFACT_BYTES
 
 
 @dataclass(frozen=True)
@@ -177,6 +186,33 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 _value("HFR_KNOWLEDGE_MAX_VERSIONS", knowledge, "max_versions", None),
                 "knowledge.max_versions",
             ),
+            max_file_bytes=_positive_int(
+                _value(
+                    "HFR_KNOWLEDGE_MAX_FILE_BYTES",
+                    knowledge,
+                    "max_file_bytes",
+                    DEFAULT_KNOWLEDGE_MAX_FILE_BYTES,
+                ),
+                "knowledge.max_file_bytes",
+            ),
+            max_file_count=_positive_int(
+                _value(
+                    "HFR_KNOWLEDGE_MAX_FILE_COUNT",
+                    knowledge,
+                    "max_file_count",
+                    DEFAULT_KNOWLEDGE_MAX_FILE_COUNT,
+                ),
+                "knowledge.max_file_count",
+            ),
+            max_artifact_bytes=_positive_int(
+                _value(
+                    "HFR_KNOWLEDGE_MAX_ARTIFACT_BYTES",
+                    knowledge,
+                    "max_artifact_bytes",
+                    DEFAULT_KNOWLEDGE_MAX_ARTIFACT_BYTES,
+                ),
+                "knowledge.max_artifact_bytes",
+            ),
         ),
         sync=SyncRuntimeConfig(
             interval_seconds=_optional_positive_float(
@@ -239,6 +275,9 @@ def save(
         "knowledge": {
             "history": config.knowledge.history,
             "max_versions": config.knowledge.max_versions,
+            "max_file_bytes": config.knowledge.max_file_bytes,
+            "max_file_count": config.knowledge.max_file_count,
+            "max_artifact_bytes": config.knowledge.max_artifact_bytes,
         },
         "sync": {
             "interval_seconds": config.sync.interval_seconds,

@@ -136,6 +136,13 @@ managing it yourself.
     "require_delivered": true,
     "vacuum": "auto"
   },
+  "knowledge": {
+    "history": "full",
+    "max_versions": null,
+    "max_file_bytes": 4194304,
+    "max_file_count": 256,
+    "max_artifact_bytes": 8388608
+  },
   "sync": {
     "interval_seconds": null,
     "max_records": 500,
@@ -159,6 +166,18 @@ and its related reconciliation checks. Unknown keys are configuration errors.
 `content_original_bytes`, and `content_captured_bytes` in plaintext metadata,
 so a shortened body is never silent. The limit applies uniformly to user,
 assistant, and tool content.
+
+The knowledge collector has three resource limits. `max_file_bytes` defaults
+to 4 MiB. `max_file_count` defaults to 256 files per artifact.
+`max_artifact_bytes` defaults to 8 MiB of captured content per artifact.
+The collector does not read a file that exceeds the file-size limit.
+It stops the skill scan after the first file above the file-count limit.
+These limits bound the plaintext knowledge bundle that the collector builds in
+memory. The collector leaves skipped files unchanged. It sets the event's
+`partial` field and adds `skipped_file_count` and `skipped_files` to the
+plaintext payload. Each skipped-file item gives the path, reason, observed byte
+count, and active limit. The service also writes a warning log for each new
+omission.
 
 `sync.max_bytes` is a soft batch target and defaults to 1 MiB. The ingestion
 protocol has a separate 4 MiB hard request limit. If encrypted content would
@@ -215,6 +234,9 @@ The environment equivalents are `HFR_CAPTURE_MAX_CONTENT_BYTES`,
 object), `HFR_CAPTURE_INTERVAL_SECONDS`, `HFR_RETENTION_ENABLED`,
 `HFR_RETENTION_MAX_AGE_DAYS`, `HFR_RETENTION_MAX_BYTES`,
 `HFR_RETENTION_REQUIRE_DELIVERED`, `HFR_RETENTION_VACUUM`,
+`HFR_KNOWLEDGE_HISTORY`, `HFR_KNOWLEDGE_MAX_VERSIONS`,
+`HFR_KNOWLEDGE_MAX_FILE_BYTES`, `HFR_KNOWLEDGE_MAX_FILE_COUNT`,
+`HFR_KNOWLEDGE_MAX_ARTIFACT_BYTES`,
 `HFR_RECONCILE_INTERVAL_SECONDS`, `HFR_SYNC_INTERVAL_SECONDS`,
 `HFR_SYNC_MAX_RECORDS`, `HFR_SYNC_MAX_BYTES`, and
 `HFR_SYNC_MAX_BATCHES_PER_TICK`. The ingest URL and Cloudflare

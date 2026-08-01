@@ -9,6 +9,7 @@ import pytest
 
 from hermes_flight_recorder.collector import keystore, knowledge_store, state_db
 from hermes_flight_recorder.collector.outbox import Outbox
+from hermes_flight_recorder.collector.recorder_config import KnowledgeConfig
 from hermes_flight_recorder.envelope import validate
 
 
@@ -192,6 +193,42 @@ def test_failed_and_staged_calls_make_no_knowledge_record(tmp_path):
     assert counts.get("knowledge.record_written", 0) == 0
     assert knowledge_events(outbox) == []
     assert outbox.knowledge_artifact_ids() == []
+
+
+def test_foreground_skill_version_obeys_file_size_limit(tmp_path, caplog):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    make_state_db(
+        home,
+        [
+            (
+                "skill_manage",
+                {"action": "create", "name": "large", "content": "x" * 32},
+                {"success": True},
+            )
+        ],
+    )
+    outbox = new_outbox(tmp_path)
+
+    state_db.poll(
+        outbox,
+        home,
+        knowledge_config=KnowledgeConfig(max_file_bytes=16),
+    )
+
+    event = knowledge_events(outbox)[0]
+    assert event["partial"] is True
+    assert event["payload"]["file_count"] == 0
+    assert event["payload"]["skipped_files"] == [
+        {
+            "path": "SKILL.md",
+            "reason": "max_file_bytes",
+            "byte_count": 32,
+            "limit": 16,
+        }
+    ]
+    assert outbox.latest_knowledge_version("skill:large")["manifest"] == []
+    assert "path=SKILL.md reason=max_file_bytes" in caplog.text
 
 
 def test_all_skill_actions_preserve_exact_action_and_order(tmp_path):

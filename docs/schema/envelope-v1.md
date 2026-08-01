@@ -351,6 +351,12 @@ all of these invariants before rendering any member as a complete artifact.
 Tombstones keep the parent metadata but carry neither encrypted content nor a
 `content_format`.
 
+A partial bundle can also contain `skipped_files`. Each item contains `path`,
+`reason`, `byte_count`, and `limit`. The parent payload contains the same list
+and sets `skipped_file_count`. The parent also sets `partial=true`.
+The collector uses the reasons `max_file_bytes`, `max_file_count`, and
+`max_artifact_bytes`. A skipped file is not in `files` or the manifest.
+
 ## Event-type surface
 
 **P0-poc** — captured and observed in the Phase 0 POC:
