@@ -50,14 +50,15 @@ class BoardBatch:
     run_watermark: Watermark
     run_high_water: int
     open_run_ids: tuple[Any, ...]
-    meta_store: Any
     board: str
 
     def advance(self) -> None:
         self.event_watermark.advance(self.event_high_water)
         self.run_watermark.advance(self.run_high_water)
         save_meta_json(
-            self.meta_store, _open_runs_meta_key(self.board), self.open_run_ids
+            self.event_watermark.store,
+            _open_runs_meta_key(self.board),
+            self.open_run_ids,
         )
 
 
@@ -92,7 +93,6 @@ def read_board(outbox, board: str, db_path: Path) -> BoardBatch | None:
         run_watermark,
         run_high_water,
         tuple(sorted(run_id for run_id, run in runs.items() if run["outcome"] is None)),
-        outbox,
         board,
     )
 

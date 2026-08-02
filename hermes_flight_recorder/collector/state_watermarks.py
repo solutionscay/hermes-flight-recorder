@@ -65,11 +65,10 @@ class SessionBatch:
     watermark: Watermark
     high_water: int
     open_ids: tuple[str, ...]
-    meta_store: Any
 
     def advance(self) -> None:
         self.watermark.advance(self.high_water)
-        save_meta_json(self.meta_store, _OPEN_SESSIONS_META, self.open_ids)
+        save_meta_json(self.watermark.store, _OPEN_SESSIONS_META, self.open_ids)
 
 
 def read_messages(outbox, conn, roles: tuple[str, ...]) -> RowBatch:
@@ -199,7 +198,6 @@ def read_sessions(outbox, conn, subject_ids: set[str]) -> SessionBatch:
         watermark,
         high_water,
         next_open,
-        outbox,
     )
 
 

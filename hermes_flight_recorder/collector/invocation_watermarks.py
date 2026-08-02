@@ -6,6 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
+from ._common import as_float as _number
 from .watermark import Watermark, load_meta_json, save_meta_json
 
 _CURSOR = "state.db:invocation-events:v1"
@@ -137,13 +138,6 @@ def _save_session_windows(
         for window in windows
     ]
     save_meta_json(outbox, _meta_key(session_id), value)
-
-
-def _number(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 __all__ = ["InvocationWindow", "read_invocation_windows"]

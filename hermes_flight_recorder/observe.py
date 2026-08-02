@@ -39,6 +39,7 @@ from __future__ import annotations
 import datetime
 from typing import Any, Iterable
 
+from .collector._common import as_float as _as_float
 from .envelope import (
     RECONCILE_FINDING_TYPES as FINDING_TYPES,
     SESSION_START_TYPES,
@@ -639,10 +640,3 @@ def _iso(epoch: Any) -> str:
     if f <= 0:
         return "-"
     return datetime.datetime.fromtimestamp(f, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _as_float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0

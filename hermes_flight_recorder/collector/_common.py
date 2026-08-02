@@ -309,6 +309,14 @@ def occurred_before(since: float | None, value: Any) -> bool:
     return epoch is not None and epoch < since
 
 
+def as_float(value: Any) -> float:
+    """Coerce a possibly missing or malformed number to float; 0.0 otherwise."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def to_epoch(value: Any) -> float | None:
     """Normalize a Hermes timestamp to epoch seconds.
 

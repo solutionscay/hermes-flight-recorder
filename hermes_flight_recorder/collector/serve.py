@@ -165,7 +165,7 @@ def _build_tasks(
         _Task(
             "audit",
             audit_iv,
-            lambda: _audit(outbox, hermes_home, config, log),
+            lambda: _reconcile(outbox, hermes_home, config, log, True),
             start + audit_iv,
         )
     )
@@ -275,7 +275,9 @@ def _capture(outbox, hermes_home, config, log: logging.Logger) -> None:
     _maybe_prune(outbox, config.retention, log)
 
 
-def _reconcile(outbox, hermes_home, config, log: logging.Logger) -> None:
+def _reconcile(
+    outbox, hermes_home, config, log: logging.Logger, full_audit: bool = False
+) -> None:
     from .reconcile import reconcile
 
     counts = reconcile(
@@ -283,22 +285,10 @@ def _reconcile(outbox, hermes_home, config, log: logging.Logger) -> None:
         hermes_home,
         capture_config=config.capture,
         knowledge_config=config.knowledge,
-        full_audit=False,
+        full_audit=full_audit,
     )
-    log.info("reconcile: %d finding(s)", sum(counts.values()))
-
-
-def _audit(outbox, hermes_home, config, log: logging.Logger) -> None:
-    from .reconcile import reconcile
-
-    counts = reconcile(
-        outbox,
-        hermes_home,
-        capture_config=config.capture,
-        knowledge_config=config.knowledge,
-        full_audit=True,
-    )
-    log.info("audit: %d finding(s)", sum(counts.values()))
+    label = "audit" if full_audit else "reconcile"
+    log.info("%s: %d finding(s)", label, sum(counts.values()))
 
 
 def _sync(outbox, transport, config, log: logging.Logger) -> None:

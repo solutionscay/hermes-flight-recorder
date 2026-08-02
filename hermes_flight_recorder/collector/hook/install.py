@@ -13,10 +13,10 @@ The hook package is the only write Flight Recorder ever makes into the Hermes ho
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from ...version import build_identity
+from ..atomic_file import atomic_write
 from . import (
     ERRLOG_FILENAME,
     HOOK_DIR_NAME,
@@ -172,17 +172,9 @@ def baked_flight_recorder_build(hook_dir: str | Path) -> str | None:
     return None
 
 
-def _write_atomic(path: Path, content: str) -> None:
-    """Replace one generated hook file without exposing partial content."""
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(content, encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+# The gateway process imports these generated files, so they stay
+# world-readable; they hold no secrets (paths and constants only).
+_HOOK_FILE_MODE = 0o644
 
 
 def install_hook(
@@ -201,9 +193,12 @@ def install_hook(
     if hook_dir.exists() and not force:
         raise FileExistsError(str(hook_dir))
     hook_dir.mkdir(parents=True, exist_ok=True)
-    _write_atomic(hook_dir / "HOOK.yaml", _MANIFEST)
-    _write_atomic(
+    atomic_write(
+        hook_dir / "HOOK.yaml", _MANIFEST.encode("utf-8"), mode=_HOOK_FILE_MODE
+    )
+    atomic_write(
         hook_dir / "handler.py",
-        render_handler(flight_recorder_home, build=build),
+        render_handler(flight_recorder_home, build=build).encode("utf-8"),
+        mode=_HOOK_FILE_MODE,
     )
     return hook_dir
