@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
+
+from helpers import make_state_db, new_outbox
 
 from hermes_flight_recorder import collector
 from hermes_flight_recorder.collector import (
@@ -16,17 +16,10 @@ from hermes_flight_recorder.collector import (
     state_db,
 )
 from hermes_flight_recorder.collector import reconcile as reconcile_module
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.recorder_config import (
     CAPTURE_SOURCE_NAMES,
     CaptureConfig,
 )
-
-
-def new_outbox(tmp_path) -> Outbox:
-    outbox = Outbox.open(tmp_path / "bridge")
-    outbox.initialize()
-    return outbox
 
 
 @pytest.mark.parametrize("disabled", CAPTURE_SOURCE_NAMES)
@@ -81,17 +74,7 @@ def test_missing_source_keys_enable_all_collectors(tmp_path, monkeypatch):
 def test_disabled_state_db_does_not_report_coverage_gap(tmp_path):
     home = tmp_path / "hermes"
     home.mkdir()
-    db = sqlite3.connect(home / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (
-            id TEXT, source TEXT, parent_session_id TEXT, started_at REAL,
-            ended_at REAL, expiry_finalized INT, profile_name TEXT
-        );
-        INSERT INTO sessions VALUES ('S', 'cli', NULL, 100, NULL, 0, NULL);
-        """
-    )
-    db.close()
+    make_state_db(home, sessions=[("S", "cli", None, 100, None, 0, None)])
 
     counts = reconcile_module.reconcile(
         new_outbox(tmp_path),

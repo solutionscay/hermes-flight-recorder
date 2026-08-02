@@ -12,15 +12,10 @@ from __future__ import annotations
 
 import json
 
+from helpers import new_outbox
+
 from hermes_flight_recorder.collector import reconcile
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.envelope import serialize, validate
-
-
-def new_outbox(tmp_path):
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def _findings(ob):

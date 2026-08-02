@@ -24,29 +24,12 @@ Covered:
 
 from __future__ import annotations
 
-import datetime
-import json
-import sqlite3
 from collections import Counter
 
-from hermes_flight_recorder.collector.outbox import Outbox
+from helpers import B, _executions_db, _interval_job, _jobs_json, iso, new_outbox
+
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
-
-# A fixed epoch anchor and a fixed UTC-5 offset, same convention as
-# tests/test_reconcile.py, so timestamps never touch wall-clock.
-B = 1784415000.0
-TZ = datetime.timezone(datetime.timedelta(hours=-5))
-
-
-def iso(epoch: float) -> str:
-    return datetime.datetime.fromtimestamp(epoch, TZ).isoformat()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def types(outbox) -> Counter:
@@ -72,39 +55,6 @@ def dedup_keys(outbox):
 
 
 # --- fixture builders -----------------------------------------------------
-def _executions_db(cron, rows) -> None:
-    """rows: (exec_id, job_id, status, claimed_at_iso, started_at_iso, finished_at_iso)."""
-    db = sqlite3.connect(cron / "executions.db")
-    db.execute(
-        "CREATE TABLE executions (id TEXT, job_id TEXT, source TEXT, pid INT, status TEXT, "
-        "claimed_at TEXT, started_at TEXT, finished_at TEXT, error TEXT)"
-    )
-    db.executemany(
-        "INSERT INTO executions VALUES (?,?,'builtin',1,?,?,?,?,NULL)",
-        [(exid, job, status, claimed, started, finished)
-         for (exid, job, status, claimed, started, finished) in rows],
-    )
-    db.commit(); db.close()
-
-
-def _jobs_json(cron, jobs) -> None:
-    (cron / "jobs.json").write_text(json.dumps({"jobs": jobs}))
-
-
-def _interval_job(job_id, *, minutes, created, extra=None) -> dict:
-    job = {
-        "id": job_id,
-        "enabled": True,
-        "state": "scheduled",
-        "created_at": iso(created),
-        "schedule": {"kind": "interval", "minutes": minutes},
-        "repeat": {"times": None, "completed": 0},
-    }
-    if extra:
-        job.update(extra)
-    return job
-
-
 def _heartbeat(cron, epoch: float) -> None:
     (cron / "ticker_heartbeat").write_text(str(epoch))
 

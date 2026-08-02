@@ -13,6 +13,8 @@ import json
 
 import pytest
 
+import helpers
+
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector import keystore
 from hermes_flight_recorder.collector.sync import (
@@ -22,7 +24,6 @@ from hermes_flight_recorder.collector.sync import (
     sync_content_keys,
 )
 from hermes_flight_recorder.collector.transport import (
-    AuthError,
     HttpsTransport,
     RetryableTransportError,
     RetryingTransport,
@@ -34,9 +35,10 @@ from test_transport import _FakeResponse, urlopen_returning
 
 
 def new_outbox(tmp_path) -> Outbox:
-    outbox = Outbox.open(tmp_path)
-    outbox.initialize()
-    return outbox
+    """The outbox lives directly at ``tmp_path`` — no bridge/ subdir:
+    these tests reopen the same directory (or keep config/keys beside it).
+    """
+    return helpers.new_outbox(tmp_path, subdir=None)
 
 
 def _seal_some_content(outbox, text="secret") -> str:

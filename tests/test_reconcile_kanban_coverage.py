@@ -16,12 +16,11 @@ from __future__ import annotations
 
 import sqlite3
 
-from hermes_flight_recorder.collector._common import build_record
-from hermes_flight_recorder.collector.outbox import Outbox
+import helpers
+from helpers import B, new_outbox
+
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
-
-B = 1784415000.0
 
 # task_runs carries the columns the stale-lease loader (#53) also reads, so a
 # reconcile pass over the same board never errors on a missing column.
@@ -48,25 +47,11 @@ def make_kanban_db(path, *, tasks=(), runs=()):
     db.close()
 
 
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
 def append_event(ob, event_type, **over):
-    """Append a minimal valid producer event straight to the outbox."""
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=over.pop("occurred_at", B),
-        source=over.pop("source", "kanban:test"),
-        capture_method=over.pop("capture_method", "poll:test"),
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=over.pop("correlation_id", "corr"),
-        payload=over.pop("payload", {}),
-        **over,
-    )
-    return ob.append(rec)
+    """Kanban-flavoured event: capture source/method differ from the default."""
+    over.setdefault("source", "kanban:test")
+    over.setdefault("capture_method", "poll:test")
+    return helpers.append_event(ob, event_type, **over)
 
 
 def coverage_gaps(ob, subject_type: str | None = None):

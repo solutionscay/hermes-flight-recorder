@@ -16,18 +16,19 @@ Focus:
 
 from __future__ import annotations
 
-import datetime
-import json
-import sqlite3
+from helpers import (
+    B,
+    _executions_db,
+    _interval_job,
+    _jobs_json,
+    append_event,
+    iso,
+    make_state_db,
+    new_outbox,
+)
 
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
-from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.envelope import validate
-
-# A fixed epoch anchor and a fixed tz offset, like the real cron store.
-B = 1784415000.0
-TZ = datetime.timezone(datetime.timedelta(hours=-5))
 
 # Small explicit thresholds so every detector fires deterministically and
 # stays fired across a +300s "now" advance (see module docstring above).
@@ -41,31 +42,6 @@ CFG = ReconcileConfig(
 )
 
 _RECONCILER_TYPES = {"reconcile.gap_detected", "reconcile.terminal_missing", "cron.run_missed"}
-
-
-def iso(epoch: float) -> str:
-    return datetime.datetime.fromtimestamp(epoch, TZ).isoformat()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def append_event(ob, event_type, **over):
-    """Append a minimal valid producer event straight to the outbox."""
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=over.pop("occurred_at", B),
-        source=over.pop("source", "hook:test"),
-        capture_method=over.pop("capture_method", "hook:test"),
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=over.pop("correlation_id", "corr"),
-        payload=over.pop("payload", {}),
-        **over,
-    )
-    return ob.append(rec)
 
 
 def findings(ob, event_type):
@@ -87,50 +63,14 @@ def dedup_keys(ob, like: str) -> list[str]:
 
 # --- durable-store fixtures ----------------------------------------------
 def _state_db(hh, sessions) -> None:
-    db = sqlite3.connect(hh / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, expiry_finalized INT, profile_name TEXT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
-        """
+    """sessions: (sid, parent, started, ended) tuples; the rest is constant."""
+    make_state_db(
+        hh,
+        sessions=[
+            (sid, "cli", parent, started, ended, 0, None)
+            for (sid, parent, started, ended) in sessions
+        ],
     )
-    for sid, parent, started, ended in sessions:
-        db.execute(
-            "INSERT INTO sessions VALUES (?,'cli',?,?,?,0,NULL)",
-            (sid, parent, started, ended),
-        )
-    db.commit(); db.close()
-
-
-def _executions_db(cron, rows) -> None:
-    db = sqlite3.connect(cron / "executions.db")
-    db.execute(
-        "CREATE TABLE executions (id TEXT, job_id TEXT, source TEXT, pid INT, status TEXT, "
-        "claimed_at TEXT, started_at TEXT, finished_at TEXT, error TEXT)"
-    )
-    db.executemany(
-        "INSERT INTO executions VALUES (?,?,'builtin',1,?,?,?,?,NULL)",
-        [(exid, job, status, claimed, started, finished)
-         for (exid, job, status, claimed, started, finished) in rows],
-    )
-    db.commit(); db.close()
-
-
-def _jobs_json(cron, jobs) -> None:
-    (cron / "jobs.json").write_text(json.dumps({"jobs": jobs}))
-
-
-def _interval_job(job_id, *, minutes, created) -> dict:
-    return {
-        "id": job_id,
-        "enabled": True,
-        "state": "scheduled",
-        "created_at": iso(created),
-        "schedule": {"kind": "interval", "minutes": minutes},
-        "repeat": {"times": None, "completed": 0},
-    }
 
 
 def _build_scenario(tmp_path):

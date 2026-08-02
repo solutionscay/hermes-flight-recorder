@@ -13,7 +13,6 @@ from hermes_flight_recorder.envelope import (
     ALL_EVENT_TYPES,
     P0_POC_EVENT_TYPES,
     RESERVED_EVENT_TYPES,
-    SCHEMA_VERSION,
     EnvelopeValidationError,
     parse,
     serialize,

@@ -18,6 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+import helpers
+
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.sync import (
     Ack,
@@ -48,9 +50,10 @@ from test_outbox import base_record
 # Fixtures and helpers
 # --------------------------------------------------------------------------
 def new_outbox(tmp_path) -> Outbox:
-    outbox = Outbox.open(tmp_path)
-    outbox.initialize()
-    return outbox
+    """The outbox lives directly at ``tmp_path`` — no bridge/ subdir:
+    these tests reopen the same directory (or keep config/keys beside it).
+    """
+    return helpers.new_outbox(tmp_path, subdir=None)
 
 
 def a_batch(records=None):

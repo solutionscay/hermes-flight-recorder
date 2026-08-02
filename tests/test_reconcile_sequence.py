@@ -1,9 +1,8 @@
 """Focused tests for sequence-gap detection (_detect_sequence_gaps), the
 reconciler's proof that the append path lost a capture.
 
-Self-contained: no imports from tests/test_reconcile.py. Mirrors its style
-(a fixed epoch anchor, iso() with a fixed tz offset, new_outbox(tmp_path))
-but defines everything locally.
+Shared fixtures (fixed epoch anchor, new_outbox(tmp_path)) come from
+tests/helpers.py; no imports from tests/test_reconcile.py.
 
 A gap is simulated the same way the append path could actually lose a row:
 by deleting from the outbox's own ``events`` table via ``ob._conn`` after
@@ -12,16 +11,10 @@ appending a contiguous run of events. No wall-clock, no network.
 
 from __future__ import annotations
 
-import datetime
+from helpers import B, append_event, new_outbox
 
-from hermes_flight_recorder.collector._common import build_record
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
-
-# A fixed epoch anchor and a fixed tz offset, like the real cron store.
-B = 1784415000.0
-TZ = datetime.timezone(datetime.timedelta(hours=-5))
 
 # A hermes_home that is never created: sequence-gap detection needs no
 # durable store at all, and a nonexistent path keeps the other three
@@ -30,36 +23,9 @@ TZ = datetime.timezone(datetime.timedelta(hours=-5))
 NO_HERMES = "no-hermes-home-does-not-exist"
 
 
-def iso(epoch: float) -> str:
-    return datetime.datetime.fromtimestamp(epoch, TZ).isoformat()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def append_event(ob, event_type, **over):
-    """Append a minimal valid producer event straight to the outbox.
-
-    Each call consumes the next producer_sequence, giving a contiguous run
-    of sequence numbers to later punch holes in.
-    """
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=over.pop("occurred_at", B),
-        source=over.pop("source", "hook:test"),
-        capture_method=over.pop("capture_method", "hook:test"),
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=over.pop("correlation_id", "corr"),
-        payload=over.pop("payload", {}),
-        **over,
-    )
-    return ob.append(rec)
-
-
 def append_n(ob, n: int) -> None:
+    """Each append consumes the next producer_sequence, giving a contiguous
+    run of sequence numbers to later punch holes in."""
     for _ in range(n):
         append_event(ob, "session.created")
 

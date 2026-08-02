@@ -9,34 +9,15 @@ suppress (only an open-ended tail is a ticker-explained artifact); a
 never-fired job is judged from its first due instant; and the startup gap
 before a job's very first fire must never itself read as a miss.
 
-Self-contained: no imports from tests/test_reconcile.py. Mirrors its style
-(fixed epoch anchor, iso() helper, new_outbox()) but defines everything
-locally.
+Shared fixtures (fixed epoch anchor, iso() helper, new_outbox(), cron-store
+builders) come from tests/helpers.py; no imports from tests/test_reconcile.py.
 """
 
 from __future__ import annotations
 
-import datetime
-import json
-import sqlite3
+from helpers import B, _executions_db, _interval_job, _jobs_json, iso, new_outbox
 
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
-
-# A fixed epoch anchor and a US-Central-like offset, same convention as the
-# reconciler's own test suite.
-B = 1784415000.0
-TZ = datetime.timezone(datetime.timedelta(hours=-5))
-
-
-def iso(epoch: float) -> str:
-    return datetime.datetime.fromtimestamp(epoch, TZ).isoformat()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def findings(outbox, event_type):
@@ -44,36 +25,6 @@ def findings(outbox, event_type):
         e for e in outbox.iter_events()
         if e["payload"]["event_type"] == event_type and e["source"] == "reconciler"
     ]
-
-
-def _executions_db(cron, rows) -> None:
-    """rows: list of (id, job_id, status, claimed_at_iso, started_at_iso, finished_at_iso)."""
-    db = sqlite3.connect(cron / "executions.db")
-    db.execute(
-        "CREATE TABLE executions (id TEXT, job_id TEXT, source TEXT, pid INT, status TEXT, "
-        "claimed_at TEXT, started_at TEXT, finished_at TEXT, error TEXT)"
-    )
-    db.executemany(
-        "INSERT INTO executions VALUES (?,?,'builtin',1,?,?,?,?,NULL)",
-        [(exid, job, status, claimed, started, finished)
-         for (exid, job, status, claimed, started, finished) in rows],
-    )
-    db.commit(); db.close()
-
-
-def _jobs_json(cron, jobs) -> None:
-    (cron / "jobs.json").write_text(json.dumps({"jobs": jobs}))
-
-
-def _interval_job(job_id, *, minutes, created) -> dict:
-    return {
-        "id": job_id,
-        "enabled": True,
-        "state": "scheduled",
-        "created_at": iso(created),
-        "schedule": {"kind": "interval", "minutes": minutes},
-        "repeat": {"times": None, "completed": 0},
-    }
 
 
 def _heartbeat(cron, epoch: float) -> None:

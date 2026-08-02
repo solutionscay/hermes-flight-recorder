@@ -26,31 +26,20 @@ import sqlite3
 import time
 from pathlib import Path
 
+import helpers
+from helpers import new_outbox
+
 from hermes_flight_recorder import cli
-from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
 
-# A fixed epoch anchor, mirrored from tests/test_reconcile.py's style, used
-# as the default `occurred_at` for events whose timestamp value is
-# irrelevant to the detector under test (sequence-gap detection never
-# inspects `occurred_at`).
-B = 1784415000.0
-
 
 # --- fixtures / helpers ---------------------------------------------------
-def new_outbox(flight_recorder_home: Path) -> Outbox:
-    """Open and initialize an Outbox, matching tests/test_reconcile.py."""
-    ob = Outbox.open(flight_recorder_home)
-    ob.initialize()
-    return ob
-
-
 def make_initialized_flight_recorder_home(flight_recorder_home: Path) -> Path:
     """Initialize an outbox at ``flight_recorder_home`` and close it, so the CLI's
     own ``Outbox.open()`` call reopens the same on-disk installation.
     """
-    ob = new_outbox(flight_recorder_home)
+    ob = new_outbox(flight_recorder_home, subdir=None)
     ob.close()
     return flight_recorder_home
 
@@ -61,17 +50,7 @@ def append_raw(flight_recorder_home: Path, event_type: str, **over) -> None:
     """
     ob = Outbox.open(flight_recorder_home)
     try:
-        rec = build_record(
-            event_type=event_type,
-            occurred_at=over.pop("occurred_at", B),
-            source=over.pop("source", "hook:test"),
-            capture_method=over.pop("capture_method", "hook:test"),
-            runtime={"kind": "cli", "engine": "standard"},
-            correlation_id=over.pop("correlation_id", "corr"),
-            payload=over.pop("payload", {}),
-            **over,
-        )
-        ob.append(rec)
+        helpers.append_event(ob, event_type, **over)
     finally:
         ob.close()
 
@@ -94,18 +73,7 @@ def make_state_db(hermes_home: Path, session_rows: list[tuple]) -> None:
     detector selects: (id, source, parent_session_id, started_at, ended_at,
     expiry_finalized, profile_name).
     """
-    db = sqlite3.connect(hermes_home / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, expiry_finalized INT, profile_name TEXT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
-        """
-    )
-    db.executemany("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)", session_rows)
-    db.commit()
-    db.close()
+    helpers.make_state_db(hermes_home, sessions=session_rows)
 
 
 # --- not-initialized -------------------------------------------------------

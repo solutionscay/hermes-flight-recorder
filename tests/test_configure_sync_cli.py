@@ -18,15 +18,8 @@ from hermes_flight_recorder.collector import sync_config
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    for var in (
-        "SC_HERMES_FLIGHT_RECORDER_HOME",
-        "HERMES_HOME",
-        "HFR_INGEST_URL",
-        "HFR_CF_ACCESS_CLIENT_ID",
-        "HFR_CF_ACCESS_CLIENT_SECRET",
-    ):
-        monkeypatch.delenv(var, raising=False)
+def _clean_env(clean_env):
+    """Every test here runs with the recorder env vars cleared."""
 
 
 def _read(fr):

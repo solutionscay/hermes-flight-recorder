@@ -11,8 +11,9 @@ from __future__ import annotations
 import sqlite3
 from collections import Counter
 
+from helpers import new_outbox
+
 from hermes_flight_recorder.collector import kanban_db
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.envelope import validate
 
 # The kanban.db columns this adapter reads. Real Hermes boards have many more;
@@ -83,12 +84,6 @@ def make_board(db_path) -> None:
     )
     db.commit()
     db.close()
-
-
-def new_outbox(tmp_path):
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def types(outbox) -> Counter:

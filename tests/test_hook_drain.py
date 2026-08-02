@@ -15,14 +15,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import helpers
+
 from hermes_flight_recorder.collector.hook import SPOOL_FILENAME, drain
 from hermes_flight_recorder.collector.outbox import Outbox
 
 
 def new_outbox(flight_recorder_home: Path) -> Outbox:
-    ob = Outbox.open(flight_recorder_home)
-    ob.initialize()
-    return ob
+    """The outbox lives directly at ``flight_recorder_home`` — no bridge/ subdir:
+    these tests reopen the same directory (or keep config/keys beside it).
+    """
+    return helpers.new_outbox(flight_recorder_home, subdir=None)
 
 
 def write_spool(flight_recorder_home: Path, events: list[tuple[str, dict, float]]) -> None:

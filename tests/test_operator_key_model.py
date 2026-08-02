@@ -8,7 +8,6 @@ The cryptographic core itself is tested in ``test_content_crypto.py``.
 
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 
 import pytest
@@ -41,9 +40,8 @@ def _open(home: Path) -> Outbox:
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
-    monkeypatch.delenv("HERMES_HOME", raising=False)
+def _clean_env(clean_env):
+    """Every test here runs with the recorder env vars cleared."""
 
 
 # --- solo bootstrap -----------------------------------------------------

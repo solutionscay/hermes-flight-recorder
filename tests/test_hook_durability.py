@@ -17,6 +17,8 @@ import json
 import os
 from pathlib import Path
 
+import helpers
+
 from hermes_flight_recorder.collector.hook import CURSOR_NAME, SPOOL_FILENAME, drain
 from hermes_flight_recorder.collector.outbox import Outbox
 
@@ -24,9 +26,10 @@ drain_module = importlib.import_module("hermes_flight_recorder.collector.hook.dr
 
 
 def new_outbox(flight_recorder_home: Path) -> Outbox:
-    ob = Outbox.open(flight_recorder_home)
-    ob.initialize()
-    return ob
+    """The outbox lives directly at ``flight_recorder_home`` — no bridge/ subdir:
+    these tests reopen the same directory (or keep config/keys beside it).
+    """
+    return helpers.new_outbox(flight_recorder_home, subdir=None)
 
 
 def line(event_type: str, ctx: dict, ts: float = 1.0) -> str:

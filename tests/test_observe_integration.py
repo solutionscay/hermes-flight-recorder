@@ -18,67 +18,33 @@ Self-contained: no imports from other test modules.
 
 from __future__ import annotations
 
-import datetime
-import json
 import sqlite3
 from pathlib import Path
+
+from helpers import (
+    ASYNC_DELEGATIONS_DDL,
+    B,
+    MESSAGES_FULL,
+    SESSIONS_FULL,
+    USAGE_FULL,
+    _executions_db,
+    _interval_job,
+    _jobs_json,
+    add,
+    iso,
+    make_state_db,
+    new_outbox,
+)
 
 from hermes_flight_recorder import observe
 from hermes_flight_recorder.cli import main
 from hermes_flight_recorder.collector import cron_db, state_db
-from hermes_flight_recorder.collector._common import build_record
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
-
-# A fixed epoch anchor (never wall-clock) and a US-Central-like offset for
-# the cron store's ISO timestamps, matching tests/test_reconcile.py.
-B = 1784415000.0
-TZ = datetime.timezone(datetime.timedelta(hours=-5))
 
 # Reconcile thresholds small enough that B + 250 already crosses them, so
 # the whole pipeline is deterministic with no wall-clock dependency.
 CFG = ReconcileConfig(coverage_grace=0.0)
 NOW = B + 250  # the j1 cron gap sits at B+120/B+180; ticker heartbeat is fresh
-
-
-def iso(epoch: float) -> str:
-    return datetime.datetime.fromtimestamp(epoch, TZ).isoformat()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def add(
-    ob,
-    event_type,
-    *,
-    occurred_at=B,
-    session_id=None,
-    parent_session_id=None,
-    correlation_id="corr",
-    invocation_id=None,
-    payload=None,
-    partial=False,
-    content=None,
-):
-    """Append a producer record straight to the outbox (bypassing polling)."""
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source="test",
-        capture_method="test",
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=correlation_id,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        invocation_id=invocation_id,
-        payload=payload or {},
-        partial=partial,
-    )
-    return ob.append(rec, content=content)
 
 
 # --- synthetic durable stores --------------------------------------------
@@ -93,47 +59,25 @@ def _write_state_db(hh: Path) -> None:
     genuinely *derived* from the polled usage row, not hardcoded.
     """
     hh.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(hh / "state.db")
-    conn.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
-            message_count INT, tool_call_count INT, input_tokens INT, output_tokens INT,
-            estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
-            profile_name TEXT, expiry_finalized INT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
-            timestamp REAL, finish_reason TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
-            api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
-            reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
-        CREATE TABLE async_delegations (delegation_id TEXT, origin_session TEXT,
-            parent_session_id TEXT, state TEXT, delivery_state TEXT,
-            owner_pid INT, dispatched_at REAL, event_json TEXT, result_json TEXT);
-        """
+    make_state_db(
+        hh,
+        sessions=[
+            ("P", "cli", None, "m", 2, 1, 100, 20, 0.01, B, B + 50, "done", "default", 1),
+            ("C", "subagent", "P", "m", 1, 0, 0, 0, 0.0, B + 5, None, None, "default", 0),
+        ],
+        messages=[
+            (5, "P", "tool", "read_file", "tc1", None,
+             '{"exit_code":0,"detail":"SECRET-XYZ"}', B + 2, None),
+        ],
+        model_usage=[
+            ("P", "m", "chat", 2, 100, 20, 0, 0, 0.01, "estimated", B + 45),
+            ("C", "m", "chat", 1, 40, 8, 0, 0, 0.004, "estimated", B + 10),
+        ],
+        sessions_columns=SESSIONS_FULL,
+        messages_columns=MESSAGES_FULL,
+        usage_columns=USAGE_FULL,
+        extra_ddl=ASYNC_DELEGATIONS_DDL,
     )
-    conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("P", "cli", None, "m", 2, 1, 100, 20, 0.01, B, B + 50, "done", "default", 1),
-    )
-    conn.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("C", "subagent", "P", "m", 1, 0, 0, 0, 0.0, B + 5, None, None, "default", 0),
-    )
-    conn.execute(
-        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
-        (5, "P", "tool", "read_file", "tc1", None,
-         '{"exit_code":0,"detail":"SECRET-XYZ"}', B + 2, None),
-    )
-    conn.execute(
-        "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("P", "m", "chat", 2, 100, 20, 0, 0, 0.01, "estimated", B + 45),
-    )
-    conn.execute(
-        "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("C", "m", "chat", 1, 40, 8, 0, 0, 0.004, "estimated", B + 10),
-    )
-    conn.commit()
-    conn.close()
 
 
 def _insert_extra_tool_message(hh: Path, msg_id: int, session_id: str, content: str, ts: float) -> None:
@@ -153,28 +97,11 @@ def _write_cron_store(hh: Path) -> None:
     """
     cron = hh / "cron"
     cron.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(cron / "executions.db")
-    conn.execute(
-        "CREATE TABLE executions (id TEXT, job_id TEXT, source TEXT, pid INT, status TEXT, "
-        "claimed_at TEXT, started_at TEXT, finished_at TEXT, error TEXT)"
-    )
-    conn.executemany(
-        "INSERT INTO executions VALUES (?,?,'builtin',1,?,?,?,?,NULL)",
-        [
-            ("e1", "j1", "completed", iso(B + 60), iso(B + 60), iso(B + 61)),
-            ("e2", "j1", "completed", iso(B + 240), iso(B + 240), iso(B + 241)),
-        ],
-    )
-    conn.commit()
-    conn.close()
-    (cron / "jobs.json").write_text(json.dumps({"jobs": [{
-        "id": "j1",
-        "enabled": True,
-        "state": "scheduled",
-        "created_at": iso(B),
-        "schedule": {"kind": "interval", "minutes": 1},
-        "repeat": {"times": None, "completed": 0},
-    }]}))
+    _executions_db(cron, [
+        ("e1", "j1", "completed", iso(B + 60), iso(B + 60), iso(B + 61)),
+        ("e2", "j1", "completed", iso(B + 240), iso(B + 240), iso(B + 241)),
+    ])
+    _jobs_json(cron, [_interval_job("j1", minutes=1, created=B)])
     (cron / "ticker_heartbeat").write_text(str(B + 250))
 
 

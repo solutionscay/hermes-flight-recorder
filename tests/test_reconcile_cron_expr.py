@@ -24,11 +24,11 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import json
 import os
 import time
 
-from hermes_flight_recorder.collector.outbox import Outbox
+from helpers import _jobs_json, iso, new_outbox
+
 from hermes_flight_recorder.collector.cron_schedule import (
     _cron_instants,
     _dow,
@@ -40,21 +40,6 @@ from hermes_flight_recorder.collector.reconcile import (
     _cron_missed,
     reconcile,
 )
-
-# A fixed epoch anchor and a US-Central-like offset, matching tests/test_reconcile.py's
-# style (values here are independent of that module -- nothing is imported from it).
-B = 1784415000.0
-TZ = datetime.timezone(datetime.timedelta(hours=-5))
-
-
-def iso(epoch: float) -> str:
-    return datetime.datetime.fromtimestamp(epoch, TZ).isoformat()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def findings(outbox, event_type):
@@ -93,10 +78,6 @@ def host_tz(name: str):
         else:
             os.environ["TZ"] = old
         time.tzset()
-
-
-def _jobs_json(cron_dir, jobs) -> None:
-    (cron_dir / "jobs.json").write_text(json.dumps({"jobs": jobs}))
 
 
 def _cron_job(job_id: str, *, expression: str, created: float) -> dict:

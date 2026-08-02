@@ -10,14 +10,9 @@ delete (tombstone that keeps prior versions restorable).
 
 from __future__ import annotations
 
+from helpers import new_outbox
+
 from hermes_flight_recorder.collector import knowledge_store
-from hermes_flight_recorder.collector.outbox import Outbox
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def write(path, text: str) -> None:

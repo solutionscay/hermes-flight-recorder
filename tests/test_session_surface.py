@@ -9,43 +9,33 @@ the frozen envelope v1 contract (payload is a free-form dict).
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
+from helpers import (
+    ASYNC_DELEGATIONS_DDL,
+    MESSAGES_FULL,
+    SESSIONS_FULL,
+    USAGE_FULL,
+    make_state_db,
+    new_outbox,
+)
+
 from hermes_flight_recorder.collector import state_db
-from hermes_flight_recorder.collector.hook import SPOOL_FILENAME, drain
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.envelope import validate
 
 from test_hook_drain import by_type, drain_to_records, write_spool
-from test_state_adapter import new_outbox
 
 
 # --- state.db producer --------------------------------------------------
 def _sessions_db(hh, rows) -> None:
-    db = sqlite3.connect(hh / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
-            message_count INT, tool_call_count INT, input_tokens INT, output_tokens INT,
-            estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
-            profile_name TEXT, expiry_finalized INT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
-            timestamp REAL, finish_reason TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
-            api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
-            reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
-        CREATE TABLE async_delegations (delegation_id TEXT, origin_session TEXT,
-            parent_session_id TEXT, state TEXT, delivery_state TEXT,
-            owner_pid INT, dispatched_at REAL, event_json TEXT, result_json TEXT);
-        """
+    make_state_db(
+        hh,
+        sessions=rows,
+        sessions_columns=SESSIONS_FULL,
+        messages_columns=MESSAGES_FULL,
+        usage_columns=USAGE_FULL,
+        extra_ddl=ASYNC_DELEGATIONS_DDL,
     )
-    db.executemany(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows
-    )
-    db.commit()
-    db.close()
 
 
 def test_state_surface_matches_source_per_row(tmp_path):

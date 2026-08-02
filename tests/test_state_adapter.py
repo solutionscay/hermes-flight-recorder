@@ -11,63 +11,50 @@ import json
 import sqlite3
 from collections import Counter
 
+import helpers
+from helpers import (
+    ASYNC_DELEGATIONS_DDL,
+    MESSAGES_FULL,
+    SESSIONS_FULL,
+    USAGE_FULL,
+    new_outbox,
+)
+
 from hermes_flight_recorder.collector import cron_db, state_db
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.envelope import validate
 
 
 # --- fixtures -----------------------------------------------------------
 def make_state_db(hermes_home) -> None:
-    db = sqlite3.connect(hermes_home / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
-            message_count INT, tool_call_count INT, input_tokens INT, output_tokens INT,
-            estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
-            profile_name TEXT, expiry_finalized INT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
-            timestamp REAL, finish_reason TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
-            api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
-            reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
-        CREATE TABLE async_delegations (delegation_id TEXT, origin_session TEXT,
-            parent_session_id TEXT, state TEXT, delivery_state TEXT,
-            owner_pid INT, dispatched_at REAL, event_json TEXT, result_json TEXT);
-        """
-    )
     # Parent CLI session — still open (ended_at NULL). Subagent child — ended.
-    db.executemany(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [
+    helpers.make_state_db(
+        hermes_home,
+        sessions=[
             ("P", "cli", None, "m", 8, 2, 18071, 825, 0.0, 1000.0, None, None, None, 0),
             ("C", "subagent", "P", "m", 4, 1, 12278, 126, 0.0, 1007.0, 1015.0, "agent_close", None, None),
         ],
-    )
-    db.executemany(
-        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
-        [
+        messages=[
             (3, "P", "user", None, None, None, "do the thing", 1000.5, None),
             (5, "P", "tool", "terminal", None, None, '{"output":"Sat","exit_code":0}', 1002.0, None),
             (7, "P", "tool", "delegate_task", None, None, '{"status":"dispatched","count":1}', 1006.0, None),
             (9, "C", "assistant", None, None, None, "", 1009.0, "tool_calls"),
             (10, "C", "tool", "read_file", None, None, '{"content":"Sat Jul 18"}', 1010.0, None),
         ],
-    )
-    db.executemany(
-        "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        [
+        model_usage=[
             ("P", "m", "", 4, 18071, 825, 55296, 452, 0.0, "estimated", 1014.0),
             ("P", "m", "title_generation", 1, 259, 8, 0, 0, 0.0, None, 1001.0),
         ],
+        sessions_columns=SESSIONS_FULL,
+        messages_columns=MESSAGES_FULL,
+        usage_columns=USAGE_FULL,
+        extra_ddl=ASYNC_DELEGATIONS_DDL,
+        extra_rows={
+            "async_delegations": [
+                ("deleg_1", "P", "P", "completed", "delivered", 4023601, 1006.0,
+                 '{"goal":"read the file","is_batch":true}', '{"results":[{"summary":"Saturday"}]}'),
+            ],
+        },
     )
-    db.execute(
-        "INSERT INTO async_delegations VALUES (?,?,?,?,?,?,?,?,?)",
-        ("deleg_1", "P", "P", "completed", "delivered", 4023601, 1006.0,
-         '{"goal":"read the file","is_batch":true}', '{"results":[{"summary":"Saturday"}]}'),
-    )
-    db.commit()
-    db.close()
 
 
 def make_cron(hermes_home) -> None:
@@ -94,12 +81,6 @@ def make_cron(hermes_home) -> None:
     (cron / "ticker_heartbeat").write_text("1784415389.44")
     (cron / "ticker_last_success").write_text("1784415389.44")
     (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "flight-recorder-probe"}]}))
-
-
-def new_outbox(tmp_path):
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def types(outbox) -> Counter:

@@ -20,12 +20,8 @@ from hermes_flight_recorder.collector.outbox import Outbox
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(tmp_path, monkeypatch):
-    user_home = tmp_path / "user-home"
-    user_home.mkdir()
-    monkeypatch.setenv("HOME", str(user_home))
-    monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
-    monkeypatch.delenv("HERMES_HOME", raising=False)
+def _clean_env(clean_env, isolated_user_home):
+    """Recorder env vars cleared and HOME pointed at a fresh directory."""
 
 
 def _hermes(tmp_path) -> Path:

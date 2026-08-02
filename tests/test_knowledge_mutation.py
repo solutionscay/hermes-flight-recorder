@@ -7,30 +7,19 @@ import sqlite3
 
 import pytest
 
+import helpers
+from helpers import ASYNC_DELEGATIONS_DDL, SESSIONS_FULL, USAGE_FULL, new_outbox
+
 from hermes_flight_recorder.collector import keystore, knowledge_store, state_db
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.recorder_config import KnowledgeConfig
 from hermes_flight_recorder.envelope import validate
 
 
-def new_outbox(tmp_path) -> Outbox:
-    outbox = Outbox.open(tmp_path / "bridge")
-    outbox.initialize()
-    return outbox
-
-
-def make_state_db(home, calls) -> None:
-    db = sqlite3.connect(home / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (
-            id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
-            message_count INT, tool_call_count INT, input_tokens INT,
-            output_tokens INT, estimated_cost_usd REAL, started_at REAL,
-            ended_at REAL, end_reason TEXT, profile_name TEXT,
-            expiry_finalized INT
-        );
-        CREATE TABLE messages (
+# The real Hermes messages schema — partial-column inserts below rely on its
+# AUTOINCREMENT/NOT NULL/DEFAULT attributes, so it stays richer than
+# helpers.MESSAGES_FULL on purpose.
+_HERMES_MESSAGES_COLUMNS = """
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
             role TEXT NOT NULL,
@@ -51,25 +40,22 @@ def make_state_db(home, calls) -> None:
             observed INTEGER DEFAULT 0,
             active INTEGER NOT NULL DEFAULT 1,
             compacted INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE session_model_usage (
-            session_id TEXT, model TEXT, task TEXT, api_call_count INT,
-            input_tokens INT, output_tokens INT, cache_read_tokens INT,
-            reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT,
-            last_seen REAL
-        );
-        CREATE TABLE async_delegations (
-            delegation_id TEXT, origin_session TEXT, parent_session_id TEXT,
-            state TEXT, delivery_state TEXT, owner_pid INT, dispatched_at REAL,
-            event_json TEXT, result_json TEXT
-        );
-        """
+"""
+
+
+def make_state_db(home, calls) -> None:
+    helpers.make_state_db(
+        home,
+        sessions=[
+            ("S", "cli", None, "m", len(calls) * 2, len(calls), 0, 0, 0.0,
+             1000.0, None, None, "default", 0),
+        ],
+        sessions_columns=SESSIONS_FULL,
+        messages_columns=_HERMES_MESSAGES_COLUMNS,
+        usage_columns=USAGE_FULL,
+        extra_ddl=ASYNC_DELEGATIONS_DDL,
     )
-    db.execute(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("S", "cli", None, "m", len(calls) * 2, len(calls), 0, 0, 0.0,
-         1000.0, None, None, "default", 0),
-    )
+    db = sqlite3.connect(home / "state.db")
     for index, (tool_name, arguments, result) in enumerate(calls, start=1):
         call_id = f"call-{index}"
         assistant_id = index * 2 - 1
