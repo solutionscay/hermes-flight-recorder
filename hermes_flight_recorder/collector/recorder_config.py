@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, fields
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -120,224 +122,6 @@ def config_path(flight_recorder_home: str | os.PathLike[str] | None = None) -> P
     return home / CONFIG_FILENAME
 
 
-def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> RecorderConfig:
-    """Load config with environment-over-file-over-default precedence."""
-    data = _read_file(config_path(flight_recorder_home))
-    capture = _section(data, "capture")
-    retention = _section(data, "retention")
-    knowledge = _section(data, "knowledge")
-    sync = _section(data, "sync")
-    reconcile = _section(data, "reconcile")
-
-    return RecorderConfig(
-        capture=CaptureConfig(
-            max_content_bytes=_positive_int(
-                _value(
-                    "HFR_CAPTURE_MAX_CONTENT_BYTES",
-                    capture,
-                    "max_content_bytes",
-                    DEFAULT_MAX_CONTENT_BYTES,
-                ),
-                "capture.max_content_bytes",
-            ),
-            message_roles=_roles(
-                _value(
-                    "HFR_CAPTURE_MESSAGE_ROLES",
-                    capture,
-                    "message_roles",
-                    DEFAULT_MESSAGE_ROLES,
-                )
-            ),
-            sources=_sources(_value("HFR_CAPTURE_SOURCES", capture, "sources", {})),
-            required_sources=_source_names(
-                _value(
-                    "HFR_CAPTURE_REQUIRED_SOURCES",
-                    capture,
-                    "required_sources",
-                    DEFAULT_REQUIRED_CAPTURE_SOURCES,
-                ),
-                "capture.required_sources",
-            ),
-            interval_seconds=_positive_float(
-                _value(
-                    "HFR_CAPTURE_INTERVAL_SECONDS",
-                    capture,
-                    "interval_seconds",
-                    DEFAULT_CAPTURE_INTERVAL_SECONDS,
-                ),
-                "capture.interval_seconds",
-            ),
-        ),
-        retention=RetentionConfig(
-            enabled=_boolean(
-                _value("HFR_RETENTION_ENABLED", retention, "enabled", False),
-                "retention.enabled",
-            ),
-            max_age_days=_optional_positive_int(
-                _value("HFR_RETENTION_MAX_AGE_DAYS", retention, "max_age_days", 30),
-                "retention.max_age_days",
-            ),
-            max_bytes=_optional_positive_int(
-                _value("HFR_RETENTION_MAX_BYTES", retention, "max_bytes", None),
-                "retention.max_bytes",
-            ),
-            require_delivered=_boolean(
-                _value("HFR_RETENTION_REQUIRE_DELIVERED", retention, "require_delivered", True),
-                "retention.require_delivered",
-            ),
-            vacuum=_choice(
-                _value("HFR_RETENTION_VACUUM", retention, "vacuum", "auto"),
-                "retention.vacuum",
-                {"auto"},
-            ),
-        ),
-        knowledge=KnowledgeConfig(
-            history=_choice(
-                _value("HFR_KNOWLEDGE_HISTORY", knowledge, "history", "full"),
-                "knowledge.history",
-                {"full", "latest_only"},
-            ),
-            max_versions=_optional_positive_int(
-                _value("HFR_KNOWLEDGE_MAX_VERSIONS", knowledge, "max_versions", None),
-                "knowledge.max_versions",
-            ),
-            max_file_bytes=_positive_int(
-                _value(
-                    "HFR_KNOWLEDGE_MAX_FILE_BYTES",
-                    knowledge,
-                    "max_file_bytes",
-                    DEFAULT_KNOWLEDGE_MAX_FILE_BYTES,
-                ),
-                "knowledge.max_file_bytes",
-            ),
-            max_file_count=_positive_int(
-                _value(
-                    "HFR_KNOWLEDGE_MAX_FILE_COUNT",
-                    knowledge,
-                    "max_file_count",
-                    DEFAULT_KNOWLEDGE_MAX_FILE_COUNT,
-                ),
-                "knowledge.max_file_count",
-            ),
-            max_artifact_bytes=_positive_int(
-                _value(
-                    "HFR_KNOWLEDGE_MAX_ARTIFACT_BYTES",
-                    knowledge,
-                    "max_artifact_bytes",
-                    DEFAULT_KNOWLEDGE_MAX_ARTIFACT_BYTES,
-                ),
-                "knowledge.max_artifact_bytes",
-            ),
-        ),
-        sync=SyncRuntimeConfig(
-            interval_seconds=_optional_positive_float(
-                _value("HFR_SYNC_INTERVAL_SECONDS", sync, "interval_seconds", None),
-                "sync.interval_seconds",
-            ),
-            max_records=_positive_int(
-                _value("HFR_SYNC_MAX_RECORDS", sync, "max_records", DEFAULT_MAX_RECORDS),
-                "sync.max_records",
-            ),
-            max_bytes=_bounded_positive_int(
-                _value("HFR_SYNC_MAX_BYTES", sync, "max_bytes", DEFAULT_MAX_BYTES),
-                "sync.max_bytes",
-                maximum=MAX_INGEST_BATCH_BYTES,
-            ),
-            max_batches_per_tick=_positive_int(
-                _value(
-                    "HFR_SYNC_MAX_BATCHES_PER_TICK",
-                    sync,
-                    "max_batches_per_tick",
-                    DEFAULT_SYNC_MAX_BATCHES_PER_TICK,
-                ),
-                "sync.max_batches_per_tick",
-            ),
-        ),
-        reconcile=ReconcileRuntimeConfig(
-            interval_seconds=_positive_float(
-                _value(
-                    "HFR_RECONCILE_INTERVAL_SECONDS",
-                    reconcile,
-                    "interval_seconds",
-                    DEFAULT_RECONCILE_INTERVAL_SECONDS,
-                ),
-                "reconcile.interval_seconds",
-            ),
-            audit_interval_seconds=_positive_float(
-                _value(
-                    "HFR_RECONCILE_AUDIT_INTERVAL_SECONDS",
-                    reconcile,
-                    "audit_interval_seconds",
-                    DEFAULT_RECONCILE_AUDIT_INTERVAL_SECONDS,
-                ),
-                "reconcile.audit_interval_seconds",
-            ),
-        ),
-    )
-
-
-def save(
-    config: RecorderConfig, flight_recorder_home: str | os.PathLike[str] | None = None
-) -> Path:
-    """Write the config durably and atomically with mode ``0600``."""
-    path = config_path(flight_recorder_home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "capture": {
-            "max_content_bytes": config.capture.max_content_bytes,
-            "message_roles": list(config.capture.message_roles),
-            "sources": config.capture.sources,
-            "required_sources": list(config.capture.required_sources),
-            "interval_seconds": config.capture.interval_seconds,
-        },
-        "retention": {
-            "enabled": config.retention.enabled,
-            "max_age_days": config.retention.max_age_days,
-            "max_bytes": config.retention.max_bytes,
-            "require_delivered": config.retention.require_delivered,
-            "vacuum": config.retention.vacuum,
-        },
-        "knowledge": {
-            "history": config.knowledge.history,
-            "max_versions": config.knowledge.max_versions,
-            "max_file_bytes": config.knowledge.max_file_bytes,
-            "max_file_count": config.knowledge.max_file_count,
-            "max_artifact_bytes": config.knowledge.max_artifact_bytes,
-        },
-        "sync": {
-            "interval_seconds": config.sync.interval_seconds,
-            "max_records": config.sync.max_records,
-            "max_bytes": config.sync.max_bytes,
-            "max_batches_per_tick": config.sync.max_batches_per_tick,
-        },
-        "reconcile": {
-            "interval_seconds": config.reconcile.interval_seconds,
-            "audit_interval_seconds": config.reconcile.audit_interval_seconds,
-        },
-    }
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    try:
-        return atomic_file.atomic_write(path, text.encode("utf-8"), mode=0o600)
-    except OSError as exc:
-        raise RecorderConfigError(
-            f"cannot write recorder config at {path}: {exc}"
-        ) from exc
-
-
-def _read_file(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, OSError) as exc:
-        raise RecorderConfigError(
-            f"cannot read recorder config at {path}: {exc}"
-        ) from exc
-    if not isinstance(data, dict):
-        raise RecorderConfigError(f"recorder config at {path} is not a JSON object")
-    return data
-
-
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name, {})
     if not isinstance(value, dict):
@@ -407,34 +191,32 @@ def _boolean(value: Any, name: str) -> bool:
     raise RecorderConfigError(f"{name} must be true or false")
 
 
-def _choice(value: Any, name: str, choices: set[str]) -> str:
+def _choice(value: Any, name: str, *, choices: set[str]) -> str:
     if not isinstance(value, str) or value not in choices:
         expected = ", ".join(sorted(repr(choice) for choice in choices))
         raise RecorderConfigError(f"{name} must be one of: {expected}")
     return value
 
 
-def _roles(value: Any) -> tuple[str, ...]:
+def _roles(value: Any, name: str) -> tuple[str, ...]:
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except ValueError as exc:
-            raise RecorderConfigError("capture.message_roles must be a JSON array") from exc
+            raise RecorderConfigError(f"{name} must be a JSON array") from exc
     if not isinstance(value, (list, tuple)) or not all(
         isinstance(role, str) and role for role in value
     ):
-        raise RecorderConfigError(
-            "capture.message_roles must be an array of non-empty strings"
-        )
+        raise RecorderConfigError(f"{name} must be an array of non-empty strings")
     return tuple(value)
 
 
-def _sources(value: Any) -> dict[str, bool]:
+def _sources(value: Any, name: str) -> dict[str, bool]:
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except ValueError as exc:
-            raise RecorderConfigError("capture.sources must be a JSON object") from exc
+            raise RecorderConfigError(f"{name} must be a JSON object") from exc
     _validate_sources(value)
     return dict(value)
 
@@ -483,6 +265,71 @@ def _validate_required_sources(value: Any) -> None:
             "capture.required_sources contains unknown source(s): "
             f"{names}; supported: {supported}"
         )
+
+
+# Each validator receives the raw value and the "section.key" name and returns
+# the normalized value or raises RecorderConfigError.
+_Validator = Callable[[Any, str], Any]
+
+# The single marshalling table: one row per configurable key, in the order the
+# keys appear in the dataclasses above. To add a key, add the dataclass field,
+# its default constant, and one (section, key, env var, default, validator)
+# row here. ``save`` needs no changes — it serializes the dataclasses directly.
+_FIELDS: tuple[tuple[str, str, str, Any, _Validator], ...] = (
+    ("capture", "max_content_bytes", "HFR_CAPTURE_MAX_CONTENT_BYTES", DEFAULT_MAX_CONTENT_BYTES, _positive_int),
+    ("capture", "message_roles", "HFR_CAPTURE_MESSAGE_ROLES", DEFAULT_MESSAGE_ROLES, _roles),
+    ("capture", "sources", "HFR_CAPTURE_SOURCES", {}, _sources),
+    ("capture", "required_sources", "HFR_CAPTURE_REQUIRED_SOURCES", DEFAULT_REQUIRED_CAPTURE_SOURCES, _source_names),
+    ("capture", "interval_seconds", "HFR_CAPTURE_INTERVAL_SECONDS", DEFAULT_CAPTURE_INTERVAL_SECONDS, _positive_float),
+    ("retention", "enabled", "HFR_RETENTION_ENABLED", False, _boolean),
+    ("retention", "max_age_days", "HFR_RETENTION_MAX_AGE_DAYS", 30, _optional_positive_int),
+    ("retention", "max_bytes", "HFR_RETENTION_MAX_BYTES", None, _optional_positive_int),
+    ("retention", "require_delivered", "HFR_RETENTION_REQUIRE_DELIVERED", True, _boolean),
+    ("retention", "vacuum", "HFR_RETENTION_VACUUM", "auto", partial(_choice, choices={"auto"})),
+    ("knowledge", "history", "HFR_KNOWLEDGE_HISTORY", "full", partial(_choice, choices={"full", "latest_only"})),
+    ("knowledge", "max_versions", "HFR_KNOWLEDGE_MAX_VERSIONS", None, _optional_positive_int),
+    ("knowledge", "max_file_bytes", "HFR_KNOWLEDGE_MAX_FILE_BYTES", DEFAULT_KNOWLEDGE_MAX_FILE_BYTES, _positive_int),
+    ("knowledge", "max_file_count", "HFR_KNOWLEDGE_MAX_FILE_COUNT", DEFAULT_KNOWLEDGE_MAX_FILE_COUNT, _positive_int),
+    ("knowledge", "max_artifact_bytes", "HFR_KNOWLEDGE_MAX_ARTIFACT_BYTES", DEFAULT_KNOWLEDGE_MAX_ARTIFACT_BYTES, _positive_int),
+    ("sync", "interval_seconds", "HFR_SYNC_INTERVAL_SECONDS", None, _optional_positive_float),
+    ("sync", "max_records", "HFR_SYNC_MAX_RECORDS", DEFAULT_MAX_RECORDS, _positive_int),
+    ("sync", "max_bytes", "HFR_SYNC_MAX_BYTES", DEFAULT_MAX_BYTES, partial(_bounded_positive_int, maximum=MAX_INGEST_BATCH_BYTES)),
+    ("sync", "max_batches_per_tick", "HFR_SYNC_MAX_BATCHES_PER_TICK", DEFAULT_SYNC_MAX_BATCHES_PER_TICK, _positive_int),
+    ("reconcile", "interval_seconds", "HFR_RECONCILE_INTERVAL_SECONDS", DEFAULT_RECONCILE_INTERVAL_SECONDS, _positive_float),
+    ("reconcile", "audit_interval_seconds", "HFR_RECONCILE_AUDIT_INTERVAL_SECONDS", DEFAULT_RECONCILE_AUDIT_INTERVAL_SECONDS, _positive_float),
+)
+
+# Section name -> section dataclass, straight from the RecorderConfig fields.
+_SECTION_TYPES: dict[str, Callable[..., Any]] = {
+    section.name: section.default_factory for section in fields(RecorderConfig)
+}
+
+
+def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> RecorderConfig:
+    """Load config with environment-over-file-over-default precedence."""
+    path = config_path(flight_recorder_home)
+    data = atomic_file.read_json_object(
+        path, error=RecorderConfigError, description="recorder config", missing_ok=True
+    )
+    sections = {name: _section(data, name) for name in _SECTION_TYPES}
+    values: dict[str, dict[str, Any]] = {name: {} for name in _SECTION_TYPES}
+    for section, key, env_name, default, validate in _FIELDS:
+        raw = _value(env_name, sections[section], key, default)
+        values[section][key] = validate(raw, f"{section}.{key}")
+    return RecorderConfig(
+        **{name: cls(**values[name]) for name, cls in _SECTION_TYPES.items()}
+    )
+
+
+def save(
+    config: RecorderConfig, flight_recorder_home: str | os.PathLike[str] | None = None
+) -> Path:
+    """Write the config durably and atomically with mode ``0600``."""
+    path = config_path(flight_recorder_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return atomic_file.write_json_object(
+        path, asdict(config), error=RecorderConfigError, description="recorder config"
+    )
 
 
 def source_enabled(config: CaptureConfig, name: str) -> bool:
