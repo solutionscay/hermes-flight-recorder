@@ -161,22 +161,32 @@ def test_interval_defaults(tmp_path):
     config = recorder_config.load(tmp_path)
     assert config.capture.interval_seconds == 15.0
     assert config.reconcile.interval_seconds == 60.0
+    assert config.reconcile.audit_interval_seconds == 3600.0
 
 
 def test_interval_file_and_env_overrides(tmp_path, monkeypatch):
     write_config(
         tmp_path,
-        {"capture": {"interval_seconds": 5}, "reconcile": {"interval_seconds": 30}},
+        {
+            "capture": {"interval_seconds": 5},
+            "reconcile": {
+                "interval_seconds": 30,
+                "audit_interval_seconds": 1800,
+            },
+        },
     )
     filed = recorder_config.load(tmp_path)
     assert filed.capture.interval_seconds == 5.0
     assert filed.reconcile.interval_seconds == 30.0
+    assert filed.reconcile.audit_interval_seconds == 1800.0
 
     monkeypatch.setenv("HFR_CAPTURE_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("HFR_RECONCILE_INTERVAL_SECONDS", "45")
+    monkeypatch.setenv("HFR_RECONCILE_AUDIT_INTERVAL_SECONDS", "900")
     env = recorder_config.load(tmp_path)
     assert env.capture.interval_seconds == 2.5
     assert env.reconcile.interval_seconds == 45.0
+    assert env.reconcile.audit_interval_seconds == 900.0
 
 
 @pytest.mark.parametrize(
@@ -185,6 +195,10 @@ def test_interval_file_and_env_overrides(tmp_path, monkeypatch):
         ({"capture": {"interval_seconds": 0}}, "capture.interval_seconds"),
         ({"capture": {"interval_seconds": -1}}, "capture.interval_seconds"),
         ({"reconcile": {"interval_seconds": 0}}, "reconcile.interval_seconds"),
+        (
+            {"reconcile": {"audit_interval_seconds": 0}},
+            "reconcile.audit_interval_seconds",
+        ),
     ],
 )
 def test_non_positive_intervals_rejected(tmp_path, payload, match):
@@ -196,7 +210,9 @@ def test_non_positive_intervals_rejected(tmp_path, payload, match):
 def test_intervals_survive_save_round_trip(tmp_path):
     config = recorder_config.RecorderConfig(
         capture=recorder_config.CaptureConfig(interval_seconds=7.0),
-        reconcile=recorder_config.ReconcileRuntimeConfig(interval_seconds=90.0),
+        reconcile=recorder_config.ReconcileRuntimeConfig(
+            interval_seconds=90.0, audit_interval_seconds=1800.0
+        ),
     )
     recorder_config.save(config, tmp_path)
     assert recorder_config.load(tmp_path) == config

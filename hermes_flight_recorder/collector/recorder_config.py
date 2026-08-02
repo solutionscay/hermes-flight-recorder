@@ -31,6 +31,7 @@ DEFAULT_KNOWLEDGE_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 # diffs the durable stores less often. These match the retired systemd timers.
 DEFAULT_CAPTURE_INTERVAL_SECONDS = 15.0
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 60.0
+DEFAULT_RECONCILE_AUDIT_INTERVAL_SECONDS = 3600.0
 DEFAULT_SYNC_MAX_BATCHES_PER_TICK = 1
 CAPTURE_SOURCE_NAMES = (
     "hook",
@@ -66,6 +67,7 @@ class ReconcileRuntimeConfig:
     # How often `serve` runs a reconcile pass — independent of capture so it
     # can flag capture staleness even when the capture pass is broken.
     interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS
+    audit_interval_seconds: float = DEFAULT_RECONCILE_AUDIT_INTERVAL_SECONDS
 
 
 @dataclass(frozen=True)
@@ -261,6 +263,15 @@ def load(flight_recorder_home: str | os.PathLike[str] | None = None) -> Recorder
                 ),
                 "reconcile.interval_seconds",
             ),
+            audit_interval_seconds=_positive_float(
+                _value(
+                    "HFR_RECONCILE_AUDIT_INTERVAL_SECONDS",
+                    reconcile,
+                    "audit_interval_seconds",
+                    DEFAULT_RECONCILE_AUDIT_INTERVAL_SECONDS,
+                ),
+                "reconcile.audit_interval_seconds",
+            ),
         ),
     )
 
@@ -301,6 +312,7 @@ def save(
         },
         "reconcile": {
             "interval_seconds": config.reconcile.interval_seconds,
+            "audit_interval_seconds": config.reconcile.audit_interval_seconds,
         },
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
@@ -495,6 +507,7 @@ __all__ = [
     "DEFAULT_REQUIRED_CAPTURE_SOURCES",
     "DEFAULT_CAPTURE_INTERVAL_SECONDS",
     "DEFAULT_MAX_CONTENT_BYTES",
+    "DEFAULT_RECONCILE_AUDIT_INTERVAL_SECONDS",
     "DEFAULT_RECONCILE_INTERVAL_SECONDS",
     "DEFAULT_SYNC_MAX_BATCHES_PER_TICK",
     "CaptureConfig",

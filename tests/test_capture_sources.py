@@ -125,3 +125,24 @@ def test_disabled_sources_skip_related_reconciliation(tmp_path, monkeypatch):
     )
 
     assert counts == {}
+
+
+def test_frequent_reconcile_skips_complete_audit_scans(tmp_path, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("complete audit ran on the frequent path")
+
+    monkeypatch.setattr(reconcile_module, "_load_execution_rows", unexpected)
+    monkeypatch.setattr(reconcile_module, "_detect_sequence_gaps", unexpected)
+    monkeypatch.setattr(reconcile_module, "_detect_coverage_gaps", unexpected)
+    monkeypatch.setattr(reconcile_module, "_detect_missing_terminals", unexpected)
+    monkeypatch.setattr(reconcile_module, "_detect_missed_cron", unexpected)
+    monkeypatch.setattr(reconcile_module, "_detect_knowledge_gaps", unexpected)
+
+    counts = reconcile_module.reconcile(
+        new_outbox(tmp_path),
+        tmp_path / "missing-hermes",
+        now=200,
+        full_audit=False,
+    )
+
+    assert counts == {}

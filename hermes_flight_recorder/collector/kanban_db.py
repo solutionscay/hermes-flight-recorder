@@ -36,13 +36,11 @@ from ._common import (
     append_and_count,
     build_record,
     kanban_board_dbs,
-    open_sqlite_read_only,
     read_home_mode,
     resolve_hermes_home,
     runtime_stamp,
-    sqlite_select_list,
-    sqlite_table_exists,
 )
+from .kanban_watermarks import TASK_META_COLUMNS, read_board
 
 # Hermes task_events.kind -> the task-level task.* event it maps to. Kinds absent
 # here (assigned, commented, heartbeat, claim_extended, spawned, promoted,
@@ -77,17 +75,6 @@ _RUN_DISPOSITION = {
     "scheduled": "released",
 }
 
-# Current-snapshot task columns that are plaintext metadata (never free text).
-_TASK_META = (
-    "priority",
-    "assignee",
-    "project_id",
-    "idempotency_key",
-    "block_kind",
-    "consecutive_failures",
-)
-
-
 def poll(
     outbox: Any, hermes_home: str | Path | None = None, *, since: float | None = None
 ) -> dict[str, int]:
@@ -105,40 +92,10 @@ def poll(
 
 
 def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None) -> None:
-    conn = open_sqlite_read_only(db_path)
-    try:
-        # task_events is the lifecycle log; with no such table there is nothing
-        # to emit from this board (an older or partial kanban schema).
-        if not sqlite_table_exists(conn, "task_events"):
-            return
-        tasks = {}
-        if sqlite_table_exists(conn, "tasks"):
-            task_select = sqlite_select_list(
-                conn,
-                "tasks",
-                ("id", "status", "session_id", "priority", "assignee",
-                 "project_id", "idempotency_key", "block_kind", "consecutive_failures"),
-            )
-            tasks = {r["id"]: r for r in conn.execute(f"SELECT {task_select} FROM tasks")}
-        runs = {}
-        if sqlite_table_exists(conn, "task_runs"):
-            run_select = sqlite_select_list(
-                conn,
-                "task_runs",
-                ("id", "task_id", "claim_lock", "claim_expires", "worker_pid",
-                 "last_heartbeat_at", "started_at", "ended_at", "outcome", "profile",
-                 "step_key"),
-            )
-            runs = {r["id"]: r for r in conn.execute(f"SELECT {run_select} FROM task_runs")}
-        event_select = sqlite_select_list(
-            conn, "task_events", ("id", "task_id", "run_id", "kind", "created_at")
-        )
-        events = conn.execute(
-            f"SELECT {event_select} FROM task_events ORDER BY id"
-        ).fetchall()
-    finally:
-        conn.close()
-
+    batch = read_board(outbox, board, db_path)
+    if batch is None:
+        return
+    events, runs, tasks = batch.events, batch.runs, batch.tasks
     rt = runtime_stamp("kanban", home_mode=home_mode)
     for ev in events:
         if occurred_before(since, ev["created_at"]):
@@ -186,6 +143,8 @@ def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None
             outbox, counts, record, dedup_key=f"kanban:{board}:run:{run_id}"
         )
 
+    batch.advance()
+
 
 def _payload(board: str, ev, task, run) -> dict[str, Any]:
     """Plaintext coordination metadata for one task lifecycle event."""
@@ -202,7 +161,7 @@ def _payload(board: str, ev, task, run) -> dict[str, Any]:
     _add_lease_fields(payload, run)
     if task is not None:
         payload["status"] = task["status"]
-        for col in _TASK_META:
+        for col in TASK_META_COLUMNS:
             value = task[col]
             if value is not None:
                 payload[col] = value
