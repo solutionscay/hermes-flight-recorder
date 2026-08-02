@@ -14,6 +14,7 @@ from ._common import (
     load_json_dict,
     open_sqlite_read_only,
     read_float,
+    sqlite_select_chunked,
     sqlite_select_list,
     sqlite_table_columns,
     ticker_heartbeat_path,
@@ -21,6 +22,7 @@ from ._common import (
 )
 from .reconcile_common import emit_finding, emit_terminal_missing
 from .kanban_watermarks import open_run_ids
+from .watermark import meta_float
 
 _PID_RE = re.compile(r"PID (\d+)")
 
@@ -113,19 +115,12 @@ def load_open_task_runs(home: Path, *, outbox=None) -> list[dict[str, Any]]:
 
 
 def _select_open_run_ids(conn, select: str, ids: set[Any]) -> list[Any]:
-    values = list(ids)
-    rows = []
-    for start in range(0, len(values), 500):
-        group = values[start : start + 500]
-        placeholders = ",".join("?" for _ in group)
-        rows.extend(
-            conn.execute(
-                f"SELECT {select} FROM task_runs "
-                f"WHERE outcome IS NULL AND id IN ({placeholders})",
-                group,
-            ).fetchall()
-        )
-    return rows
+    return sqlite_select_chunked(
+        conn,
+        f"SELECT {select} FROM task_runs "
+        "WHERE outcome IS NULL AND id IN ({placeholders})",
+        ids,
+    )
 
 
 def detect_gateway_start_failed(outbox, home, counts, when) -> None:
@@ -253,12 +248,8 @@ def ticker_is_stale(outbox, home, counts, when, config) -> bool:
 
 
 def detect_capture_stale(outbox, counts, when, config) -> None:
-    raw = outbox.get_meta(CAPTURE_HEARTBEAT_KEY)
-    if raw is None:
-        return
-    try:
-        last = float(raw)
-    except (TypeError, ValueError):
+    last = meta_float(outbox, CAPTURE_HEARTBEAT_KEY)
+    if last is None:
         return
     staleness = when - last
     if staleness <= config.capture_stale_after:

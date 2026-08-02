@@ -13,10 +13,16 @@ Each incremental scan uses this sequence:
 
 1. Read the durable watermark.
 2. Subtract the configured overlap to get the lower bound.
-3. Read the source high-water mark in one source database snapshot.
+3. Read the source high-water mark in one source database snapshot. The mark
+   is clamped to the durable watermark, so a truncated or reset source cannot
+   pull the scan range or the watermark backwards.
 4. Query the bounded range with an indexed source column.
 5. Append each result with a stable deduplication key.
 6. Advance the watermark only after all results succeed.
+
+`Watermark.high_water` and `Watermark.bounded_rows` in
+`collector/watermark.py` own this mechanism. Collectors keep only their
+column lists and row interpretation.
 
 The overlap reads a small set of old rows again. Outbox deduplication makes
 these reads safe. A failed pass keeps the old watermark, so the next pass reads

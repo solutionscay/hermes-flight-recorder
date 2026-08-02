@@ -78,19 +78,11 @@ def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
         watermark = Watermark(
             outbox, _EXECUTION_WATERMARK, overlap=_EXECUTION_OVERLAP
         )
-        lower_bound = watermark.lower_bound()
         conn.execute("BEGIN")
         try:
-            upper_bound = int(
-                conn.execute(
-                    "SELECT COALESCE(MAX(rowid), 0) FROM executions"
-                ).fetchone()[0]
+            rows, high_water = watermark.bounded_rows(
+                conn, "executions", f"rowid AS _watermark, {select}", "rowid"
             )
-            rows = conn.execute(
-                f"SELECT rowid AS _watermark, {select} FROM executions "
-                "WHERE rowid > ? AND rowid <= ? ORDER BY rowid",
-                (lower_bound, upper_bound),
-            ).fetchall()
         finally:
             conn.rollback()
     finally:
@@ -147,7 +139,7 @@ def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
             dedup_key=f"cron:finished:{exid}",
         )
 
-    watermark.advance(upper_bound)
+    watermark.advance(high_water)
 
 
 def _poll_heartbeat(outbox, home: Path, counts, home_mode) -> None:

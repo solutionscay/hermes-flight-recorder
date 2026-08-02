@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any
 
-from .watermark import Watermark
+from .watermark import Watermark, load_meta_json, save_meta_json
 
 _CURSOR = "state.db:invocation-events:v1"
 _OVERLAP = 64
@@ -102,15 +101,7 @@ def _meta_key(session_id: str) -> str:
 
 
 def _load_session_windows(outbox, session_id: str) -> list[InvocationWindow]:
-    raw = outbox.get_meta(_meta_key(session_id))
-    if raw is None:
-        return []
-    try:
-        values = json.loads(raw)
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(values, list):
-        return []
+    values = load_meta_json(outbox, _meta_key(session_id), [])
     result = []
     for value in values:
         if not isinstance(value, dict):
@@ -139,7 +130,7 @@ def _save_session_windows(
         }
         for window in windows
     ]
-    outbox.set_meta(_meta_key(session_id), json.dumps(value, separators=(",", ":")))
+    save_meta_json(outbox, _meta_key(session_id), value)
 
 
 def _number(value: Any) -> float:
