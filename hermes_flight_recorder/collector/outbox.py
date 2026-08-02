@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -45,9 +46,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from ..envelope import SCHEMA_VERSION, parse, serialize, validate
+from ..envelope import RECONCILE_FINDING_TYPES, SCHEMA_VERSION, parse, serialize, validate
 from . import content_crypto as cc
 from . import keystore
+from . import recorder_config
+from . import secret_detector
+from . import security_scan
 from ._common import (
     CAPTURE_BACKFILL_META_KEY,
     FLIGHT_RECORDER_DIR_NAME,
@@ -77,6 +81,8 @@ _CONTENT_FIELDS = (
     "content_hash",
     "key_version",
 )
+_SECURITY_FINDING_EVENT = "security.secret_detected"
+_SECURITY_LOG = logging.getLogger("hermes_flight_recorder.security")
 # ``old_version: (new_version, method_name)``. Each method runs inside the
 # transaction that also advances the durable schema version.
 _MIGRATIONS: dict[str, tuple[str, str]] = {
@@ -237,6 +243,7 @@ class Outbox(KnowledgeOutboxMixin):
         # Depth of the open ``batch()`` context; 0 means every append runs in
         # its own ``BEGIN IMMEDIATE`` transaction (the historical behavior).
         self._batch_depth = 0
+        self._security_config: recorder_config.SecurityConfig | None = None
         self._apply_migrations()
 
     @property
@@ -606,6 +613,8 @@ class Outbox(KnowledgeOutboxMixin):
         *,
         content: str | bytes | None = None,
         dedup_key: str | None = None,
+        scan_targets: dict[str, str | bytes] | None = None,
+        scan_result: security_scan.FindingResult | None = None,
     ) -> dict[str, Any]:
         """Stamp, validate, and durably append one envelope record.
 
@@ -617,7 +626,12 @@ class Outbox(KnowledgeOutboxMixin):
         record is returned.
         """
         record, _ = self._append(
-            record, content=content, dedup_key=dedup_key, return_stored=True
+            record,
+            content=content,
+            dedup_key=dedup_key,
+            return_stored=True,
+            scan_targets=scan_targets,
+            scan_result=scan_result,
         )
         return record
 
@@ -627,12 +641,53 @@ class Outbox(KnowledgeOutboxMixin):
         *,
         content: str | bytes | None = None,
         dedup_key: str | None = None,
+        scan_targets: dict[str, str | bytes] | None = None,
+        scan_result: security_scan.FindingResult | None = None,
     ) -> bool:
         """Append one record and report whether a new row was inserted."""
         _, created = self._append(
-            record, content=content, dedup_key=dedup_key, return_stored=False
+            record,
+            content=content,
+            dedup_key=dedup_key,
+            return_stored=False,
+            scan_targets=scan_targets,
+            scan_result=scan_result,
         )
         return created
+
+    def prepare_secret_scan(
+        self,
+        content: str | bytes | None = None,
+        *,
+        scan_targets: dict[str, str | bytes] | None = None,
+    ) -> security_scan.FindingResult:
+        """Scan plaintext before a caller opens an outbox batch."""
+        targets = self._normalized_scan_targets(content, scan_targets)
+        if self._security_config is None:
+            try:
+                self._security_config = recorder_config.load(
+                    self.flight_recorder_home
+                ).security
+            except Exception as exc:
+                return security_scan.FindingResult(
+                    "failed", (), type(exc).__name__
+                )
+        return security_scan.scan_targets(
+            self.flight_recorder_home, self._security_config, targets
+        )
+
+    @staticmethod
+    def _normalized_scan_targets(
+        content: str | bytes | None,
+        scan_targets: dict[str, str | bytes] | None,
+    ) -> dict[str, bytes]:
+        source = scan_targets
+        if source is None:
+            source = {} if content is None else {"content": content}
+        return {
+            target: value.encode("utf-8") if isinstance(value, str) else value
+            for target, value in source.items()
+        }
 
     @contextmanager
     def batch(self) -> Iterator["Outbox"]:
@@ -710,6 +765,8 @@ class Outbox(KnowledgeOutboxMixin):
         content: str | bytes | None,
         dedup_key: str | None,
         return_stored: bool,
+        scan_targets: dict[str, str | bytes] | None,
+        scan_result: security_scan.FindingResult | None,
     ) -> tuple[dict[str, Any], bool]:
         """Implement both append APIs and return the stored record and outcome."""
         rec = dict(record)
@@ -721,6 +778,22 @@ class Outbox(KnowledgeOutboxMixin):
         rec["event_id"] = str(uuid.uuid4())
         rec["recorded_at"] = time.time()
         inst = rec["installation_id"]
+
+        event_type = rec.get("payload", {}).get("event_type")
+        if event_type == _SECURITY_FINDING_EVENT or event_type in RECONCILE_FINDING_TYPES:
+            prepared_scan = security_scan.FindingResult("complete", ())
+        elif scan_result is not None:
+            prepared_scan = scan_result
+        else:
+            prepared_scan = self.prepare_secret_scan(
+                content, scan_targets=scan_targets
+            )
+        if prepared_scan.status == "failed":
+            _SECURITY_LOG.warning(
+                "secret scan status=failed source_event_id=%s exception_class=%s",
+                rec["event_id"],
+                prepared_scan.error_type or "UnknownError",
+            )
 
         conn = self._conn
         # Inside an open batch() the transaction already exists and commits
@@ -805,10 +878,25 @@ class Outbox(KnowledgeOutboxMixin):
                     )
                 self._insert_event(chunk, dedup_key=None)
             self._insert_event(rec, dedup_key=dedup_key)
+            final_high_water = rec["producer_sequence"]
+            if prepared_scan.matches:
+                finding = self._security_finding_record(rec, prepared_scan)
+                finding["producer_sequence"] = final_high_water + 1
+                finding.update(
+                    self._encrypt_content(security_scan.finding_content(prepared_scan))
+                )
+                validate(finding)
+                if singleton_batch_size(finding) > MAX_INGEST_BATCH_BYTES:
+                    raise OutboxError(
+                        "security finding exceeds the ingestion protocol's "
+                        f"{MAX_INGEST_BATCH_BYTES}-byte limit"
+                    )
+                self._insert_event(finding, dedup_key=None)
+                final_high_water = finding["producer_sequence"]
             conn.execute(
                 "INSERT INTO seq (installation_id, high_water) VALUES (?, ?) "
                 "ON CONFLICT(installation_id) DO UPDATE SET high_water=excluded.high_water",
-                (inst, rec["producer_sequence"]),
+                (inst, final_high_water),
             )
             if not in_batch:
                 conn.execute("COMMIT")
@@ -821,6 +909,45 @@ class Outbox(KnowledgeOutboxMixin):
                 conn.execute("ROLLBACK")
                 self._forget_process_dek()
             raise
+
+    def _security_finding_record(
+        self,
+        source: dict[str, Any],
+        result: security_scan.FindingResult,
+    ) -> dict[str, Any]:
+        """Build the encrypted companion finding for one source event."""
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "event_id": str(uuid.uuid4()),
+            "occurred_at": source["occurred_at"],
+            "recorded_at": time.time(),
+            "installation_id": source["installation_id"],
+            "tenant_id": source["tenant_id"],
+            "profile": source["profile"],
+            "runtime": source["runtime"],
+            **{
+                key: source[key]
+                for key in (
+                    "session_id",
+                    "session_key",
+                    "parent_session_id",
+                    "invocation_id",
+                )
+                if source.get(key) is not None
+            },
+            "correlation_id": source["correlation_id"],
+            "causation_id": source["event_id"],
+            "source": "secret_scan",
+            "capture_method": secret_detector.DETECTOR_NAME,
+            "payload": {
+                "event_type": _SECURITY_FINDING_EVENT,
+                "detector": secret_detector.DETECTOR_NAME,
+                "match_count": len(result.matches),
+                "artifact_ref": source["event_id"],
+                "scan_status": result.status,
+            },
+            "partial": result.status != "complete",
+        }
 
     def _inline_singleton_size(self, record: dict[str, Any], plaintext_bytes: int) -> int:
         """Exact singleton wire size after encrypting ``plaintext_bytes``.

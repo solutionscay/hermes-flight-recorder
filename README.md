@@ -14,6 +14,7 @@ Flight Recorder does these things:
 
 - It records sessions, tools, model usage, cron runs, and gateway events.
 - It records failures, gaps, missed cron runs, and stale work.
+- It flags common credentials in captured plaintext before encryption.
 - It encrypts message and tool content before the content leaves the machine.
 - It keeps a local, ordered event log (the **outbox**).
 - It continues to work when the network is down.
@@ -105,6 +106,7 @@ The `install` command does these things:
   written and no private key ever lands on the host. See
   [docs/key-model.md](docs/key-model.md).
 - It writes the configuration files with private permissions (`0600`).
+- It creates `secret-scan.key` with private permissions (`0600`).
 - It installs (or updates) the hook.
 - It verifies the result.
 
@@ -217,6 +219,28 @@ To read the captured log with no network, use `observe`:
 hermes-flight-recorder observe --hermes-home "<HERMES_HOME>" --tree
 ```
 
+Show local secret findings:
+
+```bash
+hermes-flight-recorder observe --hermes-home "<HERMES_HOME>" --security
+```
+
+The command shows types, byte locations, fingerprints, and counts. It never
+shows a secret preview. Exit code `1` means that a finding exists. Exit code
+`2` means that the configuration or decryption failed. A fleet agent needs the
+operator private key on a separate operator machine to read this report.
+
+Suppress one known finding by its type and fingerprint:
+
+```bash
+hermes-flight-recorder security --hermes-home "<HERMES_HOME>" \
+  suppress "<TYPE>" "<FINGERPRINT>"
+```
+
+Use `unsuppress` to remove the suppression. The baseline contains no secret,
+path, preview, or note. Secret detection can have false results. A clean report
+does not prove that the captured content is safe.
+
 ## 4. How to update
 
 Stop the `serve` process through the service manager that runs it. The updater
@@ -247,8 +271,9 @@ verification are complete. A service restart refuses to start before it opens
 the outbox while the update holds the lock. Before the update changes the
 package, it creates a recovery snapshot under
 `<HERMES_HOME>/flight-recorder/update-backups/`. The snapshot contains a
-consistent SQLite backup, the operator key files, recorder and sync configuration,
-the installed-version record, and the old hook.
+consistent SQLite backup, the operator key files, the secret scan key, the
+suppression baseline, recorder and sync configuration, the installed-version
+record, and the old hook.
 
 After pip installs the selected commit, a new Python process applies registered
 outbox migrations, regenerates the hook, and records the installed revision.
@@ -295,6 +320,7 @@ and verify the hook before restarting services.
 | `configure-sync` | Write the cloud endpoint and the Cloudflare Access token. |
 | `status` | Show source health, reconciliation freshness, and delivery lag. |
 | `observe` | Show the captured log locally (stream, tree, report). |
+| `security` | Add or remove a local secret suppression. |
 | `run` | Run one capture pass (for an external scheduler). |
 | `reconcile` | Run one reconcile pass (for an external scheduler). |
 | `sync` | Run one sync pass (the only command that uses the network). |

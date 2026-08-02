@@ -23,6 +23,7 @@ from pathlib import Path
 from . import content_crypto as cc
 from . import keystore
 from . import recorder_config
+from . import security_scan
 from . import sync_config
 from ._common import (
     CAPTURE_BACKFILL_META_KEY,
@@ -148,6 +149,12 @@ def install(
 
         _establish_operator_key(fr_home, operator_pubkey, log=log)
 
+        try:
+            fingerprint_key = security_scan.ensure_fingerprint_key(fr_home)
+        except security_scan.SecurityScanError as exc:
+            raise InstallError(str(exc)) from exc
+        log(f"secret scan key:       {security_scan.fingerprint_key_path(fr_home)}")
+
         _write_default_config(fr_home, log=log)
 
         hook_dir = install_hook(hermes, fr_home, force=True, build=version.build)
@@ -170,7 +177,7 @@ def _stop_if_legacy_present(fr_home: Path, *, log) -> None:
         raise InstallError(
             f"legacy Flight Recorder data found at {legacy}.\n"
             f"Automatic migration is not available yet. Move its contents "
-            f"(outbox.sqlite, operator.pub, operator.secret, "
+            f"(outbox.sqlite, operator.pub, operator.secret, secret-scan.key, "
             f"recorder-config.json, sync-config.json) to {fr_home} while "
             f"`serve` is stopped, then re-run install; or set "
             f"SC_HERMES_FLIGHT_RECORDER_HOME to keep using {legacy}."
@@ -257,7 +264,18 @@ def _verify(fr_home: Path, hook_dir: Path) -> None:
         raise InstallError(f"operator public key missing at {public}")
     if keystore.has_secret(fr_home):
         _require_owner_only(keystore.secret_path(fr_home), "operator private key")
+    secret_scan_key = security_scan.fingerprint_key_path(fr_home)
+    if not secret_scan_key.exists():
+        raise InstallError(f"secret scan key missing at {secret_scan_key}")
+    _require_owner_only(secret_scan_key, "secret scan fingerprint key")
     _require_owner_only(recorder_config.config_path(fr_home), "recorder config")
+    try:
+        security_config = recorder_config.load(fr_home).security
+    except recorder_config.RecorderConfigError as exc:
+        raise InstallError(str(exc)) from exc
+    baseline = security_scan.baseline_path(fr_home, security_config)
+    if baseline.exists():
+        _require_owner_only(baseline, "secret scan baseline")
 
     # Hook files exist and target this recorder root.
     for name in ("HOOK.yaml", "handler.py"):

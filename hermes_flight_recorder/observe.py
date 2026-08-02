@@ -37,6 +37,7 @@ filters records from an :class:`~hermes_flight_recorder.collector.outbox.Outbox`
 from __future__ import annotations
 
 import datetime
+import json
 from typing import Any, Iterable
 
 from .collector._common import as_float as _as_float
@@ -46,6 +47,7 @@ from .envelope import (
     SESSION_TERMINAL_TYPES,
     TASK_EVENT_TYPES,
     TASK_TERMINAL_TYPES,
+    SECURITY_FINDING_TYPES,
 )
 
 __all__ = [
@@ -55,9 +57,14 @@ __all__ = [
     "render_report",
     "render_kanban",
     "render_knowledge",
+    "render_security",
     "parse_since",
     "FINDING_TYPES",
 ]
+
+
+class SecurityReportError(RuntimeError):
+    """A local security report cannot decrypt or parse its findings."""
 
 
 # --- loading & filtering ------------------------------------------------
@@ -415,6 +422,66 @@ def _finding_detail(record: dict[str, Any]) -> str:
         age_s = f", ~{int(age)}s stale" if age else ""
         return f"capture loop stalled: last success {_iso(p.get('last_success_at'))}{age_s}"
     return str(p)
+
+
+def render_security(
+    outbox: Any, records: Iterable[dict[str, Any]]
+) -> tuple[list[str], int]:
+    """Decrypt and group local secret findings without a secret preview."""
+    findings = [
+        record
+        for record in records
+        if record.get("payload", {}).get("event_type") in SECURITY_FINDING_TYPES
+    ]
+    if not findings:
+        return (
+            [
+                "no unsuppressed secret findings",
+                "No detected secrets is not a safety guarantee.",
+            ],
+            0,
+        )
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for record in sorted(findings, key=_stream_key):
+        try:
+            content = json.loads(outbox.decrypt_content(record))
+        except Exception as exc:
+            raise SecurityReportError(
+                "security report needs the operator private key and valid encrypted findings"
+            ) from exc
+        matches = content.get("matches") if isinstance(content, dict) else None
+        if not isinstance(matches, list):
+            raise SecurityReportError("security finding content has an invalid format")
+        for item in matches:
+            if not isinstance(item, dict):
+                raise SecurityReportError("security finding content has an invalid match")
+            fingerprint = item.get("fingerprint")
+            if not isinstance(fingerprint, str):
+                raise SecurityReportError("security finding content has an invalid fingerprint")
+            group = grouped.setdefault(
+                fingerprint,
+                {
+                    "type": item.get("type"),
+                    "target": item.get("target"),
+                    "byte_start": item.get("byte_start"),
+                    "byte_end": item.get("byte_end"),
+                    "first_event": record.get("causation_id"),
+                    "count": 0,
+                },
+            )
+            group["count"] += 1
+
+    lines = [f"{len(grouped)} secret fingerprint(s):", ""]
+    for fingerprint, item in sorted(grouped.items()):
+        lines.append(
+            f"  {item['type']}  target={item['target']} "
+            f"bytes={item['byte_start']}:{item['byte_end']} "
+            f"first_event={item['first_event']} occurrences={item['count']} "
+            f"fingerprint={fingerprint}"
+        )
+    lines.extend(["", "No detected secrets is not a safety guarantee."])
+    return lines, 1
 
 
 # --- kanban view --------------------------------------------------------

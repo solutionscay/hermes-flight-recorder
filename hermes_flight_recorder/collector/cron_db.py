@@ -97,13 +97,17 @@ def _poll_executions(outbox, home: Path, counts, home_mode) -> None:
     # The store was read above; append the gathered rows and advance the
     # cursor in one outbox transaction, so a crash rolls back rows and cursor
     # together and a re-poll re-reads exactly the same range (issue #160).
+    error_scans = {
+        row["id"]: outbox.prepare_secret_scan(row["error"] or None)
+        for row in rows
+    }
     with outbox.batch():
         for r in rows:
-            _emit_execution(outbox, r, counts, home_mode)
+            _emit_execution(outbox, r, counts, home_mode, error_scans[r["id"]])
         watermark.advance(high_water)
 
 
-def _emit_execution(outbox, r, counts, home_mode) -> None:
+def _emit_execution(outbox, r, counts, home_mode, error_scan) -> None:
     """Append the claimed (and, when present, finished) events for one row."""
     exid, job = r["id"], r["job_id"]
     claimed = to_epoch(r["claimed_at"]) or 0.0
@@ -151,6 +155,7 @@ def _emit_execution(outbox, r, counts, home_mode) -> None:
         record,
         content=r["error"] if r["error"] else None,
         dedup_key=f"cron:finished:{exid}",
+        scan_result=error_scan,
     )
 
 

@@ -17,10 +17,9 @@ installation (`content-dev.key`). It could never be rotated, every host held a
 key that could read its own history, and a fleet of 100 agents meant 100
 independent keys with no fleet-wide read. The operator key model replaces it and
 keeps the zero-knowledge property: the backend (DBaaS) never decrypts anything.
-Server-side decryption was explicitly rejected — it would make the backend a
-plaintext honeypot of exactly the secrets this protects. Detecting sensitive
-data instead moves to the host at capture time (host-side flagging, tracked
-separately).
+Server-side decryption was explicitly rejected. It would make the backend a
+plaintext store for the secrets that this model protects. The recorder detects
+sensitive data on the host at capture time.
 
 ## The three keys
 
@@ -36,6 +35,16 @@ separately).
   sealed box: ephemeral X25519 + HKDF-SHA256 + AES-256-GCM). It is stored
   out-of-band as an opaque blob keyed by `key_version`, in the outbox's
   `content_keys` table. Only the operator private key can open it.
+
+The recorder also creates `secret-scan.key`. This file contains 32 random
+bytes and has mode `0600`. It does not decrypt content. The recorder uses it to
+calculate local HMAC fingerprints for detected secrets. The same secret gets
+the same fingerprint on one installation. It gets a different fingerprint on
+another installation.
+
+The secret scan key never syncs. An update backup keeps it with the operator
+key files and the local suppression baseline. An uninstall keeps it unless the
+operator uses `--purge-data`.
 
 Writing needs only the **public** key. Reading needs the **private** key. An
 agent host holds only the public key and its in-memory DEK, so a compromised

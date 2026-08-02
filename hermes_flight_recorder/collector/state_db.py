@@ -182,12 +182,15 @@ def poll(
             sessions.advance()
         knowledge_rows: list[tuple[Any, str, str | None, str]] = []
         for start in range(0, len(messages.rows), _MESSAGE_BATCH_ROWS):
+            message_chunk = messages.rows[start : start + _MESSAGE_BATCH_ROWS]
+            message_scans = _prepare_message_scans(outbox, message_chunk, capture)
             with outbox.batch():
                 _poll_messages(
                     ctx,
-                    messages.rows[start : start + _MESSAGE_BATCH_ROWS],
+                    message_chunk,
                     capture,
                     knowledge_rows,
+                    message_scans,
                 )
         # Knowledge mutation capture reads and hashes artifact files, so it
         # runs after the message batch commits instead of holding the write
@@ -215,8 +218,14 @@ def poll(
         with outbox.batch():
             _poll_model_usage(ctx, usage.rows)
             usage.advance()
+        delegation_scans = {
+            row["delegation_id"]: outbox.prepare_secret_scan(
+                _delegation_content(safe_json_dict(row["event_json"]), row["result_json"])
+            )
+            for row in delegations.rows
+        }
         with outbox.batch():
-            _poll_delegations(ctx, delegations.rows)
+            _poll_delegations(ctx, delegations.rows, delegation_scans)
             delegations.advance()
         return dict(counts)
     finally:
@@ -306,8 +315,22 @@ def _poll_sessions(ctx: _PollContext, rows) -> None:
         )
 
 
+def _prepare_message_scans(outbox, rows, capture_config) -> dict[int, Any]:
+    """Prepare every content scan before the message batch opens."""
+    prepared: dict[int, Any] = {}
+    for row in rows:
+        content = row["content"]
+        if row["role"] in ("user", "assistant") and not content:
+            continue
+        limited_content, _metadata = _limit_content(
+            content, capture_config.max_content_bytes
+        )
+        prepared[int(row["id"])] = outbox.prepare_secret_scan(limited_content)
+    return prepared
+
+
 def _poll_messages(
-    ctx: _PollContext, rows, capture_config, knowledge_rows
+    ctx: _PollContext, rows, capture_config, knowledge_rows, message_scans
 ) -> None:
     for r in rows:
         sid = r["session_id"]
@@ -369,6 +392,7 @@ def _poll_messages(
                 record,
                 content=limited_content,
                 dedup_key=f"state.db:{role}:{r['id']}",
+                scan_result=message_scans[int(r["id"])],
             )
             continue
 
@@ -401,6 +425,7 @@ def _poll_messages(
             record,
             content=limited_content,
             dedup_key=f"state.db:tool:{r['id']}",
+            scan_result=message_scans[int(r["id"])],
         )
         # Defer knowledge candidates: their capture reads and hashes artifact
         # files, which must not run while the batch holds the write lock. A
@@ -482,7 +507,7 @@ def _poll_model_usage(ctx: _PollContext, rows) -> None:
     outbox.set_meta("state.db:model-usage-state-version", _USAGE_STATE_VERSION)
 
 
-def _poll_delegations(ctx: _PollContext, rows) -> None:
+def _poll_delegations(ctx: _PollContext, rows, delegation_scans) -> None:
     for r in rows:
         parent = r["parent_session_id"] or r["origin_session"]
         corr = root_session(parent, ctx.parent_map) or parent
@@ -518,6 +543,7 @@ def _poll_delegations(ctx: _PollContext, rows) -> None:
             record,
             content=_delegation_content(event, r["result_json"]),
             dedup_key=f"state.db:deleg:{r['delegation_id']}",
+            scan_result=delegation_scans[r["delegation_id"]],
         )
 
 

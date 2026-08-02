@@ -423,6 +423,8 @@ def append_and_count(
     *,
     content: str | bytes | None = None,
     dedup_key: str,
+    scan_targets: dict[str, str | bytes] | None = None,
+    scan_result: Any = None,
 ) -> bool:
     """Append via dedup and count the event type only when a new row landed.
 
@@ -438,7 +440,13 @@ def append_and_count(
     """
     if _horizon_drops(outbox, record):
         return False
-    if outbox.append_if_new(record, content=content, dedup_key=dedup_key):
+    if outbox.append_if_new(
+        record,
+        content=content,
+        dedup_key=dedup_key,
+        scan_targets=scan_targets,
+        scan_result=scan_result,
+    ):
         counts[record["payload"]["event_type"]] += 1
     return True
 
