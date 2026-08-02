@@ -1,6 +1,6 @@
 """Focused tests for the reconciler's coverage-gap detector (issue #6).
 
-``_detect_coverage_gaps`` diffs the durable stores (``state.db``,
+``detect_coverage_gaps`` diffs the durable stores (``state.db``,
 ``cron/executions.db``) against the captured outbox stream. A durable row
 with no matching captured event proves a dropped capture and surfaces as
 ``reconcile.gap_detected`` / ``gap_kind='uncaptured_row'``.

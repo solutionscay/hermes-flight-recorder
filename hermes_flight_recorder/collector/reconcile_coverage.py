@@ -16,36 +16,24 @@ from ._common import (
     state_db_path,
 )
 from .recorder_config import source_enabled
-from .reconcile_common import emit_finding as _emit
+from .reconcile_common import ReconcilePass, emit_finding
 from .watermark import meta_float
 
 
 # --- coverage gaps ------------------------------------------------------
-def _detect_coverage_gaps(
-    outbox,
-    events,
-    home,
-    exec_rows,
-    counts,
-    when,
-    config,
-    capture_config,
-    horizon,
-    *,
-    boards=None,
-):
+def detect_coverage_gaps(ctx: ReconcilePass, events, exec_rows, *, boards=None) -> None:
     """A durable row with no captured event proves a dropped capture.
 
     ``boards`` reuses a caller's Kanban board list (one listing per reconcile
     pass); when None, the board list is read here.
     """
     captured = _captured_subjects(events)
-    pending = _CoveragePending(outbox)
+    pending = _CoveragePending(ctx.outbox)
     session_rows = []
     parent_map = {}
 
-    state_path = state_db_path(home)
-    if source_enabled(capture_config, "state_db") and state_path.exists():
+    state_path = state_db_path(ctx.home)
+    if source_enabled(ctx.capture_config, "state_db") and state_path.exists():
         conn = open_sqlite_read_only(state_path)
         try:
             session_cols = sqlite_table_columns(conn, "sessions")
@@ -65,86 +53,44 @@ def _detect_coverage_gaps(
             ).fetchall()
             parent_map = {r["id"]: r["parent_session_id"] for r in session_rows}
             session_started = {r["id"]: r["started_at"] for r in session_rows}
-            _coverage_sessions(
-                outbox,
-                session_rows,
-                parent_map,
-                captured,
-                pending,
-                counts,
-                when,
-                config,
-                horizon,
-            )
+            _coverage_sessions(ctx, session_rows, parent_map, captured, pending)
             _coverage_messages(
-                outbox,
-                conn,
-                parent_map,
-                session_started,
-                captured,
-                pending,
-                counts,
-                when,
-                config,
-                capture_config,
-                horizon,
+                ctx, conn, parent_map, session_started, captured, pending
             )
             _coverage_model_usage(
-                outbox,
-                conn,
-                parent_map,
-                session_started,
-                captured,
-                pending,
-                counts,
-                when,
-                config,
-                horizon,
+                ctx, conn, parent_map, session_started, captured, pending
             )
         finally:
             conn.close()
 
-    if source_enabled(capture_config, "cron"):
+    if source_enabled(ctx.capture_config, "cron"):
         # exec_rows was loaded once per reconcile pass; emit in one transaction.
-        with outbox.batch():
+        with ctx.outbox.batch():
             for r in exec_rows:
-                if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
+                if occurred_before(
+                    ctx.horizon, r["claimed_epoch"] or r["finished_at"]
+                ):
                     continue
                 if r["id"] in captured["executions"]:
                     pending.clear("execution", r["id"])
                     continue
                 _emit_coverage(
-                    outbox,
-                    counts,
-                    when,
+                    ctx,
                     subject_type="execution",
                     subject_id=r["id"],
                     source_table="cron:executions.db",
                     correlation_id=r["job_id"],
-                    grace=config.coverage_grace,
                 )
-    if source_enabled(capture_config, "kanban"):
-        _coverage_kanban(
-            outbox,
-            home,
-            captured,
-            pending,
-            counts,
-            when,
-            config,
-            horizon,
-            boards=boards,
-        )
+    if source_enabled(ctx.capture_config, "kanban"):
+        _coverage_kanban(ctx, captured, pending, boards=boards)
     pending.flush()
 
 
-def _coverage_sessions(
-    outbox, rows, parent_map, captured, pending, counts, when, config, horizon
-) -> None:
+def _coverage_sessions(ctx, rows, parent_map, captured, pending) -> None:
     # ``rows`` was fetched by the caller; emit findings in one transaction.
-    with outbox.batch():
+    with ctx.outbox.batch():
         for r in rows:
-            if occurred_before(horizon, r["started_at"]):
+            if occurred_before(ctx.horizon, r["started_at"]):
                 continue
             sid = r["id"]
             if sid in captured["sessions"]:
@@ -152,36 +98,23 @@ def _coverage_sessions(
                 continue
             corr = root_session(sid, parent_map) or sid
             _emit_coverage(
-                outbox,
-                counts,
-                when,
+                ctx,
                 subject_type="session",
                 subject_id=sid,
                 source_table="state.db:sessions",
                 correlation_id=corr,
                 session_id=sid,
                 parent_session_id=r["parent_session_id"],
-                grace=config.coverage_grace,
             )
 
 
 def _coverage_messages(
-    outbox,
-    conn,
-    parent_map,
-    session_started,
-    captured,
-    pending,
-    counts,
-    when,
-    config,
-    capture_config,
-    horizon,
+    ctx, conn, parent_map, session_started, captured, pending
 ) -> None:
     roles = tuple(
         role
         for role in ("user", "assistant", "tool")
-        if role in capture_config.message_roles
+        if role in ctx.capture_config.message_roles
     )
     if not roles:
         return
@@ -208,13 +141,13 @@ def _coverage_messages(
         roles,
     ).fetchall()
     # The durable rows are fetched above; emit findings in one transaction.
-    with outbox.batch():
+    with ctx.outbox.batch():
         for r in rows:
             sid = r["session_id"]
-            if occurred_before(horizon, r["timestamp"]):
+            if occurred_before(ctx.horizon, r["timestamp"]):
                 continue
             if r["timestamp"] is None and occurred_before(
-                horizon, session_started.get(sid)
+                ctx.horizon, session_started.get(sid)
             ):
                 continue
             if r["id"] in captured["messages"]:
@@ -222,29 +155,17 @@ def _coverage_messages(
                 continue
             corr = root_session(sid, parent_map) or sid
             _emit_coverage(
-                outbox,
-                counts,
-                when,
+                ctx,
                 subject_type="message",
                 subject_id=str(r["id"]),
                 source_table="state.db:messages",
                 correlation_id=corr,
                 session_id=sid,
-                grace=config.coverage_grace,
             )
 
 
 def _coverage_model_usage(
-    outbox,
-    conn,
-    parent_map,
-    session_started,
-    captured,
-    pending,
-    counts,
-    when,
-    config,
-    horizon,
+    ctx, conn, parent_map, session_started, captured, pending
 ) -> None:
     if not sqlite_table_exists(conn, "session_model_usage"):
         return
@@ -252,9 +173,9 @@ def _coverage_model_usage(
         "SELECT session_id, model, task FROM session_model_usage"
     ).fetchall()
     # The durable rows are fetched above; emit findings in one transaction.
-    with outbox.batch():
+    with ctx.outbox.batch():
         for r in rows:
-            if occurred_before(horizon, session_started.get(r["session_id"])):
+            if occurred_before(ctx.horizon, session_started.get(r["session_id"])):
                 continue
             key = (r["session_id"], r["model"], r["task"])
             subject_id = f"{r['session_id']}:{r['model']}:{r['task']}"
@@ -264,21 +185,16 @@ def _coverage_model_usage(
             sid = r["session_id"]
             corr = root_session(sid, parent_map) or sid
             _emit_coverage(
-                outbox,
-                counts,
-                when,
+                ctx,
                 subject_type="model_usage",
                 subject_id=subject_id,
                 source_table="state.db:session_model_usage",
                 correlation_id=corr,
                 session_id=sid,
-                grace=config.coverage_grace,
             )
 
 
-def _coverage_kanban(
-    outbox, home, captured, pending, counts, when, config, horizon, *, boards=None
-) -> None:
+def _coverage_kanban(ctx, captured, pending, *, boards=None) -> None:
     """A durable Kanban task/run with no captured ``task.*`` event.
 
     The Kanban analog of the session/execution coverage diff: every board's
@@ -288,7 +204,7 @@ def _coverage_kanban(
     shared ``reconcile:cover:*`` dedup key stays unique per board.
     """
     if boards is None:
-        boards = kanban_board_dbs(home)
+        boards = kanban_board_dbs(ctx.home)
     for board, db_path in boards:
         conn = open_sqlite_read_only(db_path)
         try:
@@ -320,39 +236,33 @@ def _coverage_kanban(
             conn.close()
         # The board rows are fetched (and the board connection closed) above;
         # emit this board's findings in one transaction.
-        with outbox.batch():
+        with ctx.outbox.batch():
             for r in tasks:
-                if occurred_before(horizon, r["created_at"] or r["started_at"]):
+                if occurred_before(ctx.horizon, r["created_at"] or r["started_at"]):
                     continue
                 if (board, r["id"]) in captured["tasks"]:
                     pending.clear("task", f"{board}:{r['id']}")
                     continue
                 _emit_coverage(
-                    outbox,
-                    counts,
-                    when,
+                    ctx,
                     subject_type="task",
                     subject_id=f"{board}:{r['id']}",
                     source_table=f"kanban:{board}:tasks",
                     correlation_id=r["id"],
                     session_id=r["session_id"],
-                    grace=config.coverage_grace,
                 )
             for r in runs:
-                if occurred_before(horizon, r["started_at"] or r["ended_at"]):
+                if occurred_before(ctx.horizon, r["started_at"] or r["ended_at"]):
                     continue
                 if (board, r["id"]) in captured["task_runs"]:
                     pending.clear("task_run", f"{board}:{r['id']}")
                     continue
                 _emit_coverage(
-                    outbox,
-                    counts,
-                    when,
+                    ctx,
                     subject_type="task_run",
                     subject_id=f"{board}:{r['id']}",
                     source_table=f"kanban:{board}:task_runs",
                     correlation_id=r["task_id"],
-                    grace=config.coverage_grace,
                 )
 
 
@@ -400,25 +310,21 @@ def _captured_subjects(events) -> dict[str, set]:
 
 
 def _emit_coverage(
-    outbox,
-    counts,
-    when,
+    ctx,
     *,
     subject_type,
     subject_id,
     source_table,
     correlation_id,
-    grace,
     session_id=None,
     parent_session_id=None,
 ) -> None:
-    if not _coverage_ready(outbox, subject_type, subject_id, when, grace):
+    if not _coverage_ready(ctx, subject_type, subject_id):
         return
-    _emit(
-        outbox,
-        counts,
+    emit_finding(
+        ctx,
         event_type="reconcile.gap_detected",
-        occurred_at=when,
+        occurred_at=ctx.when,
         correlation_id=correlation_id,
         session_id=session_id,
         parent_session_id=parent_session_id,
@@ -472,18 +378,17 @@ class _CoveragePending:
         self._cleared.clear()
 
 
-def _coverage_ready(
-    outbox, subject_type: str, subject_id: Any, when: float, grace: float
-) -> bool:
+def _coverage_ready(ctx, subject_type: str, subject_id: Any) -> bool:
     """Wait through a capture tick before an absent durable row is a gap."""
+    grace = ctx.config.coverage_grace
     if grace <= 0:
         return True
     key = _coverage_pending_key(subject_type, subject_id)
-    first_seen = meta_float(outbox, key)
+    first_seen = meta_float(ctx.outbox, key)
     if first_seen is None:
-        outbox.set_meta(key, repr(when))
+        ctx.outbox.set_meta(key, repr(ctx.when))
         return False
-    return when - first_seen >= grace
+    return ctx.when - first_seen >= grace
 
 
-__all__ = ["_detect_coverage_gaps"]
+__all__ = ["detect_coverage_gaps"]

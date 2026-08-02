@@ -94,8 +94,8 @@ def test_disabled_sources_skip_related_reconciliation(tmp_path, monkeypatch):
     monkeypatch.setattr(reconcile_module, "_load_execution_rows", unexpected)
     monkeypatch.setattr(reconcile_module, "_detect_missing_terminals", unexpected)
     monkeypatch.setattr(reconcile_module, "_detect_missed_cron", unexpected)
-    monkeypatch.setattr(reconcile_module, "_detect_gateway_start_failed", unexpected)
-    monkeypatch.setattr(reconcile_module, "_detect_stale_task_leases", unexpected)
+    monkeypatch.setattr(reconcile_module, "detect_gateway_start_failed", unexpected)
+    monkeypatch.setattr(reconcile_module, "detect_stale_task_leases", unexpected)
     monkeypatch.setattr(reconcile_module, "_detect_knowledge_gaps", unexpected)
 
     counts = reconcile_module.reconcile(
@@ -116,7 +116,7 @@ def test_frequent_reconcile_skips_complete_audit_scans(tmp_path, monkeypatch):
 
     monkeypatch.setattr(reconcile_module, "_load_execution_rows", unexpected)
     monkeypatch.setattr(reconcile_module, "_detect_sequence_gaps", unexpected)
-    monkeypatch.setattr(reconcile_module, "_detect_coverage_gaps", unexpected)
+    monkeypatch.setattr(reconcile_module, "detect_coverage_gaps", unexpected)
     monkeypatch.setattr(reconcile_module, "_detect_missing_terminals", unexpected)
     monkeypatch.setattr(reconcile_module, "_detect_missed_cron", unexpected)
     monkeypatch.setattr(reconcile_module, "_detect_knowledge_gaps", unexpected)

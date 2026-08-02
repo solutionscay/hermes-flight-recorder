@@ -70,14 +70,17 @@ from ._common import (
 from .cron_schedule import expected_instants
 from .health import RECONCILE_HEALTH_KEY, record_success
 from .recorder_config import CaptureConfig, KnowledgeConfig, source_enabled
-from .reconcile_common import emit_finding as _emit
-from .reconcile_common import emit_terminal_missing as _emit_terminal_missing
-from .reconcile_coverage import _detect_coverage_gaps
+from .reconcile_common import (
+    ReconcilePass,
+    emit_finding,
+    emit_terminal_missing,
+)
+from .reconcile_coverage import detect_coverage_gaps
 from .reconcile_runtime import (
-    detect_capture_stale as _detect_capture_stale,
-    detect_gateway_start_failed as _detect_gateway_start_failed,
-    detect_stale_task_leases as _detect_stale_task_leases,
-    ticker_is_stale as _ticker_is_stale,
+    detect_capture_stale,
+    detect_gateway_start_failed,
+    detect_stale_task_leases,
+    ticker_is_stale,
 )
 from .watermark import meta_float
 
@@ -146,11 +149,20 @@ def reconcile(
     knowledge = knowledge_config or KnowledgeConfig()
     when = float(now) if now is not None else time.time()
     home = resolve_hermes_home(hermes_home)
-    horizon = _install_horizon(outbox)
     counts: dict[str, int] = defaultdict(int)
+    ctx = ReconcilePass(
+        outbox=outbox,
+        home=home,
+        counts=counts,
+        when=when,
+        config=cfg,
+        capture_config=capture,
+        knowledge_config=knowledge,
+        horizon=_install_horizon(outbox),
+    )
 
     if source_enabled(capture, "gateway_log"):
-        _detect_gateway_start_failed(outbox, home, counts, when)
+        detect_gateway_start_failed(ctx)
     # One board listing per reconcile pass: lease detection here and, in the
     # audit below, Kanban coverage read the same list instead of re-walking
     # (and re-sniffing) every board file.
@@ -158,19 +170,11 @@ def reconcile(
         kanban_board_dbs(home) if source_enabled(capture, "kanban") else []
     )
     if source_enabled(capture, "kanban"):
-        _detect_stale_task_leases(
-            outbox,
-            home,
-            counts,
-            when,
-            cfg,
-            bounded=not full_audit,
-            boards=kanban_boards,
-        )
-    _detect_capture_stale(outbox, counts, when, cfg)
+        detect_stale_task_leases(ctx, full=full_audit, boards=kanban_boards)
+    detect_capture_stale(ctx)
     ticker_dead = False
     if source_enabled(capture, "cron"):
-        ticker_dead = _ticker_is_stale(outbox, home, counts, when, cfg)
+        ticker_dead = ticker_is_stale(ctx)
 
     if full_audit:
         installation_id = outbox.installation_id
@@ -193,44 +197,15 @@ def reconcile(
         # reads (and, for knowledge, file hashing) with their emits, so they
         # batch per pre-read row set (or not at all) inside their own modules.
         with outbox.batch():
-            _detect_sequence_gaps(
-                outbox,
-                installation_id,
-                counts,
-                when,
-                sequence_high_water,
-                cfg.sequence_gap_limit,
-            )
-        _detect_coverage_gaps(
-            outbox,
-            events,
-            home,
-            exec_rows,
-            counts,
-            when,
-            cfg,
-            capture,
-            horizon,
-            boards=kanban_boards,
-        )
+            _detect_sequence_gaps(ctx, installation_id, sequence_high_water)
+        detect_coverage_gaps(ctx, events, exec_rows, boards=kanban_boards)
         if source_enabled(capture, "hook"):
             with outbox.batch():
-                _detect_missing_terminals(
-                    outbox, events, counts, when, cfg, horizon
-                )
+                _detect_missing_terminals(ctx, events)
         if source_enabled(capture, "cron"):
-            _detect_missed_cron(
-                outbox,
-                home,
-                exec_rows,
-                counts,
-                when,
-                cfg,
-                horizon,
-                ticker_dead=ticker_dead,
-            )
+            _detect_missed_cron(ctx, exec_rows, ticker_dead=ticker_dead)
         if source_enabled(capture, "knowledge"):
-            _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
+            _detect_knowledge_gaps(ctx)
     record_success(outbox, RECONCILE_HEALTH_KEY, when)
     return dict(counts)
 
@@ -254,9 +229,7 @@ def _install_horizon(outbox: Any) -> float:
 
 
 # --- sequence gaps ------------------------------------------------------
-def _detect_sequence_gaps(
-    outbox, installation_id, counts, when, high_water, finding_limit
-) -> None:
+def _detect_sequence_gaps(ctx, installation_id, high_water) -> None:
     """Report absent sequences from 1 through the durable high-water mark.
 
     The present sequences (retained events union pruned tombstones) come
@@ -266,20 +239,20 @@ def _detect_sequence_gaps(
     for leading and trailing gaps. The finding limit bounds both iteration
     and writes if the durable high-water is damaged.
     """
+    finding_limit = ctx.config.sequence_gap_limit
     if finding_limit <= 0:
         return
 
     high_water = max(0, high_water)
-    seqs = outbox.stored_sequences(installation_id, through_sequence=high_water)
+    seqs = ctx.outbox.stored_sequences(installation_id, through_sequence=high_water)
     boundaries = [0, *seqs, high_water + 1]
     emitted = 0
     for prev_seq, next_seq in zip(boundaries, boundaries[1:]):
         for missing in range(prev_seq + 1, next_seq):
-            _emit(
-                outbox,
-                counts,
+            emit_finding(
+                ctx,
                 event_type="reconcile.gap_detected",
-                occurred_at=when,
+                occurred_at=ctx.when,
                 correlation_id=installation_id,
                 partial=False,  # a lost sequence is a fact, not an inference
                 payload={
@@ -296,7 +269,7 @@ def _detect_sequence_gaps(
 
 
 # --- missing terminals --------------------------------------------------
-def _detect_missing_terminals(outbox, events, counts, when, cfg, horizon) -> None:
+def _detect_missing_terminals(ctx, events) -> None:
     """An invocation.started with no invocation.completed, past its window.
 
     Only invocations are judged. ``invocation.completed`` is the authoritative
@@ -324,14 +297,16 @@ def _detect_missing_terminals(outbox, events, counts, when, cfg, horizon) -> Non
         if inv in completed:
             continue
         occurred = e.get("occurred_at")
-        if occurred is None or when - occurred <= cfg.invocation_terminal_timeout:
+        if (
+            occurred is None
+            or ctx.when - occurred <= ctx.config.invocation_terminal_timeout
+        ):
             continue
-        if occurred < horizon:
+        if occurred < ctx.horizon:
             continue  # started before the recorder existed
-        _emit_terminal_missing(
-            outbox,
-            counts,
-            occurred_at=when,
+        emit_terminal_missing(
+            ctx,
+            occurred_at=ctx.when,
             correlation_id=e.get("correlation_id") or inv,
             subject_type="invocation",
             subject_id=inv,
@@ -343,24 +318,22 @@ def _detect_missing_terminals(outbox, events, counts, when, cfg, horizon) -> Non
             profile=e.get("profile") or "default",
             details={
                 "start_occurred_at": occurred,
-                "age_seconds": when - occurred,
+                "age_seconds": ctx.when - occurred,
             },
             dedup_key=f"reconcile:terminal:invocation:{inv}",
         )
 
 
 # --- missed cron --------------------------------------------------------
-def _detect_missed_cron(
-    outbox, home, exec_rows, counts, when, cfg, horizon, *, ticker_dead=None
-) -> None:
-    jobs = _load_jobs(jobs_path(home))
+def _detect_missed_cron(ctx, exec_rows, *, ticker_dead=None) -> None:
+    jobs = _load_jobs(jobs_path(ctx.home))
     if not jobs:
         return
 
     # A stale heartbeat means the whole scheduler is dead: one installation
     # signal, and suppress the per-job trailing catch-up it would explain.
     if ticker_dead is None:
-        ticker_dead = _ticker_is_stale(outbox, home, counts, when, cfg)
+        ticker_dead = ticker_is_stale(ctx)
 
     exec_by_job: dict[str, list[float]] = defaultdict(list)
     for r in exec_rows:
@@ -368,14 +341,12 @@ def _detect_missed_cron(
             exec_by_job[r["job_id"]].append(r["claimed_epoch"])
     # jobs.json and the execution rows are already in memory; the per-job
     # finding emission commits as one transaction (issue #160).
-    with outbox.batch():
+    with ctx.outbox.batch():
         for job in jobs:
-            _missed_for_job(
-                outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon
-            )
+            _missed_for_job(ctx, job, exec_by_job, ticker_dead)
 
 
-def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon) -> None:
+def _missed_for_job(ctx, job, exec_by_job, ticker_dead) -> None:
     if not _job_is_active(job):
         return  # paused, disabled, or repeat-exhausted — no fire is expected
     sched = job.get("schedule") or {}
@@ -388,28 +359,30 @@ def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead, ho
         minutes = sched.get("minutes")
         if not minutes or minutes <= 0:
             return
-        runs = _interval_missed(execs, created, minutes * 60.0, when, cfg.cron_match_slack)
+        runs = _interval_missed(
+            execs, created, minutes * 60.0, ctx.when, ctx.config.cron_match_slack
+        )
     elif kind == "once":
         run_at = to_epoch(sched.get("run_at") or job.get("next_run_at"))
-        runs = _once_missed(execs, run_at, when, cfg.once_match_slack)
+        runs = _once_missed(execs, run_at, ctx.when, ctx.config.once_match_slack)
     elif kind == "cron":
         expr = sched.get("expression") or sched.get("cron") or sched.get("expr")
         # Match wall-clock fields in the job's own UTC offset (carried by its
         # ISO timestamps), so the diff is identical on any host timezone.
         job_tz = _tz_of(job.get("created_at")) or _tz_of(job.get("next_run_at"))
-        runs = _cron_missed(expr, execs, created, when, cfg, tz=job_tz)
+        runs = _cron_missed(expr, execs, created, ctx.when, ctx.config, tz=job_tz)
     else:
         return
 
     for first_at, count, is_tail in runs:
-        if first_at < horizon:
+        if first_at < ctx.horizon:
             continue  # the fire was due before the recorder existed
         # A dead scheduler explains the open-ended tail; don't double-report
         # it per job — the single ticker signal already covers it.
         if is_tail and ticker_dead:
             continue
-        _emit(
-            outbox, counts,
+        emit_finding(
+            ctx,
             event_type="cron.run_missed",
             occurred_at=first_at,
             correlation_id=job_id,
@@ -506,7 +479,7 @@ def _cron_missed(expr, execs, created, now, cfg, tz=None):
 
 
 # --- knowledge drift + event gap ----------------------------------------
-def _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge_config) -> None:
+def _detect_knowledge_gaps(ctx) -> None:
     """The Phase 3 analog of the coverage/missed-cron reconcilers.
 
     Two integrity checks over the two-stage knowledge pipeline (disk → store →
@@ -526,16 +499,16 @@ def _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge_config) ->
     not mistaken for a missed scan, and dedup on durable identity + content hash,
     never the reconcile clock.
     """
-    home_mode = read_home_mode(home)
-    _detect_knowledge_drift(outbox, home, home_mode, counts, when, cfg, knowledge_config)
-    _detect_unemitted_knowledge(outbox, counts, when, cfg)
+    home_mode = read_home_mode(ctx.home)
+    _detect_knowledge_drift(ctx, home_mode)
+    _detect_unemitted_knowledge(ctx)
 
 
-def _detect_knowledge_drift(
-    outbox, home, home_mode, counts, when, cfg, knowledge_config
-) -> None:
+def _detect_knowledge_drift(ctx, home_mode) -> None:
+    outbox = ctx.outbox
+    knowledge_config = ctx.knowledge_config
     for artifact_id, kind, name, category, files in knowledge_store.iter_disk_artifacts(
-        home, knowledge_config
+        ctx.home, knowledge_config
     ):
         try:
             manifest, occurred_at, skipped_files = knowledge_store.read_snapshot(
@@ -553,13 +526,12 @@ def _detect_knowledge_drift(
         stored_skipped = [] if latest is None else latest.get("skipped_files", [])
         if stored_hash == disk_hash and stored_skipped == skipped_files:
             continue  # the store already reflects disk — no drift
-        if when - occurred_at <= cfg.knowledge_drift_grace:
+        if ctx.when - occurred_at <= ctx.config.knowledge_drift_grace:
             continue  # too fresh — a healthy capture would still be catching up
-        _emit(
-            outbox,
-            counts,
+        emit_finding(
+            ctx,
             event_type="reconcile.gap_detected",
-            occurred_at=when,
+            occurred_at=ctx.when,
             correlation_id=f"knowledge:{artifact_id}",
             partial=True,
             payload={
@@ -579,19 +551,19 @@ def _detect_knowledge_drift(
         )
 
 
-def _detect_unemitted_knowledge(outbox, counts, when, cfg) -> None:
+def _detect_unemitted_knowledge(ctx) -> None:
+    outbox = ctx.outbox
     for artifact_id in outbox.knowledge_artifact_ids():
         last_emitted = int(outbox.get_meta(f"knowledge:emitted:{artifact_id}") or 0)
         for version in outbox.knowledge_versions(artifact_id):
             if version["seq"] <= last_emitted:
                 continue  # already emitted
-            if when - version["occurred_at"] <= cfg.knowledge_drift_grace:
+            if ctx.when - version["occurred_at"] <= ctx.config.knowledge_drift_grace:
                 continue  # freshly captured — the emitter will ship it next tick
-            _emit(
-                outbox,
-                counts,
+            emit_finding(
+                ctx,
                 event_type="reconcile.gap_detected",
-                occurred_at=when,
+                occurred_at=ctx.when,
                 correlation_id=f"knowledge:{artifact_id}",
                 partial=True,
                 payload={
