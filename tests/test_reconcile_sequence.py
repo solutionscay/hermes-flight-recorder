@@ -220,6 +220,38 @@ def test_concurrent_append_after_high_water_snapshot_is_not_a_tail_gap(
     assert gap_findings(ob) == []
 
 
+# --- pruned-summary interaction ---------------------------------------------
+def test_gap_detection_spans_retained_and_pruned_history(tmp_path):
+    """The SQL scan unions retained events with retention tombstones, so an
+    intentionally pruned sequence is never a gap, while a hole punched in
+    either the retained rows or the tombstones still is.
+    """
+    import time as _time
+
+    ob = new_outbox(tmp_path)
+    append_n(ob, 6)  # producer_sequence 1..6
+    # Prune 1..3 into compact tombstones (all recorded before the far-future
+    # age bound; the delivery cursor caps candidates at sequence 3).
+    result = ob.prune_delivered(3, older_than=_time.time() + 1000.0, vacuum=False)
+    assert result.pruned_count == 3
+    # Punch one hole in the pruned range and one in the retained range.
+    ob._conn.execute(
+        "DELETE FROM retention_tombstones WHERE producer_sequence=2"
+    )
+    delete_sequence(ob, 5)
+
+    run_reconcile(ob, tmp_path)
+
+    gaps = gap_findings(ob)
+    by_seq = {g["payload"]["missing_sequence"]: g["payload"] for g in gaps}
+    assert set(by_seq) == {2, 5}
+    # Brackets bridge the pruned/retained boundary with real neighbours.
+    assert by_seq[2]["prev_sequence"] == 1
+    assert by_seq[2]["next_sequence"] == 3
+    assert by_seq[5]["prev_sequence"] == 4
+    assert by_seq[5]["next_sequence"] == 6
+
+
 # --- brackets and partial flag ----------------------------------------------
 def test_prev_and_next_sequence_are_never_none_for_a_detected_gap(tmp_path):
     """A detected hole has a stored sequence or a range boundary on each side.
