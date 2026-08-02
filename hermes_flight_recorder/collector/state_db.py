@@ -40,6 +40,7 @@ from ._common import (
     runtime_stamp,
     safe_json_dict,
     occurred_before,
+    sqlite_table_columns,
     state_db_path,
 )
 from .recorder_config import CaptureConfig
@@ -180,6 +181,9 @@ def poll(
         # lock across that work. The messages watermark advances only after
         # it finishes: a crash here re-scans the same rows next pass, the
         # message appends dedup, and the knowledge capture retries.
+        has_tool_calls = bool(knowledge_rows) and "tool_calls" in sqlite_table_columns(
+            conn, "messages"
+        )
         for row, corr, invocation_id, profile in knowledge_rows:
             _capture_knowledge_mutation(
                 outbox,
@@ -192,6 +196,7 @@ def poll(
                 counts,
                 knowledge_config,
                 home,
+                has_tool_calls,
             )
         messages.advance()
         with outbox.batch():
@@ -712,15 +717,16 @@ def _capture_knowledge_mutation(
     counts: dict[str, int],
     knowledge_config: Any,
     hermes_home: Path,
+    has_tool_calls: bool,
 ) -> None:
     """Pair one knowledge tool result with its assistant tool-call arguments."""
     tool_name = tool_row["tool_name"]
     tool_call_id = tool_row["tool_call_id"]
     if (
-        tool_name not in {"skill_manage", "memory"}
+        not has_tool_calls
+        or tool_name not in {"skill_manage", "memory"}
         or not isinstance(tool_call_id, str)
         or not tool_call_id
-        or not _table_has_column(conn, "messages", "tool_calls")
     ):
         return
     result = safe_json_dict(tool_row["content"])
@@ -771,12 +777,15 @@ def _find_tool_call(
     tool_call_id: str,
 ) -> tuple[int, str, str, dict[str, Any]] | None:
     """Find a tool call by its durable ID in earlier assistant rows."""
+    # Lazy cursor scan: the match is almost always the immediately preceding
+    # assistant row, so newest-first iteration stops after a row or two
+    # instead of materializing every earlier tool-call row in the session.
     rows = conn.execute(
         "SELECT id, tool_calls FROM messages "
         "WHERE session_id=? AND role='assistant' AND id < ? "
         "AND tool_calls IS NOT NULL ORDER BY id DESC",
         (session_id, before_row_id),
-    ).fetchall()
+    )
     for row in rows:
         try:
             calls = json.loads(row["tool_calls"])
@@ -814,10 +823,6 @@ def _find_tool_call(
                 return None
             return int(row["id"]), name, arguments_text, arguments
     return None
-
-
-def _table_has_column(conn: Any, table: str, column: str) -> bool:
-    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
 def _delegation_content(event: dict[str, Any], result_json: str | None) -> str | None:

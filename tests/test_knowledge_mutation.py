@@ -512,3 +512,39 @@ def test_fleet_mutation_uses_disk_after_state_after_restart(tmp_path, monkeypatc
         b"# Fleet\nv2\n"
     )
     assert not keystore.has_secret(bridge)
+
+
+def test_schema_probe_runs_once_per_poll_with_many_tool_rows(tmp_path, monkeypatch):
+    """The messages tool_calls probe is hoisted out of the per-row loop."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    make_state_db(
+        home,
+        [
+            (
+                "skill_manage",
+                {
+                    "action": "create",
+                    "name": f"probe{index}",
+                    "category": "ops",
+                    "content": f"---\nname: probe{index}\n---\n\n# P{index}\n",
+                },
+                {"success": True, "category": "ops"},
+            )
+            for index in range(3)
+        ],
+    )
+    outbox = new_outbox(tmp_path)
+    real_probe = state_db.sqlite_table_columns
+    probe_calls = []
+
+    def counting_probe(conn, table):
+        probe_calls.append(table)
+        return real_probe(conn, table)
+
+    monkeypatch.setattr(state_db, "sqlite_table_columns", counting_probe)
+
+    counts = state_db.poll(outbox, home)
+
+    assert counts["knowledge.record_written"] == 3
+    assert probe_calls == ["messages"]
