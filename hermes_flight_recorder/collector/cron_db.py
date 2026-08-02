@@ -88,58 +88,66 @@ def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
     finally:
         conn.close()
 
-    for r in rows:
-        if occurred_before(since, r["claimed_at"]):
-            continue  # claimed before the capture horizon (no backfill)
-        exid, job = r["id"], r["job_id"]
-        claimed = to_epoch(r["claimed_at"]) or 0.0
-        rt = runtime_stamp("cron", home_mode=home_mode)
+    # The store was read above; append the gathered rows and advance the
+    # cursor in one outbox transaction, so a crash rolls back rows and cursor
+    # together and a re-poll re-reads exactly the same range (issue #160).
+    with outbox.batch():
+        for r in rows:
+            _emit_execution(outbox, r, counts, home_mode, since)
+        watermark.advance(high_water)
 
-        record = build_record(
-            event_type="cron.run_claimed",
-            occurred_at=claimed,
-            source="cron:executions.db",
-            capture_method="poll:cron:executions.db",
-            runtime=rt,
-            correlation_id=job,
-            payload={
-                "job_id": job,
-                "execution_id": exid,
-                "run_source": r["source"],
-                "pid": r["pid"],
-                "status": r["status"],
-            },
-        )
-        append_and_count(outbox, counts, record, dedup_key=f"cron:claimed:{exid}")
 
-        if r["finished_at"] is None:
-            continue
-        ok = r["status"] == "completed" and not r["error"]
-        record = build_record(
-            event_type="cron.run_finished",
-            occurred_at=to_epoch(r["finished_at"]) or claimed,
-            source="cron:executions.db",
-            capture_method="poll:cron:executions.db",
-            runtime=rt,
-            correlation_id=job,
-            payload={
-                "job_id": job,
-                "execution_id": exid,
-                "status": r["status"],
-                "ok": ok,
-                "started_at": r["started_at"],
-                "finished_at": r["finished_at"],
-            },
-        )
-        append_and_count(
-            outbox,
-            counts,
-            record,
-            content=r["error"] if r["error"] else None,
-            dedup_key=f"cron:finished:{exid}",
-        )
+def _emit_execution(outbox, r, counts, home_mode, since=None) -> None:
+    """Append the claimed (and, when present, finished) events for one row."""
+    if occurred_before(since, r["claimed_at"]):
+        return  # claimed before the capture horizon (no backfill)
+    exid, job = r["id"], r["job_id"]
+    claimed = to_epoch(r["claimed_at"]) or 0.0
+    rt = runtime_stamp("cron", home_mode=home_mode)
 
-    watermark.advance(high_water)
+    record = build_record(
+        event_type="cron.run_claimed",
+        occurred_at=claimed,
+        source="cron:executions.db",
+        capture_method="poll:cron:executions.db",
+        runtime=rt,
+        correlation_id=job,
+        payload={
+            "job_id": job,
+            "execution_id": exid,
+            "run_source": r["source"],
+            "pid": r["pid"],
+            "status": r["status"],
+        },
+    )
+    append_and_count(outbox, counts, record, dedup_key=f"cron:claimed:{exid}")
+
+    if r["finished_at"] is None:
+        return
+    ok = r["status"] == "completed" and not r["error"]
+    record = build_record(
+        event_type="cron.run_finished",
+        occurred_at=to_epoch(r["finished_at"]) or claimed,
+        source="cron:executions.db",
+        capture_method="poll:cron:executions.db",
+        runtime=rt,
+        correlation_id=job,
+        payload={
+            "job_id": job,
+            "execution_id": exid,
+            "status": r["status"],
+            "ok": ok,
+            "started_at": r["started_at"],
+            "finished_at": r["finished_at"],
+        },
+    )
+    append_and_count(
+        outbox,
+        counts,
+        record,
+        content=r["error"] if r["error"] else None,
+        dedup_key=f"cron:finished:{exid}",
+    )
 
 
 def _poll_heartbeat(outbox, home: Path, counts, home_mode) -> None:

@@ -392,3 +392,100 @@ def test_concurrent_append_if_new_has_one_winner(tmp_path):
     assert ob.count() == 1
     assert ob.high_water() == 1
     ob.close()
+
+
+# --- batched appends (issue #160) -----------------------------------------
+def test_batch_commits_appends_as_one_transaction(tmp_path):
+    ob = open_outbox(tmp_path)
+    with ob.batch():
+        first = ob.append(base_record())
+        second = ob.append(base_record())
+    assert (first["producer_sequence"], second["producer_sequence"]) == (1, 2)
+    ob.close()
+
+    reopened = Outbox.open(tmp_path)  # both rows are durable after the commit
+    assert reopened.count() == 2
+    assert reopened.high_water() == 2
+    reopened.close()
+
+
+def test_batch_exception_rolls_back_rows_meta_and_sequence(tmp_path):
+    ob = open_outbox(tmp_path)
+    ob.append(base_record())
+    with pytest.raises(RuntimeError):
+        with ob.batch():
+            ob.append(base_record())
+            ob.set_cursor("source-under-test", 7)
+            ob.set_meta("meta-under-test", "42")
+            raise RuntimeError("crash mid-batch")
+
+    # Rows, cursor, and meta written inside the batch all rolled back as one.
+    assert ob.count() == 1
+    assert ob.get_cursor("source-under-test") is None
+    assert ob.get_meta("meta-under-test") is None
+    # The rolled-back sequence number is reused: no permanent gap.
+    assert ob.append(base_record())["producer_sequence"] == 2
+    ob.close()
+
+
+def test_dedup_inside_a_batch_matches_rows_from_before_and_within(tmp_path):
+    ob = open_outbox(tmp_path)
+    ob.append(base_record(), dedup_key="pre-existing")
+    with ob.batch():
+        assert not ob.append_if_new(base_record(), dedup_key="pre-existing")
+        assert ob.append_if_new(base_record(), dedup_key="fresh")
+        assert not ob.append_if_new(base_record(), dedup_key="fresh")
+    assert ob.count() == 2
+    assert ob.high_water() == 2  # dedup hits consumed no sequence
+    ob.close()
+
+
+def test_nested_batch_joins_the_open_transaction(tmp_path):
+    ob = open_outbox(tmp_path)
+    with ob.batch():
+        ob.append(base_record())
+        with ob.batch():  # must join, not deadlock on the shared connection
+            ob.append(base_record())
+        ob.append(base_record())
+    assert ob.count() == 3
+    ob.close()
+
+
+def test_exception_in_a_nested_batch_rolls_back_the_whole_batch(tmp_path):
+    ob = open_outbox(tmp_path)
+    with pytest.raises(RuntimeError):
+        with ob.batch():
+            ob.append(base_record())
+            with ob.batch():
+                ob.append(base_record())
+                raise RuntimeError("inner crash")
+    assert ob.count() == 0
+    assert ob.high_water() == 0
+    ob.close()
+
+
+def test_failed_append_inside_a_batch_keeps_the_earlier_appends(tmp_path):
+    ob = open_outbox(tmp_path)
+    with ob.batch():
+        ob.append(base_record())
+        bad = base_record()
+        del bad["payload"]
+        with pytest.raises(EnvelopeValidationError):
+            ob.append(bad)  # rejects the record, leaves the batch usable
+        ob.append(base_record())
+    assert ob.count() == 2
+    ob.close()
+
+
+def test_content_written_after_a_batch_rollback_stays_decryptable(tmp_path):
+    # The rolled-back batch may have minted the process data key; its wrapped
+    # form rolled back with it, so the outbox must mint a fresh key rather
+    # than encrypt under a key version that no longer exists.
+    ob = open_outbox(tmp_path)
+    with pytest.raises(RuntimeError):
+        with ob.batch():
+            ob.append(base_record(), content="lost with the batch")
+            raise RuntimeError("crash mid-batch")
+    stored = ob.append(base_record(), content="survives")
+    assert ob.decrypt_content(stored) == b"survives"
+    ob.close()
