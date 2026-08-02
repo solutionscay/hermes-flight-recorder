@@ -29,8 +29,10 @@ import sys
 from functools import partial
 from pathlib import Path
 
-# Runnable standalone and spec-loadable: put the sibling _gate module on the path.
+# Runnable standalone and spec-loadable: put the sibling _gate module on the
+# path, and the repo root so a raw checkout imports the co-located package.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import time
 

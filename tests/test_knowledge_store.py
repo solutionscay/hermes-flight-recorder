@@ -194,6 +194,10 @@ def test_version_restores_byte_for_byte(tmp_path):
     assert restored == {"SKILL.md": body, "references/how.md": ref}
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses file permission bits, so chmod(0) cannot make a file unreadable",
+)
 def test_unreadable_artifact_is_isolated_not_fatal(tmp_path):
     home = tmp_path / "hermes"
     skills = home / "skills"
