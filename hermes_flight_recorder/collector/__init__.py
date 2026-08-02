@@ -78,8 +78,10 @@ def run_pass(
 
     ``on_source_error`` receives each tolerated per-source failure (any
     exception from the hook drain — a bad spool must not sink the poll pass —
-    and a missing durable store from a poll). When it is None, every failure
-    propagates instead.
+    and a missing durable store from a poll) and each per-item error a source
+    tolerated while its poll still completed (an unreadable knowledge
+    artifact). When it is None, a failed poll propagates instead; per-item
+    errors of a completed poll are only recorded in source health.
 
     ``now`` overrides the wall clock stamped into the capture heartbeat; it
     exists for deterministic fixtures (the exit gate) that reconcile against a
@@ -101,77 +103,99 @@ def run_pass(
     home_mode = read_home_mode(hermes_home)
 
     totals: Counter[str] = Counter()
-    knowledge_errors: list[Exception] = []
 
-    def capture_knowledge_error(_artifact_id: str, exc: Exception) -> None:
-        knowledge_errors.append(exc)
+    def poll_knowledge() -> tuple[dict[str, int], list[Exception]]:
+        """Knowledge scan adapted to the uniform ``(counts, errors)`` protocol.
 
+        ``knowledge_store.poll`` reports each unreadable artifact through its
+        ``on_artifact_error`` callback and keeps scanning; this adapter collects
+        those tolerated per-artifact errors and returns them alongside the
+        counts, so the loop below never needs to know which source they came
+        from (issue #168).
+        """
+        errors: list[Exception] = []
+        counts = knowledge_store.poll(
+            outbox,
+            hermes_home,
+            knowledge_config=knowledge_config,
+            on_artifact_error=lambda _artifact_id, exc: errors.append(exc),
+            home_mode=home_mode,
+        )
+        return counts, errors
+
+    # Every poll returns ``(counts, errors)``: per-event-type counts of newly
+    # captured records, plus any per-item errors the source tolerated without
+    # failing the whole poll (a degraded pass — counts still land, the next
+    # tick re-scans). Only knowledge currently produces tolerated errors; a
+    # source that grows per-item tolerance later just returns them here.
     sources: tuple[
         tuple[
             str,
             str,
-            Callable[[], dict[str, int]],
+            Callable[[], tuple[dict[str, int], list[Exception]]],
             tuple[type[Exception], ...],
         ],
         ...,
     ] = (
-        ("hook", "hook drain", lambda: drain_hook_spool(outbox), (Exception,)),
+        (
+            "hook",
+            "hook drain",
+            lambda: (drain_hook_spool(outbox), []),
+            (Exception,),
+        ),
         (
             "state_db",
             "state.db",
-            lambda: state_db.poll(
-                outbox,
-                hermes_home,
-                capture_config=capture,
-                knowledge_config=knowledge_config,
-                since=since,
-                home_mode=home_mode,
+            lambda: (
+                state_db.poll(
+                    outbox,
+                    hermes_home,
+                    capture_config=capture,
+                    knowledge_config=knowledge_config,
+                    since=since,
+                    home_mode=home_mode,
+                ),
+                [],
             ),
             _DURABLE_STORE_ERRORS,
         ),
         (
             "cron",
             "cron",
-            lambda: cron_db.poll(
-                outbox, hermes_home, since=since, home_mode=home_mode
+            lambda: (
+                cron_db.poll(outbox, hermes_home, since=since, home_mode=home_mode),
+                [],
             ),
             _DURABLE_STORE_ERRORS,
         ),
         (
             "kanban",
             "kanban",
-            lambda: kanban_db.poll(
-                outbox, hermes_home, since=since, home_mode=home_mode
+            lambda: (
+                kanban_db.poll(outbox, hermes_home, since=since, home_mode=home_mode),
+                [],
             ),
             _DURABLE_STORE_ERRORS,
         ),
         (
             "gateway_log",
             "gateway log",
-            lambda: gateway_log.poll(
-                outbox, hermes_home, since=since, home_mode=home_mode
+            lambda: (
+                gateway_log.poll(
+                    outbox, hermes_home, since=since, home_mode=home_mode
+                ),
+                [],
             ),
             _DURABLE_STORE_ERRORS,
         ),
-        (
-            "knowledge",
-            "knowledge",
-            lambda: knowledge_store.poll(
-                outbox,
-                hermes_home,
-                knowledge_config=knowledge_config,
-                on_artifact_error=capture_knowledge_error,
-                home_mode=home_mode,
-            ),
-            _DURABLE_STORE_ERRORS,
-        ),
+        ("knowledge", "knowledge", poll_knowledge, _DURABLE_STORE_ERRORS),
     )
     health_at = time.time() if now is None else float(now)
     for source_name, label, poll, tolerated in sources:
         if not source_enabled(capture, source_name):
             continue
         try:
-            source_totals = poll()
+            source_totals, source_errors = poll()
         except tolerated as exc:
             record_error(outbox, source_health_key(source_name), health_at, exc)
             if on_source_error is None:
@@ -179,11 +203,19 @@ def run_pass(
             on_source_error(label, exc)
         else:
             totals.update(source_totals)
-            if source_name == "knowledge" and knowledge_errors:
-                error = knowledge_errors[-1]
-                record_error(outbox, source_health_key(source_name), health_at, error)
+            if source_errors:
+                # Degraded but not dead: the poll completed and its counts are
+                # kept, while the health record shows the per-item failure so
+                # observers see the degradation. Tolerated per-item errors
+                # never propagate, even without an error handler.
+                record_error(
+                    outbox,
+                    source_health_key(source_name),
+                    health_at,
+                    source_errors[-1],
+                )
                 if on_source_error is not None:
-                    for exc in knowledge_errors:
+                    for exc in source_errors:
                         on_source_error(label, exc)
             else:
                 record_success(outbox, source_health_key(source_name), health_at)

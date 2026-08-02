@@ -157,6 +157,66 @@ def test_knowledge_artifact_errors_set_source_failure(tmp_path, monkeypatch):
     assert "PermissionError" in state["last_error"]
 
 
+def test_degraded_knowledge_poll_keeps_counts_and_reports_every_error(
+    tmp_path, monkeypatch
+):
+    """The uniform (counts, errors) path preserves the degraded-source contract:
+    a poll that completes with tolerated per-item errors keeps its counts,
+    reports each error through on_source_error, records the last one in source
+    health — and never raises, even with no error handler."""
+    ob = Outbox.open(tmp_path / "bridge")
+    ob.initialize()
+
+    first = PermissionError("denied: skill one")
+    second = PermissionError("denied: skill two")
+
+    def partial_failure(*args, on_artifact_error=None, **kwargs):
+        on_artifact_error("skill:one", first)
+        on_artifact_error("skill:two", second)
+        return {"knowledge.record_written": 3}
+
+    monkeypatch.setattr(knowledge_store, "poll", partial_failure)
+
+    reported: list[tuple[str, Exception]] = []
+    totals = run_pass(
+        ob,
+        tmp_path / "missing",
+        on_source_error=lambda label, exc: reported.append((label, exc)),
+        now=400.0,
+    )
+
+    # The degraded poll's counts still land in the pass totals.
+    assert totals.get("knowledge.record_written") == 3
+    # Every tolerated per-item error reaches the handler, under the source label.
+    assert [(label, exc) for label, exc in reported if label == "knowledge"] == [
+        ("knowledge", first),
+        ("knowledge", second),
+    ]
+    # Health records the failure (the last error), exactly as before.
+    state = read_health(ob, source_health_key("knowledge"))
+    assert state["consecutive_failures"] == 1
+    assert state["last_error_at"] == 400.0
+    assert "denied: skill two" in state["last_error"]
+    assert "last_success_at" not in state
+
+    # Without a handler, tolerated per-item errors of a completed poll still do
+    # not propagate — cron alone raises on the missing home, knowledge does not.
+    monkeypatch.setattr(cron_db, "poll", lambda *args, **kwargs: {})
+    for module in ("state_db", "kanban_db", "gateway_log"):
+        monkeypatch.setattr(
+            __import__(
+                f"hermes_flight_recorder.collector.{module}", fromlist=["poll"]
+            ),
+            "poll",
+            lambda *args, **kwargs: {},
+        )
+    totals = run_pass(ob, tmp_path / "missing", now=500.0)
+    assert totals.get("knowledge.record_written") == 3
+    state = read_health(ob, source_health_key("knowledge"))
+    assert state["consecutive_failures"] == 2
+    assert state["last_error_at"] == 500.0
+
+
 def test_capture_pass_reads_config_yaml_at_most_once(tmp_path, monkeypatch):
     """One capture pass resolves home_mode exactly once (issue #164).
 
