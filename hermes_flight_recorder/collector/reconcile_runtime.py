@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -26,11 +27,18 @@ from .watermark import meta_float
 
 _PID_RE = re.compile(r"PID (\d+)")
 
+# gateway-starts.log grows one epoch line per gateway start, forever. The
+# frequent reconcile pass only needs the last parseable line, so it reads a
+# bounded tail instead of the whole file.
+_GATEWAY_LOG_TAIL_BYTES = 8192
+
 
 def detect_stale_task_leases(
-    outbox, home, counts, when, config, *, bounded: bool = True
+    outbox, home, counts, when, config, *, bounded: bool = True, boards=None
 ) -> None:
-    for run in load_open_task_runs(home, outbox=outbox if bounded else None):
+    for run in load_open_task_runs(
+        home, outbox=outbox if bounded else None, boards=boards
+    ):
         if not lease_is_dead(run, when, config):
             continue
         board, run_id = run["board"], run["id"]
@@ -67,9 +75,22 @@ def lease_is_dead(run: dict[str, Any], when: float, config: Any) -> bool:
     )
 
 
-def load_open_task_runs(home: Path, *, outbox=None) -> list[dict[str, Any]]:
+def load_open_task_runs(
+    home: Path, *, outbox=None, boards=None
+) -> list[dict[str, Any]]:
+    """Open task attempts per board. ``boards`` reuses a caller's board list.
+
+    In the bounded (frequent) mode, a board whose durable open-run id set is
+    empty — the common steady state — is skipped without opening its
+    ``kanban.db`` at all.
+    """
     runs: list[dict[str, Any]] = []
-    for board, db_path in kanban_board_dbs(home):
+    if boards is None:
+        boards = kanban_board_dbs(home)
+    for board, db_path in boards:
+        ids = open_run_ids(outbox, board) if outbox is not None else None
+        if ids is not None and not ids:
+            continue  # no open attempts recorded — nothing to read
         conn = open_sqlite_read_only(db_path)
         try:
             columns = sqlite_table_columns(conn, "task_runs")
@@ -89,7 +110,6 @@ def load_open_task_runs(home: Path, *, outbox=None) -> list[dict[str, Any]]:
                         "started_at",
                     ),
                 )
-                ids = open_run_ids(outbox, board) if outbox is not None else None
                 if ids is not None:
                     rows = _select_open_run_ids(conn, select, ids)
                 else:
@@ -211,17 +231,30 @@ def parse_pid(text: str) -> int | None:
 
 
 def last_start_epoch(path: Path) -> float | None:
-    if not path.exists():
-        return None
-    last: float | None = None
+    """The last parseable epoch in the tail of ``gateway-starts.log``.
+
+    Reads at most :data:`_GATEWAY_LOG_TAIL_BYTES` from the end of the file.
+    When the read starts mid-file, the first line of the tail may be partial,
+    so it is dropped; the "last parseable line" semantics hold within the
+    tail. Returns None when the file is absent or unreadable.
+    """
     try:
-        for line in path.read_text().splitlines():
-            try:
-                last = float(line.strip())
-            except ValueError:
-                continue
+        with path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            start = max(0, size - _GATEWAY_LOG_TAIL_BYTES)
+            fh.seek(start)
+            tail = fh.read()
     except OSError:
         return None
+    lines = tail.decode("utf-8", "replace").splitlines()
+    if start > 0:
+        lines = lines[1:]  # a mid-file read starts on a partial line
+    last: float | None = None
+    for line in lines:
+        try:
+            last = float(line.strip())
+        except ValueError:
+            continue
     return last
 
 

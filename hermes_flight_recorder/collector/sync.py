@@ -168,12 +168,59 @@ def delivery_cursor(outbox: Any) -> int:
 
 
 def serialize_batch(batch: "Batch | KeyBatch") -> bytes:
-    """Serialize a batch with the encoding used for the byte-size limit."""
+    """Serialize a batch with the encoding used for the byte-size limit.
+
+    A batch built by :func:`build_batches` / :func:`_build_key_batches`
+    already carries its exact wire bytes (assembled from the per-record JSON
+    computed at sizing time), so shipping it re-serializes nothing.
+    """
+    cached = getattr(batch, "wire_bytes", None)
+    if cached is not None:
+        return cached
     return json.dumps(
         batch,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+# The fixed wire envelope every batch body shares:
+# ``{"protocol_version":"1","records":[<record JSON, comma-joined>]}``.
+# Splitting the serialized empty batch keeps the prefix/suffix derived from
+# the same encoder that ``serialize_batch`` uses.
+_EMPTY_BATCH_WIRE = json.dumps(
+    {"protocol_version": PROTOCOL_VERSION, "records": []},
+    ensure_ascii=False,
+    separators=(",", ":"),
+).encode("utf-8")
+_WIRE_PREFIX = _EMPTY_BATCH_WIRE[:-2]  # ends with the records array's '['
+_WIRE_SUFFIX = _EMPTY_BATCH_WIRE[-2:]  # ']}'
+
+
+def _record_json(record: dict[str, Any]) -> bytes:
+    """One record's exact wire JSON — the unit sizing and shipping share."""
+    return json.dumps(
+        record,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+class _PreserializedBatch(dict):
+    """A protocol batch that remembers its exact wire bytes.
+
+    A plain ``dict`` everywhere (equality, JSON encoding, ``records`` access)
+    plus one attribute ``wire_bytes`` that :func:`serialize_batch` returns
+    instead of re-serializing every record a second time per ship pass.
+    """
+
+    wire_bytes: bytes
+
+
+def _preserialized(batch: dict[str, Any], parts: list[bytes]) -> Any:
+    out = _PreserializedBatch(batch)
+    out.wire_bytes = _WIRE_PREFIX + b",".join(parts) + _WIRE_SUFFIX
+    return out
 
 
 def singleton_batch_size(record: dict[str, Any]) -> int:
@@ -201,8 +248,10 @@ def build_batches(
 
     target_bytes = min(max_bytes, MAX_INGEST_BATCH_BYTES)
     current: list[dict[str, Any]] = []
+    current_parts: list[bytes] = []
     current_bytes = 0  # len(serialize_batch(_batch(current))), tracked incrementally
-    envelope_bytes = len(serialize_batch(_batch([])))
+    envelope_bytes = len(_EMPTY_BATCH_WIRE)
+
     installation_id: str | None = None
     previous_sequence: int | None = None
 
@@ -219,26 +268,31 @@ def build_batches(
             raise SyncError("records must be ordered by producer_sequence")
         previous_sequence = sequence
 
-        # Serialize each record once. Batch size is the fixed envelope plus
-        # each record plus one comma between records, so the limit check
-        # never re-serializes the accumulated batch.
-        single_bytes = singleton_batch_size(record)
+        # Serialize each record once, at sizing time. Batch size is the fixed
+        # envelope plus each record plus one comma between records, so the
+        # limit check never re-serializes the accumulated batch — and the
+        # yielded batch carries these same bytes as its wire body, so the
+        # transport never serializes the records a second time.
+        part = _record_json(record)
+        single_bytes = envelope_bytes + len(part)
         if single_bytes > MAX_INGEST_BATCH_BYTES:
             raise SyncError(
                 f"record at producer_sequence {sequence} exceeds the "
                 f"{MAX_INGEST_BATCH_BYTES}-byte ingestion limit"
             )
-        grown_bytes = current_bytes + (single_bytes - envelope_bytes) + 1
+        grown_bytes = current_bytes + len(part) + 1
         if current and (len(current) >= max_records or grown_bytes > target_bytes):
-            yield _batch(current)
+            yield _preserialized(_batch(current), current_parts)
             current = [record]
+            current_parts = [part]
             current_bytes = single_bytes
         else:
             current.append(record)
+            current_parts.append(part)
             current_bytes = single_bytes if len(current) == 1 else grown_bytes
 
     if current:
-        yield _batch(current)
+        yield _preserialized(_batch(current), current_parts)
 
 
 def sync(
@@ -345,6 +399,11 @@ def _build_key_batches(
 
     installation_id: str | None = None
     current: list[dict[str, Any]] = []
+    current_parts: list[bytes] = []
+    # len(serialize_batch(_key_batch(current))), tracked incrementally the
+    # same way build_batches does: fixed envelope + each record + one comma
+    # between records. No accumulated batch is ever re-serialized.
+    current_bytes = 0
     for record in records:
         record_installation_id = record["installation_id"]
         if installation_id is None:
@@ -352,18 +411,23 @@ def _build_key_batches(
         elif record_installation_id != installation_id:
             raise SyncError("one key sync pass cannot mix installation_id values")
 
-        candidate = current + [record]
+        part = _record_json(record)
+        single_bytes = len(_EMPTY_BATCH_WIRE) + len(part)
+        grown_bytes = current_bytes + len(part) + 1
         if current and (
-            len(candidate) > max_records
-            or len(serialize_batch(_key_batch(candidate))) > MAX_INGEST_BATCH_BYTES
+            len(current) >= max_records or grown_bytes > MAX_INGEST_BATCH_BYTES
         ):
-            yield _key_batch(current)
+            yield _preserialized(_key_batch(current), current_parts)
             current = [record]
+            current_parts = [part]
+            current_bytes = single_bytes
         else:
-            current = candidate
+            current.append(record)
+            current_parts.append(part)
+            current_bytes = single_bytes if len(current) == 1 else grown_bytes
 
     if current:
-        yield _key_batch(current)
+        yield _preserialized(_key_batch(current), current_parts)
 
 
 def _validate_key_ack(ack: KeyAck, batch: KeyBatch) -> None:

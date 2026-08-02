@@ -214,6 +214,19 @@ def test_iter_events_in_sequence_order(tmp_path):
     ob.close()
 
 
+def test_iter_events_since_filters_on_occurred_at_in_sql(tmp_path):
+    ob = open_outbox(tmp_path)
+    for offset in (-10.0, 0.0, 10.0):
+        record = base_record()
+        record["occurred_at"] = 1752861993.417 + offset
+        ob.append(record)
+
+    kept = [r["occurred_at"] for r in ob.iter_events(since=1752861993.417)]
+    assert kept == [1752861993.417, 1752862003.417]  # at-or-after, in order
+    assert len(list(ob.iter_events(since=0.0))) == 3
+    ob.close()
+
+
 # --- content encryption -------------------------------------------------
 def test_content_is_encrypted_with_hash_and_companions(tmp_path):
     ob = open_outbox(tmp_path)
@@ -298,6 +311,54 @@ def test_metadata_larger_than_hard_limit_is_rejected_without_sequence(tmp_path):
 
     assert ob.high_water() == 0
     assert ob.count() == 0
+    ob.close()
+
+
+def test_chunked_decrypt_scans_only_the_chunk_sequence_range(tmp_path, monkeypatch):
+    # Chunks are written contiguously immediately before their parent, so a
+    # stored parent bounds the reassembly scan to that sequence range and
+    # never falls back to iterating the whole event table (issue #166).
+    ob = open_outbox(tmp_path)
+    for _ in range(5):
+        ob.append(base_record())
+    content = b"x" * 3_200_000
+    parent = ob.append(base_record("knowledge.record_written"), content=content)
+    for _ in range(5):
+        ob.append(base_record())
+
+    def full_scan_forbidden(*args, **kwargs):
+        raise AssertionError("decrypt_content fell back to a full event scan")
+
+    monkeypatch.setattr(ob, "iter_events", full_scan_forbidden)
+    assert ob.decrypt_content(parent) == content
+    ob.close()
+
+
+def test_chunked_decrypt_without_stamped_sequence_still_reassembles(tmp_path):
+    # A caller-built record without producer_sequence keeps the full-scan
+    # fallback, so the pre-#166 call shape still works.
+    ob = open_outbox(tmp_path)
+    content = b"x" * 3_200_000
+    parent = ob.append(base_record("knowledge.record_written"), content=content)
+
+    stripped = dict(parent)
+    del stripped["producer_sequence"]
+    assert ob.decrypt_content(stripped) == content
+    ob.close()
+
+
+def test_chunked_decrypt_bounded_scan_errors_on_missing_chunk(tmp_path):
+    ob = open_outbox(tmp_path)
+    content = b"x" * 3_200_000
+    parent = ob.append(base_record("knowledge.record_written"), content=content)
+
+    ob._conn.execute(
+        "DELETE FROM events WHERE producer_sequence=?",
+        (parent["producer_sequence"] - 1,),  # the last chunk
+    )
+
+    with pytest.raises(OutboxError, match="incomplete"):
+        ob.decrypt_content(parent)
     ob.close()
 
 

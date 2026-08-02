@@ -176,3 +176,52 @@ def test_no_gateway_no_false_positive(tmp_path):
     ob = new_outbox(tmp_path)
     reconcile.reconcile(ob, hh, now=1_800_000_000.0)
     assert _findings(ob) == []
+
+
+# --- bounded tail read of gateway-starts.log (issue #166) -----------------
+def test_last_start_epoch_bounded_tail_matches_last_line_of_large_log(tmp_path):
+    # The log grows one epoch line per gateway start, forever. The tail read
+    # must return the last parseable line even when the file is far larger
+    # than the tail window.
+    from hermes_flight_recorder.collector.reconcile_runtime import (
+        _GATEWAY_LOG_TAIL_BYTES,
+        last_start_epoch,
+    )
+
+    log = tmp_path / "gateway-starts.log"
+    lines = [f"{1784400000 + i}.0" for i in range(1200)]
+    log.write_text("\n".join(lines) + "\n")
+    assert log.stat().st_size > _GATEWAY_LOG_TAIL_BYTES
+
+    assert last_start_epoch(log) == 1784401199.0
+
+
+def test_last_start_epoch_drops_the_partial_first_tail_line(tmp_path):
+    # Construct a file where the tail window starts mid-way through a numeric
+    # line, so the truncated fragment ("538.0") would parse to a wrong epoch
+    # if it were not dropped as partial. Everything after it is unparseable,
+    # so the correct bounded-tail answer is None.
+    from hermes_flight_recorder.collector.reconcile_runtime import (
+        _GATEWAY_LOG_TAIL_BYTES,
+        last_start_epoch,
+    )
+
+    head = b"1.0\n"
+    straddling = b"1784496538.0\n"
+    cut = 7  # the window starts here, leaving the parseable fragment b"538.0\n"
+    garbage = b"g" * (_GATEWAY_LOG_TAIL_BYTES - (len(straddling) - cut) - 1) + b"\n"
+    log = tmp_path / "gateway-starts.log"
+    log.write_bytes(head + straddling + garbage)
+    assert log.stat().st_size - _GATEWAY_LOG_TAIL_BYTES == len(head) + cut
+
+    assert last_start_epoch(log) is None
+
+
+def test_last_start_epoch_small_log_keeps_full_read_semantics(tmp_path):
+    from hermes_flight_recorder.collector.reconcile_runtime import last_start_epoch
+
+    log = tmp_path / "gateway-starts.log"
+    log.write_text("garbage\n1784496008.1\nnot-a-number\n1784496538.087068\n\n")
+
+    assert last_start_epoch(log) == 1784496538.087068
+    assert last_start_epoch(tmp_path / "missing.log") is None

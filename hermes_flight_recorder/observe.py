@@ -70,14 +70,38 @@ def load(
 
     ``session`` keeps the whole operation an id takes part in (matched on
     ``correlation_id``, ``session_id``, or ``parent_session_id``). ``since``
-    keeps events at or after an ``occurred_at`` epoch.
+    keeps events at or after an ``occurred_at`` epoch. Filtering streams over
+    the iterator, so the unfiltered history is never materialized; a real
+    :class:`~hermes_flight_recorder.collector.outbox.Outbox` additionally
+    evaluates ``since`` inside SQLite.
     """
-    records = list(outbox.iter_events())
-    if session is not None:
-        records = [r for r in records if _touches_session(r, session)]
-    if since is not None:
-        records = [r for r in records if _as_float(r.get("occurred_at")) >= since]
-    return records
+    return [
+        r
+        for r in _iter_records(outbox, since)
+        if session is None or _touches_session(r, session)
+    ]
+
+
+def _iter_records(outbox: Any, since: float | None) -> Iterable[dict[str, Any]]:
+    """Iterate outbox records with the ``since`` filter applied.
+
+    A real Outbox accepts ``iter_events(since=...)`` and pushes the
+    ``occurred_at`` predicate down into SQL, so out-of-window envelopes are
+    never JSON-parsed. A minimal stand-in that exposes only ``iter_events()``
+    (the documented dependency of :func:`load`) gets the identical filter in
+    Python: ``occurred_at`` folded through ``_as_float`` (missing/invalid →
+    0.0), kept when at or after ``since``.
+    """
+    if since is None:
+        return outbox.iter_events()
+    try:
+        return outbox.iter_events(since=since)
+    except TypeError:  # iter_events() without since support
+        return (
+            r
+            for r in outbox.iter_events()
+            if _as_float(r.get("occurred_at")) >= since
+        )
 
 
 def _touches_session(record: dict[str, Any], session: str) -> bool:
