@@ -359,22 +359,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
     )
 
 
-def _sync_summary(outbox, before_cursor: int) -> tuple[int, int, int]:
-    """Return ``(acked_this_pass, delivery_cursor, pending)`` from outbox state.
-
-    The delivery cursor advances only after a durable ack, so its movement is
-    the honest count of what shipped and acked this pass. ``pending`` is the
-    distance the server is still behind the producer high-water. Read from the
-    outbox, not from the pass result, so the summary is truthful even when a
-    multi-batch pass ships some batches and then the network drops.
-    """
-    from .collector.sync import delivery_cursor
-
-    after = delivery_cursor(outbox)
-    producer_high_water = outbox.high_water()
-    return after - before_cursor, after, producer_high_water - after
-
-
 def _sync_once(
     outbox,
     transport,
@@ -383,64 +367,78 @@ def _sync_once(
     max_bytes: int = 1024 * 1024,
     retention_config=None,
 ) -> int:
-    """One sync pass. Print the summary and return a sync exit code."""
-    from .collector.sync import delivery_cursor
-    from .collector.transport import TerminalTransportError, push
+    """One sync pass. Print the summary and return a sync exit code.
 
-    before = delivery_cursor(outbox)
-    try:
-        outcome = push(outbox, transport, max_records=max_records, max_bytes=max_bytes)
-    except TerminalTransportError as exc:
+    The pass itself (push -> cursor delta -> wrapped-DEK ship -> prune) is
+    shared with ``serve`` in :mod:`.collector.sync_pass`; this function only
+    renders the result and maps it to an exit code.
+    """
+    from .collector.sync_pass import run_sync_pass
+
+    result = run_sync_pass(
+        outbox,
+        transport,
+        max_records=max_records,
+        max_bytes=max_bytes,
+        retention_config=retention_config,
+    )
+    if result.outcome == "terminal":
         # A client defect. Resending the same body cannot help.
-        print(f"sync stopped: malformed batch (client defect): {exc}", file=sys.stderr)
+        print(
+            f"sync stopped: malformed batch (client defect): {result.detail}",
+            file=sys.stderr,
+        )
         return _SYNC_TERMINAL
 
-    acked, cursor, pending = _sync_summary(outbox, before)
     print(
-        f"shipped {acked} / acked {acked} / pending {pending}  "
-        f"(delivery cursor {cursor}, producer high-water {cursor + pending})"
+        f"shipped {result.acked} / acked {result.acked} / pending {result.pending}  "
+        f"(delivery cursor {result.delivery_cursor}, "
+        f"producer high-water {result.delivery_cursor + result.pending})"
     )
-    _sync_content_keys_once(outbox, transport)
-    if retention_config is not None:
-        _automatic_prune(outbox, retention_config)
-    if outcome.ok:
+    _report_key_ship(result)
+    if result.prune_error is not None:
+        print(f"automatic retention skipped: {result.prune_error}", file=sys.stderr)
+    elif result.pruned is not None:
+        _print_prune_result(result.pruned, automatic=True)
+    if result.outcome == "ok":
         return _SYNC_OK
-    if outcome.reason == "auth":
+    if result.outcome == "auth":
         message = "sync failed: the edge rejected the service token"
-        if outcome.detail:
-            message += f": {outcome.detail}"
+        if result.detail:
+            message += f": {result.detail}"
         print(message, file=sys.stderr)
         return _SYNC_AUTH
+    if result.outcome == "cancelled":
+        # Shutdown stopped the pass mid-flight; the outbox keeps the events.
+        print("sync stopped for shutdown", file=sys.stderr)
+        return _SYNC_OK
     message = "sync failed: the ingestion service is unreachable"
-    if outcome.detail:
-        message += f": {outcome.detail}"
+    if result.detail:
+        message += f": {result.detail}"
     print(message, file=sys.stderr)
     return _SYNC_UNREACHABLE
 
 
-def _sync_content_keys_once(outbox, transport) -> None:
-    """Ship pending wrapped DEKs alongside events; best-effort, never fatal.
+def _report_key_ship(result) -> None:
+    """Print the wrapped-DEK side-channel outcome; never affects exit codes.
 
-    The wrapped-DEK side-channel is independent of event delivery: a network or
-    auth failure just leaves the records for the next pass (delivery is
-    idempotent server-side), so it only reports and never changes the sync exit
-    code. A terminal client defect is surfaced but still not fatal to events.
+    The side-channel is independent of event delivery: a network or auth
+    failure just leaves the records for the next pass (delivery is idempotent
+    server-side). A terminal client defect is surfaced but still not fatal.
     """
-    from .collector.transport import TerminalTransportError, push_content_keys
-
-    try:
-        outcome = push_content_keys(outbox, transport)
-    except TerminalTransportError as exc:
+    if result.key_outcome is None:
+        return
+    if result.key_outcome == "terminal":
         print(
-            f"wrapped-key sync stopped: malformed batch (client defect): {exc}",
+            "wrapped-key sync stopped: malformed batch (client defect): "
+            f"{result.key_detail}",
             file=sys.stderr,
         )
-        return
-    if outcome.ok:
-        if outcome.result is not None and outcome.result.keys_sent:
-            print(f"shipped {outcome.result.keys_sent} wrapped key(s)")
+    elif result.key_outcome == "ok":
+        if result.keys_sent:
+            print(f"shipped {result.keys_sent} wrapped key(s)")
     else:
-        print(f"wrapped-key sync deferred ({outcome.reason})", file=sys.stderr)
+        print(f"wrapped-key sync deferred ({result.key_outcome})", file=sys.stderr)
 
 
 def _cmd_sync(args: argparse.Namespace) -> int:
