@@ -49,7 +49,9 @@ from ..envelope import SCHEMA_VERSION, parse, serialize, validate
 from . import content_crypto as cc
 from . import keystore
 from ._common import (
+    CAPTURE_BACKFILL_META_KEY,
     FLIGHT_RECORDER_DIR_NAME,
+    INSTALLED_AT_META_KEY,
     default_flight_recorder_home,
     resolve_flight_recorder_home,
     resolve_hermes_home,
@@ -146,6 +148,11 @@ CREATE TABLE IF NOT EXISTS knowledge_version (
 """
 
 
+# Sentinel for the lazily-read capture-horizon cache ("not read yet" must be
+# distinguishable from a cached None, which means backfill is enabled).
+_HORIZON_UNREAD = object()
+
+
 _RETENTION_PAYLOAD_KEYS = (
     "message_row_id",
     "model",
@@ -225,6 +232,8 @@ class Outbox(KnowledgeOutboxMixin):
         # KnowledgeOutboxMixin; this only triggers its initialization.
         self._init_knowledge_state()
         self._installation_id: str | None = None
+        # Lazily-read ``--no-backfill`` capture horizon; see capture_horizon.
+        self._capture_horizon_cache: Any = _HORIZON_UNREAD
         # Depth of the open ``batch()`` context; 0 means every append runs in
         # its own ``BEGIN IMMEDIATE`` transaction (the historical behavior).
         self._batch_depth = 0
@@ -347,6 +356,31 @@ class Outbox(KnowledgeOutboxMixin):
                 raise OutboxError("outbox is not initialized; call initialize() first")
             self._installation_id = row[0]
         return self._installation_id
+
+    @property
+    def capture_horizon(self) -> float | None:
+        """The ``install --no-backfill`` capture horizon epoch, or None.
+
+        None — the default — means backfill is enabled and nothing is dropped.
+        The horizon is the ``installed_at`` marker, returned only when
+        ``install --no-backfill`` stamped ``capture:backfill`` off. Cached
+        after the first read (both markers are written once, at install,
+        before any capture), so the append path never pays a meta read per
+        record; a ``set_meta``/``delete_meta`` on either marker invalidates
+        the cache.
+        """
+        if self._capture_horizon_cache is _HORIZON_UNREAD:
+            self._capture_horizon_cache = self._read_capture_horizon()
+        return self._capture_horizon_cache
+
+    def _read_capture_horizon(self) -> float | None:
+        if self.get_meta(CAPTURE_BACKFILL_META_KEY) != "false":
+            return None
+        raw = self.get_meta(INSTALLED_AT_META_KEY)
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
 
     # --- content keys ---------------------------------------------------
     # Writing needs only the operator *public* key: content is encrypted with
@@ -903,9 +937,13 @@ class Outbox(KnowledgeOutboxMixin):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+        if key in (CAPTURE_BACKFILL_META_KEY, INSTALLED_AT_META_KEY):
+            self._capture_horizon_cache = _HORIZON_UNREAD
 
     def delete_meta(self, key: str) -> None:
         self._conn.execute("DELETE FROM meta WHERE key=?", (key,))
+        if key in (CAPTURE_BACKFILL_META_KEY, INSTALLED_AT_META_KEY):
+            self._capture_horizon_cache = _HORIZON_UNREAD
 
     def meta_keys_with_prefix(self, prefix: str) -> list[str]:
         """Return the meta keys that start with ``prefix``, byte-exactly.
@@ -923,9 +961,13 @@ class Outbox(KnowledgeOutboxMixin):
 
     def delete_meta_many(self, keys: Iterable[str]) -> None:
         """Delete many meta keys with one batched statement."""
-        self._conn.executemany(
-            "DELETE FROM meta WHERE key=?", [(key,) for key in keys]
-        )
+        materialized = [(key,) for key in keys]
+        self._conn.executemany("DELETE FROM meta WHERE key=?", materialized)
+        if any(
+            key in (CAPTURE_BACKFILL_META_KEY, INSTALLED_AT_META_KEY)
+            for (key,) in materialized
+        ):
+            self._capture_horizon_cache = _HORIZON_UNREAD
 
     # --- read -----------------------------------------------------------
     def high_water(self, installation_id: str | None = None) -> int:

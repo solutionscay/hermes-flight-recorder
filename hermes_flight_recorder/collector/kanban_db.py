@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
-    occurred_before,
     append_and_count,
     build_record,
     kanban_board_dbs,
@@ -79,27 +78,26 @@ def poll(
     outbox: Any,
     hermes_home: str | Path | None = None,
     *,
-    since: float | None = None,
     home_mode: str | None = None,
 ) -> dict[str, int]:
     """One read-only poll pass over every Kanban board. Returns per-type counts.
 
-    ``since`` is the capture horizon (``install --no-backfill``); task events and
-    attempts older than it are skipped so history is not backfilled. ``home_mode``
-    is the terminal home-mode policy resolved by the caller (``run_pass``
-    resolves it once per capture pass, issue #164); when None, a standalone
-    call resolves it itself.
+    The ``install --no-backfill`` capture horizon is enforced in the append
+    path (``append_and_count``), not here. ``home_mode`` is the terminal
+    home-mode policy resolved by the caller (``run_pass`` resolves it once per
+    capture pass, issue #164); when None, a standalone call resolves it
+    itself.
     """
     home = resolve_hermes_home(hermes_home)
     if home_mode is None:
         home_mode = read_home_mode(hermes_home)
     counts: dict[str, int] = defaultdict(int)
     for board, db_path in kanban_board_dbs(home):
-        _poll_board(outbox, board, db_path, counts, home_mode, since)
+        _poll_board(outbox, board, db_path, counts, home_mode)
     return dict(counts)
 
 
-def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None) -> None:
+def _poll_board(outbox, board: str, db_path: Path, counts, home_mode) -> None:
     batch = read_board(outbox, board, db_path)
     if batch is None:
         return
@@ -110,8 +108,6 @@ def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None
     # rows and cursors together (issue #160).
     with outbox.batch():
         for ev in events:
-            if occurred_before(since, ev["created_at"]):
-                continue  # created before the capture horizon (no backfill)
             event_type = _KIND_EVENT.get(ev["kind"])
             if event_type is None:
                 continue
@@ -139,8 +135,6 @@ def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None
             run = runs[run_id]
             if run["outcome"] is None:
                 continue
-            if occurred_before(since, run["ended_at"] or run["started_at"]):
-                continue  # attempt ended before the capture horizon (no backfill)
             task = tasks.get(run["task_id"])
             record = build_record(
                 event_type="task.attempt_ended",
