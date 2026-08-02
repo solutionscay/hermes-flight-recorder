@@ -39,7 +39,8 @@ the same durable state appends nothing new (idempotent). The reconciler
 never writes to any Hermes store.
 
 The frequent pass runs bounded runtime-health checks. The less frequent audit
-loads the retained stream and complete durable histories for integrity checks.
+loads a slim SQL-extracted summary of the retained stream and complete durable
+histories for integrity checks.
 """
 
 from __future__ import annotations
@@ -162,21 +163,25 @@ def reconcile(
         installation_id = outbox.installation_id
         # Bind the stream to a high-water that predates concurrent appends.
         sequence_high_water = outbox.high_water(installation_id)
-        events = list(outbox.iter_events(installation_id))
+        # One slim snapshot of the stream. The audit fields are extracted in
+        # SQL (``json_extract``; see ``Outbox.iter_event_summaries``), so no
+        # complete envelope is JSON-parsed into memory (issue #163). Retained
+        # events first, then pruned summaries — the order the detectors have
+        # always read.
+        events = list(outbox.iter_event_summaries(installation_id))
         events.extend(outbox.iter_pruned_summaries(installation_id))
         exec_rows = (
             _load_execution_rows(home) if source_enabled(capture, "cron") else []
         )
-        # The sequence and terminal detectors judge only the in-memory event
-        # snapshot loaded above, so their finding emission batches into one
-        # outbox transaction each (issue #160). The coverage and knowledge
-        # detectors interleave durable-store reads (and, for knowledge, file
-        # hashing) with their emits, so they batch per pre-read row set (or
-        # not at all) inside their own modules.
+        # The sequence detector reads only integers from SQL and the terminal
+        # detector judges only the in-memory snapshot loaded above, so their
+        # finding emission batches into one outbox transaction each (issue
+        # #160). The coverage and knowledge detectors interleave durable-store
+        # reads (and, for knowledge, file hashing) with their emits, so they
+        # batch per pre-read row set (or not at all) inside their own modules.
         with outbox.batch():
             _detect_sequence_gaps(
                 outbox,
-                events,
                 installation_id,
                 counts,
                 when,
@@ -228,26 +233,22 @@ def _install_horizon(outbox: Any) -> float:
 
 # --- sequence gaps ------------------------------------------------------
 def _detect_sequence_gaps(
-    outbox, events, installation_id, counts, when, high_water, finding_limit
+    outbox, installation_id, counts, when, high_water, finding_limit
 ) -> None:
     """Report absent sequences from 1 through the durable high-water mark.
 
-    Zero and ``high_water + 1`` are range boundaries. They keep the existing
-    integer bracket fields useful for leading and trailing gaps. The finding
-    limit bounds both iteration and writes if the durable high-water is
-    damaged.
+    The present sequences (retained events union pruned tombstones) come
+    sorted and de-duplicated straight from SQL as bare integers (issue #163);
+    no envelope is parsed for this detector. Zero and ``high_water + 1`` are
+    range boundaries. They keep the existing integer bracket fields useful
+    for leading and trailing gaps. The finding limit bounds both iteration
+    and writes if the durable high-water is damaged.
     """
     if finding_limit <= 0:
         return
 
     high_water = max(0, high_water)
-    seqs = sorted(
-        {
-            event["producer_sequence"]
-            for event in events
-            if 1 <= event["producer_sequence"] <= high_water
-        }
-    )
+    seqs = outbox.stored_sequences(installation_id, through_sequence=high_water)
     boundaries = [0, *seqs, high_water + 1]
     emitted = 0
     for prev_seq, next_seq in zip(boundaries, boundaries[1:]):

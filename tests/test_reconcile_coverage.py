@@ -421,6 +421,66 @@ def test_no_backfill_install_horizon_keeps_new_uncaptured_rows(tmp_path):
     }
 
 
+# --- coverage-pending grace markers -------------------------------------------
+def test_captured_row_clears_its_pending_marker_and_touches_nothing_else(tmp_path):
+    """The batched pending-clear (issue #162) behaves like the per-row DELETE:
+    a captured subject's grace marker is removed, and no other meta row —
+    watermark cursor, knowledge emit cursor, or a near-prefix key — changes.
+    """
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    make_state_db(hh, sessions=[("S1", "cli", None, B, None, 0, None)])
+    ob = new_outbox(tmp_path)
+    cfg = ReconcileConfig(coverage_grace=30.0)
+
+    # First pass: the uncaptured row starts its grace window (marker set).
+    reconcile(ob, hh, now=B, config=cfg)
+    assert ob.get_meta("reconcile:coverage_pending:session:S1") is not None
+
+    # Neighbouring meta state the exact-prefix batch must never sweep in.
+    ob.set_cursor("state.db:messages", 42)
+    ob.set_meta("knowledge:emitted:art-1", "3")
+    ob.set_meta("reconcile:coverage_pending_lookalike", "keep")
+
+    # The capture arrives; the next audit clears the marker.
+    append_event(ob, "session.created", session_id="S1", correlation_id="S1")
+    reconcile(ob, hh, now=B + 1, config=cfg)
+
+    assert ob.get_meta("reconcile:coverage_pending:session:S1") is None
+    assert ob.get_cursor("state.db:messages") == "42"
+    assert ob.get_meta("knowledge:emitted:art-1") == "3"
+    assert ob.get_meta("reconcile:coverage_pending_lookalike") == "keep"
+    assert coverage_gaps(ob, "session") == []
+
+
+def test_pending_marker_of_a_still_uncaptured_row_survives_the_batch(tmp_path):
+    """Only markers for subjects proven captured are deleted; a subject still
+    inside its grace window keeps its marker so a later pass can judge it.
+    """
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    make_state_db(
+        hh,
+        sessions=[
+            ("cap", "cli", None, B, None, 0, None),
+            ("gap", "cli", None, B, None, 0, None),
+        ],
+    )
+    ob = new_outbox(tmp_path)
+    cfg = ReconcileConfig(coverage_grace=30.0)
+
+    reconcile(ob, hh, now=B, config=cfg)  # both markers set
+    append_event(ob, "session.created", session_id="cap", correlation_id="cap")
+    reconcile(ob, hh, now=B + 1, config=cfg)
+
+    assert ob.get_meta("reconcile:coverage_pending:session:cap") is None
+    assert ob.get_meta("reconcile:coverage_pending:session:gap") is not None
+
+    # Past the grace, the surviving marker still yields the finding.
+    reconcile(ob, hh, now=B + 31, config=cfg)
+    assert {g["payload"]["subject_id"] for g in coverage_gaps(ob, "session")} == {"gap"}
+
+
 # --- idempotency & combined scenario -----------------------------------------
 def test_coverage_gap_is_idempotent_across_reconcile_runs(tmp_path):
     hh = tmp_path / "hermes"

@@ -26,6 +26,7 @@ def _detect_coverage_gaps(
 ):
     """A durable row with no captured event proves a dropped capture."""
     captured = _captured_subjects(events)
+    pending = _CoveragePending(outbox)
     session_rows = []
     parent_map = {}
 
@@ -55,6 +56,7 @@ def _detect_coverage_gaps(
                 session_rows,
                 parent_map,
                 captured,
+                pending,
                 counts,
                 when,
                 config,
@@ -66,6 +68,7 @@ def _detect_coverage_gaps(
                 parent_map,
                 session_started,
                 captured,
+                pending,
                 counts,
                 when,
                 config,
@@ -78,6 +81,7 @@ def _detect_coverage_gaps(
                 parent_map,
                 session_started,
                 captured,
+                pending,
                 counts,
                 when,
                 config,
@@ -93,7 +97,7 @@ def _detect_coverage_gaps(
                 if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
                     continue
                 if r["id"] in captured["executions"]:
-                    _clear_coverage_pending(outbox, "execution", r["id"])
+                    pending.clear("execution", r["id"])
                     continue
                 _emit_coverage(
                     outbox,
@@ -106,11 +110,14 @@ def _detect_coverage_gaps(
                     grace=config.coverage_grace,
                 )
     if source_enabled(capture_config, "kanban"):
-        _coverage_kanban(outbox, home, captured, counts, when, config, horizon)
+        _coverage_kanban(
+            outbox, home, captured, pending, counts, when, config, horizon
+        )
+    pending.flush()
 
 
 def _coverage_sessions(
-    outbox, rows, parent_map, captured, counts, when, config, horizon
+    outbox, rows, parent_map, captured, pending, counts, when, config, horizon
 ) -> None:
     # ``rows`` was fetched by the caller; emit findings in one transaction.
     with outbox.batch():
@@ -119,7 +126,7 @@ def _coverage_sessions(
                 continue
             sid = r["id"]
             if sid in captured["sessions"]:
-                _clear_coverage_pending(outbox, "session", sid)
+                pending.clear("session", sid)
                 continue
             corr = root_session(sid, parent_map) or sid
             _emit_coverage(
@@ -142,6 +149,7 @@ def _coverage_messages(
     parent_map,
     session_started,
     captured,
+    pending,
     counts,
     when,
     config,
@@ -188,7 +196,7 @@ def _coverage_messages(
             ):
                 continue
             if r["id"] in captured["messages"]:
-                _clear_coverage_pending(outbox, "message", str(r["id"]))
+                pending.clear("message", str(r["id"]))
                 continue
             corr = root_session(sid, parent_map) or sid
             _emit_coverage(
@@ -205,7 +213,16 @@ def _coverage_messages(
 
 
 def _coverage_model_usage(
-    outbox, conn, parent_map, session_started, captured, counts, when, config, horizon
+    outbox,
+    conn,
+    parent_map,
+    session_started,
+    captured,
+    pending,
+    counts,
+    when,
+    config,
+    horizon,
 ) -> None:
     if not sqlite_table_exists(conn, "session_model_usage"):
         return
@@ -220,7 +237,7 @@ def _coverage_model_usage(
             key = (r["session_id"], r["model"], r["task"])
             subject_id = f"{r['session_id']}:{r['model']}:{r['task']}"
             if key in captured["model_usage"]:
-                _clear_coverage_pending(outbox, "model_usage", subject_id)
+                pending.clear("model_usage", subject_id)
                 continue
             sid = r["session_id"]
             corr = root_session(sid, parent_map) or sid
@@ -237,7 +254,9 @@ def _coverage_model_usage(
             )
 
 
-def _coverage_kanban(outbox, home, captured, counts, when, config, horizon) -> None:
+def _coverage_kanban(
+    outbox, home, captured, pending, counts, when, config, horizon
+) -> None:
     """A durable Kanban task/run with no captured ``task.*`` event.
 
     The Kanban analog of the session/execution coverage diff: every board's
@@ -282,7 +301,7 @@ def _coverage_kanban(outbox, home, captured, counts, when, config, horizon) -> N
                 if occurred_before(horizon, r["created_at"] or r["started_at"]):
                     continue
                 if (board, r["id"]) in captured["tasks"]:
-                    _clear_coverage_pending(outbox, "task", f"{board}:{r['id']}")
+                    pending.clear("task", f"{board}:{r['id']}")
                     continue
                 _emit_coverage(
                     outbox,
@@ -299,9 +318,7 @@ def _coverage_kanban(outbox, home, captured, counts, when, config, horizon) -> N
                 if occurred_before(horizon, r["started_at"] or r["ended_at"]):
                     continue
                 if (board, r["id"]) in captured["task_runs"]:
-                    _clear_coverage_pending(
-                        outbox, "task_run", f"{board}:{r['id']}"
-                    )
+                    pending.clear("task_run", f"{board}:{r['id']}")
                     continue
                 _emit_coverage(
                     outbox,
@@ -392,12 +409,43 @@ def _emit_coverage(
     )
 
 
+_COVERAGE_PENDING_PREFIX = "reconcile:coverage_pending:"
+
+
 def _coverage_pending_key(subject_type: str, subject_id: Any) -> str:
-    return f"reconcile:coverage_pending:{subject_type}:{subject_id}"
+    return f"{_COVERAGE_PENDING_PREFIX}{subject_type}:{subject_id}"
 
 
-def _clear_coverage_pending(outbox, subject_type: str, subject_id: Any) -> None:
-    outbox.delete_meta(_coverage_pending_key(subject_type, subject_id))
+class _CoveragePending:
+    """The ``reconcile:coverage_pending:*`` grace markers, loaded once per pass.
+
+    A full audit used to issue one ``DELETE FROM meta`` per already-captured
+    durable row — tens of thousands of no-op DELETEs on a large home (issue
+    #162). One SELECT loads the marker keys actually present (exact-prefix
+    match, so watermark cursors and knowledge emit cursors in the same table
+    are never touched); ``clear`` collects only those keys, and ``flush``
+    deletes them in one batched transaction.
+    """
+
+    def __init__(self, outbox) -> None:
+        self._outbox = outbox
+        self._present = set(outbox.meta_keys_with_prefix(_COVERAGE_PENDING_PREFIX))
+        self._cleared: list[str] = []
+
+    def clear(self, subject_type: str, subject_id: Any) -> None:
+        """Drop a captured subject's grace marker, if one exists."""
+        key = _coverage_pending_key(subject_type, subject_id)
+        if key in self._present:
+            self._present.remove(key)
+            self._cleared.append(key)
+
+    def flush(self) -> None:
+        """Delete the collected markers as one ``executemany`` batch."""
+        if not self._cleared:
+            return
+        with self._outbox.batch():
+            self._outbox.delete_meta_many(self._cleared)
+        self._cleared.clear()
 
 
 def _coverage_ready(

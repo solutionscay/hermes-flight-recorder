@@ -156,6 +156,20 @@ _RETENTION_PAYLOAD_KEYS = (
     "run_id",
 )
 
+# The envelope subset the reconciler's full audit reads (see
+# ``iter_event_summaries``). Extracted with ``json_extract`` inside SQLite so
+# an audit never JSON-parses complete envelopes — with their inline content
+# ciphertext — into Python objects.
+_AUDIT_ENVELOPE_KEYS = (
+    "occurred_at",
+    "correlation_id",
+    "profile",
+    "session_id",
+    "parent_session_id",
+    "invocation_id",
+)
+_AUDIT_PAYLOAD_KEYS = ("event_type", *_RETENTION_PAYLOAD_KEYS)
+
 
 def _retention_summary(record: dict[str, Any], sequence: int) -> dict[str, Any]:
     """Return the non-content fields reconciliation needs after a prune."""
@@ -862,6 +876,26 @@ class Outbox(KnowledgeOutboxMixin):
     def delete_meta(self, key: str) -> None:
         self._conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
+    def meta_keys_with_prefix(self, prefix: str) -> list[str]:
+        """Return the meta keys that start with ``prefix``, byte-exactly.
+
+        A ``substr`` comparison, not ``LIKE``: the match is case-sensitive
+        and no character of ``prefix`` acts as a wildcard, so a namespace
+        prefix such as ``reconcile:coverage_pending:`` never sweeps in
+        cursor, watermark, or knowledge keys that merely compare alike.
+        """
+        rows = self._conn.execute(
+            "SELECT key FROM meta WHERE substr(key, 1, ?) = ?",
+            (len(prefix), prefix),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def delete_meta_many(self, keys: Iterable[str]) -> None:
+        """Delete many meta keys with one batched statement."""
+        self._conn.executemany(
+            "DELETE FROM meta WHERE key=?", [(key,) for key in keys]
+        )
+
     # --- read -----------------------------------------------------------
     def high_water(self, installation_id: str | None = None) -> int:
         inst = installation_id or self.installation_id
@@ -1086,6 +1120,70 @@ class Outbox(KnowledgeOutboxMixin):
                 yield json.loads(raw)
         finally:
             rows.close()
+
+    def stored_sequences(
+        self,
+        installation_id: str | None = None,
+        *,
+        through_sequence: int,
+    ) -> list[int]:
+        """Sorted distinct producer sequences present, from 1 through a bound.
+
+        Retained events union compact retention tombstones, answered by two
+        index range scans in SQL. Sequence-gap detection needs only these
+        integers, so no envelope leaves the database for it.
+        """
+        inst = installation_id or self.installation_id
+        rows = self._conn.execute(
+            "SELECT producer_sequence FROM events "
+            "WHERE installation_id=? AND producer_sequence BETWEEN 1 AND ? "
+            "UNION "
+            "SELECT producer_sequence FROM retention_tombstones "
+            "WHERE installation_id=? AND producer_sequence BETWEEN 1 AND ? "
+            "ORDER BY producer_sequence",
+            (inst, through_sequence, inst, through_sequence),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def iter_event_summaries(
+        self,
+        installation_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield slim audit summaries of retained events in sequence order.
+
+        The same shape :meth:`iter_pruned_summaries` yields — the envelope
+        identity fields plus a ``payload`` sub-dict carrying ``event_type``
+        and the reconcile subject fields — so the audit detectors read one
+        shape across retained and pruned history. A single multi-path
+        ``json_extract`` per row parses the JSON once inside SQLite; the
+        complete envelope (which may carry megabytes of inline content
+        ciphertext) is never materialized in Python. Absent or null fields
+        are omitted, exactly as :func:`_retention_summary` omits them.
+        """
+        paths = [f"$.{key}" for key in _AUDIT_ENVELOPE_KEYS] + [
+            f"$.payload.{key}" for key in _AUDIT_PAYLOAD_KEYS
+        ]
+        inst = installation_id or self.installation_id
+        cur = self._conn.execute(
+            "SELECT json_extract(envelope_json, "
+            + ", ".join("?" for _ in paths)
+            + ") FROM events WHERE installation_id=? ORDER BY producer_sequence",
+            (*paths, inst),
+        )
+        split = len(_AUDIT_ENVELOPE_KEYS)
+        for (packed,) in cur:
+            values = json.loads(packed)
+            summary: dict[str, Any] = {
+                key: value
+                for key, value in zip(_AUDIT_ENVELOPE_KEYS, values[:split])
+                if value is not None
+            }
+            summary["payload"] = {
+                key: value
+                for key, value in zip(_AUDIT_PAYLOAD_KEYS, values[split:])
+                if value is not None
+            }
+            yield summary
 
     def iter_events(
         self,
