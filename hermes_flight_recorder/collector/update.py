@@ -8,7 +8,6 @@ regenerates the Hermes hook, stamps the installed build, and verifies it.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sqlite3
@@ -32,19 +31,16 @@ PENDING_UPDATE_FILENAME = "pending-update.json"
 INSTALLED_VERSION_FILENAME = "installed-version.json"
 LAST_UPDATE_FILENAME = "last-update.json"
 BACKUP_DIRNAME = "update-backups"
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
-    data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    atomic_file.atomic_write(path, data, mode=0o600)
+    atomic_file.write_json_object(path, value, sort_keys=True)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise UpdateError(f"cannot read update state at {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise UpdateError(f"invalid update state at {path}")
-    return value
+    return atomic_file.read_json_object(
+        path, error=UpdateError, description="update state"
+    )
 
 
 def _refuse_if_serving(fr_home: Path) -> RuntimeLock:

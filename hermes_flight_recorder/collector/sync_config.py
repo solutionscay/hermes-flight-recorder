@@ -18,7 +18,6 @@ The config file is ``sync-config.json`` and is written with mode ``0600``.
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,15 +71,9 @@ def config_path(flight_recorder_home: str | os.PathLike[str] | None = None) -> P
 
 
 def _read_file(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, OSError) as exc:
-        raise SyncConfigError(f"cannot read sync config at {path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise SyncConfigError(f"sync config at {path} is not a JSON object")
-    return data
+    return atomic_file.read_json_object(
+        path, error=SyncConfigError, description="sync config", missing_ok=True
+    )
 
 
 def _normalize_ingest_url(value: Any) -> Any:
@@ -146,11 +139,9 @@ def save(
         "cf_access_client_id": config.cf_access_client_id,
         "cf_access_client_secret": config.cf_access_client_secret,
     }
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    try:
-        return atomic_file.atomic_write(path, text.encode("utf-8"), mode=0o600)
-    except OSError as exc:
-        raise SyncConfigError(f"cannot write sync config at {path}: {exc}") from exc
+    return atomic_file.write_json_object(
+        path, payload, error=SyncConfigError, description="sync config"
+    )
 
 
 def configure(
