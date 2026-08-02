@@ -32,21 +32,9 @@ from typing import TYPE_CHECKING, Any
 # a crash-loop, a hung pass).
 CAPTURE_HEARTBEAT_KEY = "capture:last_success_at"
 
-def _capture_since(outbox: Any) -> float | None:
-    """The capture horizon epoch, or None when backfill is enabled (default).
-
-    Returns the ``installed_at`` marker only when backfill is explicitly off, so
-    collectors emit nothing that occurred before the recorder was installed.
-    """
-    from ._common import CAPTURE_BACKFILL_META_KEY, INSTALLED_AT_META_KEY
-
-    if outbox.get_meta(CAPTURE_BACKFILL_META_KEY) != "false":
-        return None
-    raw = outbox.get_meta(INSTALLED_AT_META_KEY)
-    try:
-        return float(raw) if raw is not None else None
-    except (TypeError, ValueError):
-        return None
+# The ``install --no-backfill`` capture horizon is not threaded through the
+# polls: it is enforced once, in the append path (``_common.append_and_count``
+# reading ``Outbox.capture_horizon``), so an adapter cannot forget it.
 
 # A durable-store poll may hit a transient fault that is not a missing file: the
 # Hermes DB is momentarily locked (``sqlite3.OperationalError`` while Hermes
@@ -95,7 +83,6 @@ def run_pass(
     from .hook import drain as drain_hook_spool
     from .recorder_config import CaptureConfig, source_enabled
 
-    since = _capture_since(outbox)
     capture = capture_config or CaptureConfig()
     # Resolve the terminal home-mode policy once per pass; every durable-store
     # poll stamps it, and re-reading config.yaml per source (or per matched log
@@ -152,7 +139,6 @@ def run_pass(
                     hermes_home,
                     capture_config=capture,
                     knowledge_config=knowledge_config,
-                    since=since,
                     home_mode=home_mode,
                 ),
                 [],
@@ -163,7 +149,7 @@ def run_pass(
             "cron",
             "cron",
             lambda: (
-                cron_db.poll(outbox, hermes_home, since=since, home_mode=home_mode),
+                cron_db.poll(outbox, hermes_home, home_mode=home_mode),
                 [],
             ),
             _DURABLE_STORE_ERRORS,
@@ -172,7 +158,7 @@ def run_pass(
             "kanban",
             "kanban",
             lambda: (
-                kanban_db.poll(outbox, hermes_home, since=since, home_mode=home_mode),
+                kanban_db.poll(outbox, hermes_home, home_mode=home_mode),
                 [],
             ),
             _DURABLE_STORE_ERRORS,
@@ -181,9 +167,7 @@ def run_pass(
             "gateway_log",
             "gateway log",
             lambda: (
-                gateway_log.poll(
-                    outbox, hermes_home, since=since, home_mode=home_mode
-                ),
+                gateway_log.poll(outbox, hermes_home, home_mode=home_mode),
                 [],
             ),
             _DURABLE_STORE_ERRORS,

@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
-    occurred_before,
     sqlite_select_list,
     sqlite_table_exists,
     append_and_count,
@@ -49,27 +48,26 @@ def poll(
     outbox: Any,
     hermes_home: str | Path | None = None,
     *,
-    since: float | None = None,
     home_mode: str | None = None,
 ) -> dict[str, int]:
     """One read-only poll pass over the cron store. Returns per-type counts.
 
-    ``since`` is the capture horizon (``install --no-backfill``); executions
-    claimed before it are skipped so history is not backfilled. ``home_mode``
-    is the terminal home-mode policy resolved by the caller (``run_pass``
-    resolves it once per capture pass, issue #164); when None, a standalone
-    call resolves it itself.
+    The ``install --no-backfill`` capture horizon is enforced in the append
+    path (``append_and_count``), not here. ``home_mode`` is the terminal
+    home-mode policy resolved by the caller (``run_pass`` resolves it once per
+    capture pass, issue #164); when None, a standalone call resolves it
+    itself.
     """
     home = resolve_hermes_home(hermes_home)
     if home_mode is None:
         home_mode = read_home_mode(hermes_home)
     counts: dict[str, int] = defaultdict(int)
-    _poll_executions(outbox, home, counts, home_mode, since)
+    _poll_executions(outbox, home, counts, home_mode)
     _poll_heartbeat(outbox, home, counts, home_mode)
     return dict(counts)
 
 
-def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
+def _poll_executions(outbox, home: Path, counts, home_mode) -> None:
     db_path = executions_db_path(home)
     if not db_path.exists():
         return
@@ -101,14 +99,12 @@ def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
     # together and a re-poll re-reads exactly the same range (issue #160).
     with outbox.batch():
         for r in rows:
-            _emit_execution(outbox, r, counts, home_mode, since)
+            _emit_execution(outbox, r, counts, home_mode)
         watermark.advance(high_water)
 
 
-def _emit_execution(outbox, r, counts, home_mode, since=None) -> None:
+def _emit_execution(outbox, r, counts, home_mode) -> None:
     """Append the claimed (and, when present, finished) events for one row."""
-    if occurred_before(since, r["claimed_at"]):
-        return  # claimed before the capture horizon (no backfill)
     exid, job = r["id"], r["job_id"]
     claimed = to_epoch(r["claimed_at"]) or 0.0
     rt = runtime_stamp("cron", home_mode=home_mode)

@@ -42,16 +42,17 @@ def poll(
     outbox: Any,
     hermes_home: str | Path | None = None,
     *,
-    since: float | None = None,
     home_mode: str | None = None,
 ) -> dict[str, int]:
     """Capture newly appended terminal provider failures from ``agent.log``.
 
-    ``since`` is the capture horizon (``install --no-backfill``); failures logged
-    before it are skipped so history is not backfilled. ``home_mode`` is the
-    terminal home-mode policy resolved by the caller (``run_pass`` resolves it
-    once per capture pass, issue #164); when None, a standalone call resolves
-    it itself — in either case exactly once, never per matched log line.
+    The ``install --no-backfill`` capture horizon is enforced in the append
+    path (``append_and_count``), not here; the byte cursor advances over a
+    dropped line exactly as it advanced over a skipped one. ``home_mode`` is
+    the terminal home-mode policy resolved by the caller (``run_pass``
+    resolves it once per capture pass, issue #164); when None, a standalone
+    call resolves it itself — in either case exactly once, never per matched
+    log line.
     """
     home = resolve_hermes_home(hermes_home)
     path = home / "logs" / "agent.log"
@@ -78,7 +79,6 @@ def poll(
                 line.decode("utf-8", errors="replace").rstrip("\r\n"),
                 counts,
                 home_mode,
-                since,
             )
 
     if offset != cursor:
@@ -103,7 +103,7 @@ def _read_cursor(outbox: Any, path: Path) -> int:
 
 
 def _capture_line(
-    outbox: Any, line: str, counts: dict[str, int], home_mode: str, since: float | None = None
+    outbox: Any, line: str, counts: dict[str, int], home_mode: str
 ) -> None:
     match = _FAILURE.match(line)
     if match is None:
@@ -112,8 +112,6 @@ def _capture_line(
     summary = fields["summary"]
     http_status = _status(summary)
     occurred_at = _to_epoch(fields["timestamp"])
-    if since is not None and occurred_at < since:
-        return  # logged before the capture horizon (no backfill)
     payload: dict[str, Any] = {
         "provider": fields["provider"],
         "model": fields["model"],

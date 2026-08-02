@@ -39,7 +39,6 @@ from ._common import (
     root_session,
     runtime_stamp,
     safe_json_dict,
-    occurred_before,
     sqlite_table_columns,
     state_db_path,
 )
@@ -87,15 +86,14 @@ def poll(
     *,
     capture_config: CaptureConfig | None = None,
     knowledge_config: Any = None,
-    since: float | None = None,
     home_mode: str | None = None,
 ) -> dict[str, int]:
     """One read-only poll pass over ``state.db``. Returns per-type counts.
 
-    ``since`` is the capture horizon: when set (``install --no-backfill``), rows
-    whose activity predates it are skipped, so history is not backfilled. The
-    session parent/profile maps are still built from every row so post-horizon
-    activity in an older session keeps its attribution.
+    The ``install --no-backfill`` capture horizon is enforced in the append
+    path (``append_and_count``), not here. The session parent/profile maps
+    are built from every row, so post-horizon activity in an older session
+    keeps its attribution.
 
     ``home_mode`` is the terminal home-mode policy resolved by the caller
     (``run_pass`` resolves it once per capture pass, issue #164); when None,
@@ -157,9 +155,7 @@ def poll(
         # lock across a read of a Hermes store.
         counts: dict[str, int] = defaultdict(int)
         with outbox.batch():
-            _poll_sessions(
-                outbox, sessions.emit_rows, parent_map, counts, home_mode, since
-            )
+            _poll_sessions(outbox, sessions.emit_rows, parent_map, counts, home_mode)
             sessions.advance()
         knowledge_rows: list[tuple[Any, str, str | None, str]] = []
         for start in range(0, len(messages.rows), _MESSAGE_BATCH_ROWS):
@@ -174,7 +170,6 @@ def poll(
                     home_mode,
                     capture,
                     knowledge_rows,
-                    since,
                 )
         # Knowledge mutation capture reads and hashes artifact files, so it
         # runs after the message batch commits instead of holding the write
@@ -208,7 +203,6 @@ def poll(
                 invocation_windows,
                 counts,
                 home_mode,
-                since,
             )
             usage.advance()
         with outbox.batch():
@@ -220,7 +214,6 @@ def poll(
                 invocation_windows,
                 counts,
                 home_mode,
-                since,
             )
             delegations.advance()
         return dict(counts)
@@ -228,10 +221,8 @@ def poll(
         conn.close()
 
 
-def _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since=None) -> None:
+def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
     for r in sessions:
-        if occurred_before(since, r["started_at"]):
-            continue  # started before the capture horizon (no backfill)
         sid = r["id"]
         is_sub = r["source"] == "subagent"
         kind = r["source"] or "unknown"
@@ -319,11 +310,8 @@ def _poll_messages(
     home_mode,
     capture_config,
     knowledge_rows,
-    since=None,
 ) -> None:
     for r in rows:
-        if occurred_before(since, r["timestamp"]):
-            continue  # predates the capture horizon; cursor still advances
         sid = r["session_id"]
         corr = root_session(sid, parent_map) or sid
         role = r["role"]
@@ -409,7 +397,7 @@ def _poll_messages(
             partial=content_metadata["content_truncated"],
             payload=payload,
         )
-        append_and_count(
+        captured = append_and_count(
             outbox,
             counts,
             record,
@@ -417,14 +405,16 @@ def _poll_messages(
             dedup_key=f"state.db:tool:{r['id']}",
         )
         # Defer knowledge candidates: their capture reads and hashes artifact
-        # files, which must not run while the batch holds the write lock.
-        if r["tool_name"] in ("skill_manage", "memory"):
+        # files, which must not run while the batch holds the write lock. A
+        # row the capture horizon dropped was never captured, so it yields no
+        # knowledge candidate either (pre-horizon mutations never did).
+        if captured and r["tool_name"] in ("skill_manage", "memory"):
             knowledge_rows.append(
                 (r, corr, invocation_id, profile_of.get(sid, "default"))
             )
 
 def _poll_model_usage(
-    outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode, since=None
+    outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode
 ) -> None:
     identities = [
         (str(row["session_id"]), str(row["model"] or ""), str(row["task"] or ""))
@@ -432,8 +422,6 @@ def _poll_model_usage(
     ]
     previous_states = _usage_states(outbox, identities)
     for r in rows:
-        if occurred_before(since, r["last_seen"]):
-            continue  # last touched before the capture horizon (no backfill)
         sid = str(r["session_id"])
         corr = root_session(sid, parent_map) or sid
         identity = (sid, str(r["model"] or ""), str(r["task"] or ""))
@@ -497,11 +485,9 @@ def _poll_model_usage(
 
 
 def _poll_delegations(
-    outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode, since=None
+    outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode
 ) -> None:
     for r in rows:
-        if occurred_before(since, r["dispatched_at"]):
-            continue  # dispatched before the capture horizon (no backfill)
         parent = r["parent_session_id"] or r["origin_session"]
         corr = root_session(parent, parent_map) or parent
         event = safe_json_dict(r["event_json"])  # is_batch lives here, not as a column

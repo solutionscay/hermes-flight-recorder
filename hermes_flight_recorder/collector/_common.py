@@ -31,8 +31,9 @@ LEGACY_FLIGHT_RECORDER_HOME = ".hermes-flight-recorder"
 INSTALLED_AT_META_KEY = "installed_at"
 
 # The outbox meta key set to ``"false"`` by ``install --no-backfill``. When off,
-# capture skips durable rows that occurred before ``installed_at``, so a fresh
-# install records from now instead of ingesting the whole Hermes history.
+# the append path (see ``append_and_count``) drops poll-captured records that
+# occurred before ``installed_at``, so a fresh install records from now instead
+# of ingesting the whole Hermes history.
 CAPTURE_BACKFILL_META_KEY = "capture:backfill"
 
 
@@ -291,12 +292,16 @@ def hermes_created_skills(home: Path) -> list[tuple[str, str | None, Path]]:
 
 
 def occurred_before(since: float | None, value: Any) -> bool:
-    """True when a Hermes timestamp precedes the capture horizon ``since``.
+    """True when a Hermes timestamp strictly precedes the horizon ``since``.
 
-    ``since`` None (backfill enabled — the default) is never "before", so this
-    is a no-op unless ``install --no-backfill`` set a horizon. A missing or
-    unparseable timestamp is treated as not-before and kept, so a schema without
-    the time column degrades to backfilling rather than silently dropping rows.
+    Used by the reconciler's install horizon (``installed_at``), so a detector
+    never judges durable history that predates the recorder. The capture-side
+    ``--no-backfill`` horizon is enforced once in :func:`append_and_count`
+    with the same boundary semantics (strict "before"; a missing timestamp is
+    kept). A ``since`` of None is never "before"; a missing timestamp is
+    treated as not-before and kept, so a schema without the time column
+    degrades to judging (or capturing) the row rather than silently
+    dropping it.
     """
     if since is None:
         return False
@@ -368,6 +373,41 @@ def load_json_dict(path: Path) -> dict[str, Any]:
     return safe_json_dict(text)
 
 
+# Poll capture methods exempt from the --no-backfill horizon. These snapshot
+# *standing* state whose ``occurred_at`` is the state's own age, not replayed
+# history: a ticker heartbeat that was already stale at install time carries a
+# pre-install epoch, yet it describes the scheduler's current liveness and has
+# always been captured under ``--no-backfill``.
+_HORIZON_EXEMPT_CAPTURE_METHODS = frozenset({"poll:cron:heartbeat"})
+
+
+def _horizon_drops(outbox: Any, record: dict[str, Any]) -> bool:
+    """True when the ``--no-backfill`` horizon says to drop this record.
+
+    Enforced by ``capture_method``, a property of the record itself, so every
+    durable-store adapter — including one written tomorrow — is covered
+    without a per-row check. Only ``poll:*`` records are eligible: a poll
+    replays durable Hermes history, which is exactly what ``--no-backfill``
+    excludes. Live hook records (``hook:*``), reconciler findings
+    (``derive:*``), and knowledge snapshots (``scan:*``) describe
+    the present even when their ``occurred_at`` is old, and are never dropped.
+
+    Boundary semantics match the per-row ``occurred_before`` checks this
+    replaced: strictly before the horizon drops; equal-or-after keeps. An
+    ``occurred_at`` of ``0.0`` is the adapters' missing-timestamp sentinel
+    (the source column was NULL, which ``occurred_before`` always kept), so
+    it is kept here too rather than silently dropped.
+    """
+    method = record.get("capture_method", "")
+    if not method.startswith("poll:") or method in _HORIZON_EXEMPT_CAPTURE_METHODS:
+        return False
+    horizon = getattr(outbox, "capture_horizon", None)
+    if horizon is None:
+        return False
+    occurred_at = float(record["occurred_at"])
+    return 0.0 < occurred_at < horizon
+
+
 def append_and_count(
     outbox: Any,
     counts: dict[str, int],
@@ -375,14 +415,24 @@ def append_and_count(
     *,
     content: str | bytes | None = None,
     dedup_key: str,
-) -> None:
+) -> bool:
     """Append via dedup and count the event type only when a new row landed.
 
-    ``counts`` must tolerate ``+= 1`` on a missing key (a ``defaultdict`` or
-    ``Counter``).
+    The single enforcement point for the ``install --no-backfill`` capture
+    horizon (see :func:`_horizon_drops`): a poll-captured record that occurred
+    before the horizon is dropped — not appended and not counted, exactly as
+    the deleted per-row checks skipped it before building the record.
+
+    Returns False only for a horizon drop; True when the record exists in the
+    outbox afterwards (newly appended, or already present via dedup), so a
+    caller can chain work that requires the captured record. ``counts`` must
+    tolerate ``+= 1`` on a missing key (a ``defaultdict`` or ``Counter``).
     """
+    if _horizon_drops(outbox, record):
+        return False
     if outbox.append_if_new(record, content=content, dedup_key=dedup_key):
         counts[record["payload"]["event_type"]] += 1
+    return True
 
 
 def open_sqlite_read_only(path: Path) -> sqlite3.Connection:
