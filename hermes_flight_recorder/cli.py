@@ -359,6 +359,31 @@ def _cmd_status(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_security(args: argparse.Namespace) -> int:
+    from .collector import recorder_config, security_scan
+
+    fr_home = _flight_recorder_home(args)
+    try:
+        config = recorder_config.load(fr_home).security
+        changed = security_scan.update_suppression(
+            fr_home,
+            config,
+            args.detector_type,
+            args.fingerprint,
+            add=args.security_action == "suppress",
+        )
+    except (
+        recorder_config.RecorderConfigError,
+        security_scan.SecurityScanError,
+    ) as exc:
+        print(f"security baseline failed: {exc}", file=sys.stderr)
+        return 2
+    action = "added" if args.security_action == "suppress" else "removed"
+    state = action if changed else "unchanged"
+    print(f"security suppression {state}: {args.detector_type} {args.fingerprint}")
+    return 0
+
+
 def _sync_once(
     outbox,
     transport,
@@ -757,6 +782,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Knowledge store: per-artifact latest manifest, version history, and diff.",
     )
+    p_obs.add_argument(
+        "--security",
+        action="store_true",
+        help="Secret findings grouped by local fingerprint; decrypts finding details.",
+    )
     p_obs.add_argument("--session", default=None, help="Filter to one session/operation id.")
     p_obs.add_argument("--since", default=None, help="Keep events at/after an epoch or ISO timestamp.")
     p_obs.set_defaults(func=_cmd_observe)
@@ -774,6 +804,18 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[_home_options()],
     )
     p_status.set_defaults(func=_cmd_status)
+
+    p_security = sub.add_parser(
+        "security",
+        help="Add or remove a local secret-scan suppression.",
+        parents=[_home_options()],
+    )
+    security_sub = p_security.add_subparsers(dest="security_action", required=True)
+    for action in ("suppress", "unsuppress"):
+        command = security_sub.add_parser(action)
+        command.add_argument("detector_type", help="Stable detector type from a finding.")
+        command.add_argument("fingerprint", help="The 22-character local fingerprint.")
+        command.set_defaults(func=_cmd_security)
 
     p_sync = sub.add_parser(
         "sync",

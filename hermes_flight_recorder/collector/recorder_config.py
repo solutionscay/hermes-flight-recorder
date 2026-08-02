@@ -29,6 +29,9 @@ DEFAULT_MESSAGE_ROLES = ("user", "assistant", "tool")
 DEFAULT_KNOWLEDGE_MAX_FILE_BYTES = 4 * 1024 * 1024
 DEFAULT_KNOWLEDGE_MAX_FILE_COUNT = 256
 DEFAULT_KNOWLEDGE_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+DEFAULT_SECRET_SCAN_MAX_BYTES = 8 * 1024 * 1024
+DEFAULT_SECRET_SCAN_DEADLINE_MS = 250
+DEFAULT_SECRET_SCAN_BASELINE = "secret-scan-baseline.json"
 # Foreground `serve` cadences. Capture polls the fast path often; reconcile
 # diffs the durable stores less often. These match the retired systemd timers.
 DEFAULT_CAPTURE_INTERVAL_SECONDS = 15.0
@@ -98,6 +101,14 @@ class KnowledgeConfig:
 
 
 @dataclass(frozen=True)
+class SecurityConfig:
+    secret_scan_enabled: bool = True
+    secret_scan_max_bytes: int = DEFAULT_SECRET_SCAN_MAX_BYTES
+    secret_scan_deadline_ms: int = DEFAULT_SECRET_SCAN_DEADLINE_MS
+    secret_scan_baseline: str = DEFAULT_SECRET_SCAN_BASELINE
+
+
+@dataclass(frozen=True)
 class SyncRuntimeConfig:
     # None preserves the existing CLI's one-pass default.  An explicit value
     # enables the same continuous mode as ``sync --interval``.
@@ -114,6 +125,7 @@ class RecorderConfig:
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     sync: SyncRuntimeConfig = field(default_factory=SyncRuntimeConfig)
     reconcile: ReconcileRuntimeConfig = field(default_factory=ReconcileRuntimeConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
 
 
 def config_path(flight_recorder_home: str | os.PathLike[str] | None = None) -> Path:
@@ -195,6 +207,17 @@ def _choice(value: Any, name: str, *, choices: set[str]) -> str:
     if not isinstance(value, str) or value not in choices:
         expected = ", ".join(sorted(repr(choice) for choice in choices))
         raise RecorderConfigError(f"{name} must be one of: {expected}")
+    return value
+
+
+def _local_filename(value: Any, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or Path(value).name != value
+        or value in {".", ".."}
+    ):
+        raise RecorderConfigError(f"{name} must be a local file name")
     return value
 
 
@@ -297,6 +320,10 @@ _FIELDS: tuple[tuple[str, str, str, Any, _Validator], ...] = (
     ("sync", "max_batches_per_tick", "HFR_SYNC_MAX_BATCHES_PER_TICK", DEFAULT_SYNC_MAX_BATCHES_PER_TICK, _positive_int),
     ("reconcile", "interval_seconds", "HFR_RECONCILE_INTERVAL_SECONDS", DEFAULT_RECONCILE_INTERVAL_SECONDS, _positive_float),
     ("reconcile", "audit_interval_seconds", "HFR_RECONCILE_AUDIT_INTERVAL_SECONDS", DEFAULT_RECONCILE_AUDIT_INTERVAL_SECONDS, _positive_float),
+    ("security", "secret_scan_enabled", "HFR_SECRET_SCAN_ENABLED", True, _boolean),
+    ("security", "secret_scan_max_bytes", "HFR_SECRET_SCAN_MAX_BYTES", DEFAULT_SECRET_SCAN_MAX_BYTES, _positive_int),
+    ("security", "secret_scan_deadline_ms", "HFR_SECRET_SCAN_DEADLINE_MS", DEFAULT_SECRET_SCAN_DEADLINE_MS, _positive_int),
+    ("security", "secret_scan_baseline", "HFR_SECRET_SCAN_BASELINE", DEFAULT_SECRET_SCAN_BASELINE, _local_filename),
 )
 
 # Section name -> section dataclass, straight from the RecorderConfig fields.
@@ -363,6 +390,7 @@ __all__ = [
     "RecorderConfig",
     "RecorderConfigError",
     "RetentionConfig",
+    "SecurityConfig",
     "SyncRuntimeConfig",
     "source_enabled",
     "source_required",

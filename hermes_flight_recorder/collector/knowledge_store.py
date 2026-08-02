@@ -606,7 +606,7 @@ def _capture(
         provenance="agent",
         first_seen=occurred_at,
     )
-    seq, created = outbox.append_knowledge_version(
+    _seq, created = outbox.append_knowledge_version(
         artifact_id,
         manifest=manifest,
         occurred_at=occurred_at,
@@ -645,7 +645,6 @@ def _capture(
                 plaintext_files=plaintext_files,
                 config=config,
             )
-            outbox.set_meta(f"knowledge:emitted:{artifact_id}", str(seq))
     return created
 
 
@@ -740,7 +739,6 @@ def _emit_artifact_events(
             continue
         if _emit_version_event(outbox, runtime, artifact, version, config=config):
             emitted += 1
-        outbox.set_meta(cursor_key, str(version["seq"]))
     return emitted
 
 
@@ -761,10 +759,12 @@ def _emit_version_event(
 
     if is_tombstone:
         content: str | None = None
+        scan_files: dict[str, bytes] = {}
         file_count = 0
         byte_count = 0
     else:
         files = []
+        scan_files = {}
         byte_count = 0
         skipped_files = list(version.get("skipped_files", []))
         for entry in version["manifest"]:
@@ -814,6 +814,7 @@ def _emit_version_event(
             else:
                 raw = plaintext_files[entry["path"]]
             byte_count += len(raw)
+            scan_files[entry["path"]] = raw
             files.append(
                 {
                     "path": entry["path"],
@@ -868,8 +869,14 @@ def _emit_version_event(
         payload=payload,
         partial=bool(not is_tombstone and skipped_files),
     )
-    return outbox.append_if_new(
-        record,
-        content=content,
-        dedup_key=f"knowledge:{artifact['artifact_id']}:v{seq}",
-    )
+    prepared_scan = outbox.prepare_secret_scan(scan_targets=scan_files)
+    with outbox.batch():
+        created = outbox.append_if_new(
+            record,
+            content=content,
+            dedup_key=f"knowledge:{artifact['artifact_id']}:v{seq}",
+            scan_targets=scan_files,
+            scan_result=prepared_scan,
+        )
+        outbox.set_meta(f"knowledge:emitted:{artifact['artifact_id']}", str(seq))
+    return created

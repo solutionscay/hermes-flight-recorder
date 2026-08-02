@@ -20,6 +20,8 @@ from typing import Any
 
 from ..version import VersionInfo, build_identity, current_version
 from . import atomic_file
+from . import recorder_config
+from . import security_scan
 from ._common import resolve_flight_recorder_home, resolve_hermes_home
 from .hook import HOOK_DIR_NAME, install_hook
 from .outbox import Outbox
@@ -90,13 +92,20 @@ def _backup_installation(fr_home: Path, hermes_home: Path) -> Path:
             f"Flight Recorder is not installed at {fr_home}; run `install` first"
         )
     _backup_sqlite(database, backup / "outbox.sqlite")
-    for name in (
+    names = [
         "operator.pub",
         "operator.secret",
+        "secret-scan.key",
         "recorder-config.json",
         "sync-config.json",
         INSTALLED_VERSION_FILENAME,
-    ):
+    ]
+    try:
+        baseline_name = recorder_config.load(fr_home).security.secret_scan_baseline
+    except recorder_config.RecorderConfigError:
+        baseline_name = recorder_config.DEFAULT_SECRET_SCAN_BASELINE
+    names.append(baseline_name)
+    for name in dict.fromkeys(names):
         source = fr_home / name
         if source.is_file():
             shutil.copy2(source, backup / name)
@@ -356,6 +365,7 @@ def complete_update(
         outbox = Outbox.open(fr_home, hermes_home=hermes)
         try:
             installation_id = outbox.initialize()
+            security_scan.ensure_fingerprint_key(fr_home)
             info = write_installed_version(
                 fr_home,
                 source=(

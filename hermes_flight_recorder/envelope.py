@@ -25,6 +25,7 @@ __all__ = [
     "TASK_EVENT_TYPES",
     "TASK_TERMINAL_TYPES",
     "RECONCILE_FINDING_TYPES",
+    "SECURITY_FINDING_TYPES",
     "EnvelopeValidationError",
     "validate",
     "serialize",
@@ -85,6 +86,7 @@ RESERVED_EVENT_TYPES = frozenset(
         "runtime.content_chunk_recorded",
         "knowledge.record_written",
         "knowledge.record_compacted",
+        "security.secret_detected",
     }
 )
 
@@ -127,6 +129,8 @@ RECONCILE_FINDING_TYPES = (
     "cron.run_missed",
     "runtime.gateway_start_failed",
 )
+
+SECURITY_FINDING_TYPES = ("security.secret_detected",)
 
 
 class EnvelopeValidationError(ValueError):

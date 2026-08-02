@@ -72,7 +72,8 @@ def test_dek_stays_in_memory_never_on_disk(tmp_path):
     # revival of the retired symmetric dev key.
     names = {p.name for p in tmp_path.iterdir()}
     assert "content-dev.key" not in names
-    assert not any(n.endswith(".key") for n in names)
+    assert {n for n in names if n.endswith(".key")} == {"secret-scan.key"}
+    assert len((tmp_path / "secret-scan.key").read_bytes()) == 32
     ob.close()
 
 

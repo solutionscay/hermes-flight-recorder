@@ -18,6 +18,10 @@ def clean_env(monkeypatch):
         "HFR_INGEST_URL",
         "HFR_CF_ACCESS_CLIENT_ID",
         "HFR_CF_ACCESS_CLIENT_SECRET",
+        "HFR_SECRET_SCAN_ENABLED",
+        "HFR_SECRET_SCAN_MAX_BYTES",
+        "HFR_SECRET_SCAN_DEADLINE_MS",
+        "HFR_SECRET_SCAN_BASELINE",
     ):
         monkeypatch.delenv(var, raising=False)
 

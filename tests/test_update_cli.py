@@ -409,6 +409,21 @@ def test_complete_update_preserves_state_and_refreshes_hook(tmp_path):
         reopened.close()
 
 
+def test_complete_update_adds_secret_scan_key_to_an_older_install(tmp_path):
+    hermes, fr_home = _hermes(tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (fr_home / "secret-scan.key").unlink()
+
+    prepare_update(fr_home, hermes, source=str(checkout), editable=True)
+    complete_update(fr_home, hermes, log=lambda _message: None)
+
+    key = fr_home / "secret-scan.key"
+    assert len(key.read_bytes()) == 32
+    if os.name == "posix":
+        assert key.stat().st_mode & 0o077 == 0
+
+
 def test_registered_migration_failure_rolls_back_schema_and_version(
     tmp_path, monkeypatch
 ):

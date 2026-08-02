@@ -357,6 +357,18 @@ and sets `skipped_file_count`. The parent also sets `partial=true`.
 The collector uses the reasons `max_file_bytes`, `max_file_count`, and
 `max_artifact_bytes`. A skipped file is not in `files` or the manifest.
 
+## Secret finding content
+
+`security.secret_detected` refers to one captured source event. Its
+`causation_id` and plaintext `artifact_ref` contain the source `event_id`.
+The plaintext payload also contains `detector`, `match_count`, and
+`scan_status`. It does not contain a secret type or location.
+
+The encrypted content contains a `matches` array. Each match contains `type`,
+`target`, `byte_start`, `byte_end`, and `fingerprint`. The byte range is
+zero-based and half-open. It refers to the exact plaintext bytes in `target`.
+The fingerprint is a local HMAC value. The content contains no secret preview.
+
 ## Event-type surface
 
 **P0-poc** — captured and observed in the Phase 0 POC:
@@ -377,7 +389,8 @@ The collector uses the reasons `max_file_bytes`, `max_file_count`, and
 `cron.definition_changed`, `command.invoked`, `handoff.state_changed`,
 `task.created`, `task.claimed`, `task.completed`, `task.blocked`,
 `task.failed_terminal`, `task.attempt_ended`, `runtime.content_chunk_recorded`,
-`knowledge.record_written`, `knowledge.record_compacted`.
+`knowledge.record_written`, `knowledge.record_compacted`,
+`security.secret_detected`.
 
 ## Ordering model
 
