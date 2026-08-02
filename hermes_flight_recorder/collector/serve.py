@@ -302,67 +302,49 @@ def _audit(outbox, hermes_home, config, log: logging.Logger) -> None:
 
 
 def _sync(outbox, transport, config, log: logging.Logger) -> None:
-    from .sync import delivery_cursor
-    from .transport import TerminalTransportError, push
+    """One sync pass, shared with the CLI in :mod:`.sync_pass`; log the result."""
+    from .sync_pass import run_sync_pass
 
-    before = delivery_cursor(outbox)
-    try:
-        outcome = push(
-            outbox,
-            transport,
-            max_records=config.sync.max_records,
-            max_bytes=config.sync.max_bytes,
-            max_batches=config.sync.max_batches_per_tick,
-        )
-    except TerminalTransportError as exc:
-        log.error("sync stopped: malformed batch (client defect): %s", exc)
-        return
-
-    after = delivery_cursor(outbox)
-    pending = outbox.high_water() - after
-    log.info("sync: acked %d, pending %d", after - before, pending)
-    if not outcome.ok:
-        if outcome.reason == "auth":
-            log.error("sync failed: the edge rejected the service token")
-        elif outcome.reason == "cancelled":
-            log.info("sync stopped for shutdown")
-        else:
-            log.warning("sync failed: the ingestion service is unreachable (buffered)")
-    if outcome.reason == "cancelled":
-        return
-    _sync_content_keys(
+    result = run_sync_pass(
         outbox,
         transport,
-        log,
+        max_records=config.sync.max_records,
+        max_bytes=config.sync.max_bytes,
         max_batches=config.sync.max_batches_per_tick,
+        retention_config=config.retention,
     )
-    _maybe_prune(outbox, config.retention, log)
-
-
-def _sync_content_keys(
-    outbox,
-    transport,
-    log: logging.Logger,
-    *,
-    max_batches: int | None = None,
-) -> None:
-    """Ship pending wrapped DEKs; best-effort and independent of event sync."""
-    from .transport import TerminalTransportError, push_content_keys
-
-    try:
-        outcome = push_content_keys(outbox, transport, max_batches=max_batches)
-    except TerminalTransportError as exc:
-        log.error("wrapped-key sync stopped: malformed batch (client defect): %s", exc)
+    if result.outcome == "terminal":
+        log.error("sync stopped: malformed batch (client defect): %s", result.detail)
         return
-    if outcome.ok:
-        if outcome.result is not None and outcome.result.keys_sent:
-            log.info("wrapped-key sync: shipped %d", outcome.result.keys_sent)
-    elif outcome.reason == "auth":
+
+    log.info("sync: acked %d, pending %d", result.acked, result.pending)
+    if result.outcome == "auth":
+        log.error("sync failed: the edge rejected the service token")
+    elif result.outcome == "cancelled":
+        log.info("sync stopped for shutdown")
+        return
+    elif result.outcome != "ok":
+        log.warning("sync failed: the ingestion service is unreachable (buffered)")
+
+    if result.key_outcome == "terminal":
+        log.error(
+            "wrapped-key sync stopped: malformed batch (client defect): %s",
+            result.key_detail,
+        )
+    elif result.key_outcome == "ok":
+        if result.keys_sent:
+            log.info("wrapped-key sync: shipped %d", result.keys_sent)
+    elif result.key_outcome == "auth":
         log.error("wrapped-key sync failed: the edge rejected the service token")
-    elif outcome.reason == "cancelled":
+    elif result.key_outcome == "cancelled":
         log.info("wrapped-key sync stopped for shutdown")
-    else:
+    elif result.key_outcome is not None:
         log.warning("wrapped-key sync failed: the service is unreachable (buffered)")
+
+    if result.prune_error is not None:
+        log.warning("automatic retention skipped: %s", result.prune_error)
+    elif result.pruned is not None and result.pruned.pruned_count:
+        log.info("retention: pruned %d delivered event(s)", result.pruned.pruned_count)
 
 
 def _maybe_prune(outbox, retention_config, log: logging.Logger) -> None:
