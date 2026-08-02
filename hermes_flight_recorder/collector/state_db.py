@@ -72,6 +72,12 @@ _USAGE_STATE_VERSION = state_watermarks.USAGE_STATE_VERSION
 # Hermes persists an incoming user message shortly before firing agent:start.
 # Keep the skew narrow so an old, unrelated row cannot attach to a later turn.
 _USER_START_SKEW_SECONDS = 30.0
+# Message rows appended per outbox transaction. Messages are the highest-volume
+# source and a first backfill scans the whole history, so commit in bounded
+# slices (matching the hook drain's chunk cadence) instead of building one
+# giant transaction. A crash between slices re-scans into dedup hits — the
+# same tolerance the per-row commits had.
+_MESSAGE_BATCH_ROWS = 500
 
 
 def poll(
@@ -137,48 +143,75 @@ def poll(
         }
         invocation_windows = read_invocation_windows(outbox, usage_ids)
 
+        # Each source's append loop plus its watermark advance runs in one
+        # outbox transaction (issue #160): a crash rolls back the rows and the
+        # cursor together, so a re-poll re-reads exactly the same range. The
+        # source rows were all gathered above, so no batch holds the write
+        # lock across a read of a Hermes store.
         counts: dict[str, int] = defaultdict(int)
-        _poll_sessions(
-            outbox, sessions.emit_rows, parent_map, counts, home_mode, since
-        )
-        sessions.advance()
-        _poll_messages(
-            outbox,
-            conn,
-            messages.rows,
-            parent_map,
-            profile_of,
-            invocation_windows,
-            counts,
-            home_mode,
-            capture,
-            knowledge_config,
-            home,
-            since,
-        )
+        with outbox.batch():
+            _poll_sessions(
+                outbox, sessions.emit_rows, parent_map, counts, home_mode, since
+            )
+            sessions.advance()
+        knowledge_rows: list[tuple[Any, str, str | None, str]] = []
+        for start in range(0, len(messages.rows), _MESSAGE_BATCH_ROWS):
+            with outbox.batch():
+                _poll_messages(
+                    outbox,
+                    messages.rows[start : start + _MESSAGE_BATCH_ROWS],
+                    parent_map,
+                    profile_of,
+                    invocation_windows,
+                    counts,
+                    home_mode,
+                    capture,
+                    knowledge_rows,
+                    since,
+                )
+        # Knowledge mutation capture reads and hashes artifact files, so it
+        # runs after the message batch commits instead of holding the write
+        # lock across that work. The messages watermark advances only after
+        # it finishes: a crash here re-scans the same rows next pass, the
+        # message appends dedup, and the knowledge capture retries.
+        for row, corr, invocation_id, profile in knowledge_rows:
+            _capture_knowledge_mutation(
+                outbox,
+                conn,
+                row,
+                corr,
+                invocation_id,
+                profile,
+                home_mode,
+                counts,
+                knowledge_config,
+                home,
+            )
         messages.advance()
-        _poll_model_usage(
-            outbox,
-            usage.rows,
-            parent_map,
-            profile_of,
-            invocation_windows,
-            counts,
-            home_mode,
-            since,
-        )
-        usage.advance()
-        _poll_delegations(
-            outbox,
-            delegations.rows,
-            parent_map,
-            profile_of,
-            invocation_windows,
-            counts,
-            home_mode,
-            since,
-        )
-        delegations.advance()
+        with outbox.batch():
+            _poll_model_usage(
+                outbox,
+                usage.rows,
+                parent_map,
+                profile_of,
+                invocation_windows,
+                counts,
+                home_mode,
+                since,
+            )
+            usage.advance()
+        with outbox.batch():
+            _poll_delegations(
+                outbox,
+                delegations.rows,
+                parent_map,
+                profile_of,
+                invocation_windows,
+                counts,
+                home_mode,
+                since,
+            )
+            delegations.advance()
         return dict(counts)
     finally:
         conn.close()
@@ -267,7 +300,6 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since=None) 
 
 def _poll_messages(
     outbox,
-    conn,
     rows,
     parent_map,
     profile_of,
@@ -275,8 +307,7 @@ def _poll_messages(
     counts,
     home_mode,
     capture_config,
-    knowledge_config,
-    hermes_home,
+    knowledge_rows,
     since=None,
 ) -> None:
     for r in rows:
@@ -374,18 +405,12 @@ def _poll_messages(
             content=limited_content,
             dedup_key=f"state.db:tool:{r['id']}",
         )
-        _capture_knowledge_mutation(
-            outbox,
-            conn,
-            r,
-            corr,
-            invocation_id,
-            profile_of.get(sid, "default"),
-            home_mode,
-            counts,
-            knowledge_config,
-            hermes_home,
-        )
+        # Defer knowledge candidates: their capture reads and hashes artifact
+        # files, which must not run while the batch holds the write lock.
+        if r["tool_name"] in ("skill_manage", "memory"):
+            knowledge_rows.append(
+                (r, corr, invocation_id, profile_of.get(sid, "default"))
+            )
 
 def _poll_model_usage(
     outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode, since=None

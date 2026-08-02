@@ -40,6 +40,11 @@ from . import CURSOR_NAME, MAX_SPOOL_BYTES, SPOOL_FILENAME
 _GENERATION_META = "hook-spool:generation"
 _IDENTITY_META = "hook-spool:identity"
 _SEGMENT_PREFIX = f"{SPOOL_FILENAME}.segment."
+# Spool lines per outbox transaction. One commit per chunk instead of one per
+# line, while a huge backlog never builds one giant transaction (or memory
+# buffer). A crash between chunk commits re-reads from the stored cursor and
+# the per-line dedup keys absorb the replay.
+_DRAIN_CHUNK_LINES = 500
 
 
 def drain(outbox: Any, flight_recorder_home: str | Path | None = None) -> dict[str, int]:
@@ -115,38 +120,63 @@ def _drain_path(
     """Drain complete lines from one stable spool generation."""
     consumed = 0
     complete = True
-    # Stream line by line, so a large backlog never sits in memory whole. A
-    # line without a trailing newline (only possible at EOF) is a partial
-    # write; leave it for the next drain.
+    # Read one bounded chunk of complete lines at a time and commit it as one
+    # outbox transaction, so a large backlog neither sits in memory whole nor
+    # pays one write transaction per line. The file read stays outside the
+    # transaction; only the append loop holds the write lock. A line without
+    # a trailing newline (only possible at EOF) is a partial write; leave it
+    # for the next drain.
     with open(path, "rb") as fh:
         fh.seek(cursor)
-        for raw in fh:
-            if not raw.endswith(b"\n"):
-                complete = False
+        while complete:
+            chunk: list[tuple[int, bytes]] = []
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    complete = False
+                    break
+                chunk.append((cursor + consumed, raw))
+                consumed += len(raw)
+                if len(chunk) >= _DRAIN_CHUNK_LINES:
+                    break
+            if not chunk:
                 break
-            line_offset = cursor + consumed
-            consumed += len(raw)
-            text = raw.decode("utf-8", "replace").strip()
-            if not text:
-                continue
-            try:
-                obj = json.loads(text)
-            except ValueError:
-                continue  # skip an undecodable line rather than fail the drain
-            mapped = _map_event(obj, line_offset, session_ids, outbox)
-            if mapped is None:
-                continue
-            record, content = mapped
-            dedup_key = (
-                f"hook-spool:{line_offset}"
-                if generation == "legacy"
-                else f"hook-spool:{generation}:{line_offset}"
-            )
-            append_and_count(
-                outbox, counts, record, content=content,
-                dedup_key=dedup_key,
-            )
+            with outbox.batch():
+                for line_offset, raw in chunk:
+                    _drain_line(
+                        outbox, raw, line_offset, generation, counts, session_ids
+                    )
     return consumed, complete
+
+
+def _drain_line(
+    outbox: Any,
+    raw: bytes,
+    line_offset: int,
+    generation: str,
+    counts: dict[str, int],
+    session_ids: dict[str, str],
+) -> None:
+    """Map one complete spool line and append it with its stable dedup key."""
+    text = raw.decode("utf-8", "replace").strip()
+    if not text:
+        return
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return  # skip an undecodable line rather than fail the drain
+    mapped = _map_event(obj, line_offset, session_ids, outbox)
+    if mapped is None:
+        return
+    record, content = mapped
+    dedup_key = (
+        f"hook-spool:{line_offset}"
+        if generation == "legacy"
+        else f"hook-spool:{generation}:{line_offset}"
+    )
+    append_and_count(
+        outbox, counts, record, content=content,
+        dedup_key=dedup_key,
+    )
 
 
 def _rotate_consumed_spool(

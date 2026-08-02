@@ -87,22 +87,24 @@ def _detect_coverage_gaps(
             conn.close()
 
     if source_enabled(capture_config, "cron"):
-        for r in exec_rows:
-            if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
-                continue
-            if r["id"] in captured["executions"]:
-                _clear_coverage_pending(outbox, "execution", r["id"])
-                continue
-            _emit_coverage(
-                outbox,
-                counts,
-                when,
-                subject_type="execution",
-                subject_id=r["id"],
-                source_table="cron:executions.db",
-                correlation_id=r["job_id"],
-                grace=config.coverage_grace,
-            )
+        # exec_rows was loaded once per reconcile pass; emit in one transaction.
+        with outbox.batch():
+            for r in exec_rows:
+                if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
+                    continue
+                if r["id"] in captured["executions"]:
+                    _clear_coverage_pending(outbox, "execution", r["id"])
+                    continue
+                _emit_coverage(
+                    outbox,
+                    counts,
+                    when,
+                    subject_type="execution",
+                    subject_id=r["id"],
+                    source_table="cron:executions.db",
+                    correlation_id=r["job_id"],
+                    grace=config.coverage_grace,
+                )
     if source_enabled(capture_config, "kanban"):
         _coverage_kanban(outbox, home, captured, counts, when, config, horizon)
 
@@ -110,26 +112,28 @@ def _detect_coverage_gaps(
 def _coverage_sessions(
     outbox, rows, parent_map, captured, counts, when, config, horizon
 ) -> None:
-    for r in rows:
-        if occurred_before(horizon, r["started_at"]):
-            continue
-        sid = r["id"]
-        if sid in captured["sessions"]:
-            _clear_coverage_pending(outbox, "session", sid)
-            continue
-        corr = root_session(sid, parent_map) or sid
-        _emit_coverage(
-            outbox,
-            counts,
-            when,
-            subject_type="session",
-            subject_id=sid,
-            source_table="state.db:sessions",
-            correlation_id=corr,
-            session_id=sid,
-            parent_session_id=r["parent_session_id"],
-            grace=config.coverage_grace,
-        )
+    # ``rows`` was fetched by the caller; emit findings in one transaction.
+    with outbox.batch():
+        for r in rows:
+            if occurred_before(horizon, r["started_at"]):
+                continue
+            sid = r["id"]
+            if sid in captured["sessions"]:
+                _clear_coverage_pending(outbox, "session", sid)
+                continue
+            corr = root_session(sid, parent_map) or sid
+            _emit_coverage(
+                outbox,
+                counts,
+                when,
+                subject_type="session",
+                subject_id=sid,
+                source_table="state.db:sessions",
+                correlation_id=corr,
+                session_id=sid,
+                parent_session_id=r["parent_session_id"],
+                grace=config.coverage_grace,
+            )
 
 
 def _coverage_messages(
@@ -173,29 +177,31 @@ def _coverage_messages(
         f"WHERE role IN ({placeholders}){content_predicate}",
         roles,
     ).fetchall()
-    for r in rows:
-        sid = r["session_id"]
-        if occurred_before(horizon, r["timestamp"]):
-            continue
-        if r["timestamp"] is None and occurred_before(
-            horizon, session_started.get(sid)
-        ):
-            continue
-        if r["id"] in captured["messages"]:
-            _clear_coverage_pending(outbox, "message", str(r["id"]))
-            continue
-        corr = root_session(sid, parent_map) or sid
-        _emit_coverage(
-            outbox,
-            counts,
-            when,
-            subject_type="message",
-            subject_id=str(r["id"]),
-            source_table="state.db:messages",
-            correlation_id=corr,
-            session_id=sid,
-            grace=config.coverage_grace,
-        )
+    # The durable rows are fetched above; emit findings in one transaction.
+    with outbox.batch():
+        for r in rows:
+            sid = r["session_id"]
+            if occurred_before(horizon, r["timestamp"]):
+                continue
+            if r["timestamp"] is None and occurred_before(
+                horizon, session_started.get(sid)
+            ):
+                continue
+            if r["id"] in captured["messages"]:
+                _clear_coverage_pending(outbox, "message", str(r["id"]))
+                continue
+            corr = root_session(sid, parent_map) or sid
+            _emit_coverage(
+                outbox,
+                counts,
+                when,
+                subject_type="message",
+                subject_id=str(r["id"]),
+                source_table="state.db:messages",
+                correlation_id=corr,
+                session_id=sid,
+                grace=config.coverage_grace,
+            )
 
 
 def _coverage_model_usage(
@@ -206,27 +212,29 @@ def _coverage_model_usage(
     rows = conn.execute(
         "SELECT session_id, model, task FROM session_model_usage"
     ).fetchall()
-    for r in rows:
-        if occurred_before(horizon, session_started.get(r["session_id"])):
-            continue
-        key = (r["session_id"], r["model"], r["task"])
-        subject_id = f"{r['session_id']}:{r['model']}:{r['task']}"
-        if key in captured["model_usage"]:
-            _clear_coverage_pending(outbox, "model_usage", subject_id)
-            continue
-        sid = r["session_id"]
-        corr = root_session(sid, parent_map) or sid
-        _emit_coverage(
-            outbox,
-            counts,
-            when,
-            subject_type="model_usage",
-            subject_id=subject_id,
-            source_table="state.db:session_model_usage",
-            correlation_id=corr,
-            session_id=sid,
-            grace=config.coverage_grace,
-        )
+    # The durable rows are fetched above; emit findings in one transaction.
+    with outbox.batch():
+        for r in rows:
+            if occurred_before(horizon, session_started.get(r["session_id"])):
+                continue
+            key = (r["session_id"], r["model"], r["task"])
+            subject_id = f"{r['session_id']}:{r['model']}:{r['task']}"
+            if key in captured["model_usage"]:
+                _clear_coverage_pending(outbox, "model_usage", subject_id)
+                continue
+            sid = r["session_id"]
+            corr = root_session(sid, parent_map) or sid
+            _emit_coverage(
+                outbox,
+                counts,
+                when,
+                subject_type="model_usage",
+                subject_id=subject_id,
+                source_table="state.db:session_model_usage",
+                correlation_id=corr,
+                session_id=sid,
+                grace=config.coverage_grace,
+            )
 
 
 def _coverage_kanban(outbox, home, captured, counts, when, config, horizon) -> None:
@@ -267,39 +275,44 @@ def _coverage_kanban(outbox, home, captured, counts, when, config, horizon) -> N
                 runs = []
         finally:
             conn.close()
-        for r in tasks:
-            if occurred_before(horizon, r["created_at"] or r["started_at"]):
-                continue
-            if (board, r["id"]) in captured["tasks"]:
-                _clear_coverage_pending(outbox, "task", f"{board}:{r['id']}")
-                continue
-            _emit_coverage(
-                outbox,
-                counts,
-                when,
-                subject_type="task",
-                subject_id=f"{board}:{r['id']}",
-                source_table=f"kanban:{board}:tasks",
-                correlation_id=r["id"],
-                session_id=r["session_id"],
-                grace=config.coverage_grace,
-            )
-        for r in runs:
-            if occurred_before(horizon, r["started_at"] or r["ended_at"]):
-                continue
-            if (board, r["id"]) in captured["task_runs"]:
-                _clear_coverage_pending(outbox, "task_run", f"{board}:{r['id']}")
-                continue
-            _emit_coverage(
-                outbox,
-                counts,
-                when,
-                subject_type="task_run",
-                subject_id=f"{board}:{r['id']}",
-                source_table=f"kanban:{board}:task_runs",
-                correlation_id=r["task_id"],
-                grace=config.coverage_grace,
-            )
+        # The board rows are fetched (and the board connection closed) above;
+        # emit this board's findings in one transaction.
+        with outbox.batch():
+            for r in tasks:
+                if occurred_before(horizon, r["created_at"] or r["started_at"]):
+                    continue
+                if (board, r["id"]) in captured["tasks"]:
+                    _clear_coverage_pending(outbox, "task", f"{board}:{r['id']}")
+                    continue
+                _emit_coverage(
+                    outbox,
+                    counts,
+                    when,
+                    subject_type="task",
+                    subject_id=f"{board}:{r['id']}",
+                    source_table=f"kanban:{board}:tasks",
+                    correlation_id=r["id"],
+                    session_id=r["session_id"],
+                    grace=config.coverage_grace,
+                )
+            for r in runs:
+                if occurred_before(horizon, r["started_at"] or r["ended_at"]):
+                    continue
+                if (board, r["id"]) in captured["task_runs"]:
+                    _clear_coverage_pending(
+                        outbox, "task_run", f"{board}:{r['id']}"
+                    )
+                    continue
+                _emit_coverage(
+                    outbox,
+                    counts,
+                    when,
+                    subject_type="task_run",
+                    subject_id=f"{board}:{r['id']}",
+                    source_table=f"kanban:{board}:task_runs",
+                    correlation_id=r["task_id"],
+                    grace=config.coverage_grace,
+                )
 
 
 def _captured_subjects(events) -> dict[str, set]:

@@ -65,10 +65,16 @@ def read_invocation_windows(
                 InvocationWindow(invocation_id, existing.started_at, occurred_at)
             )
 
-    for session_id, windows in changed.items():
-        ordered = sorted(windows, key=lambda window: window.started_at)
-        _save_session_windows(outbox, session_id, ordered[-_MAX_WINDOWS_PER_SESSION:])
-    watermark.advance(high_water)
+    # One transaction for the rewritten windows and the cursor (issue #160):
+    # a crash rolls them back together, and the overlap re-indexes the same
+    # events next pass. The indexing above was read-only.
+    with outbox.batch():
+        for session_id, windows in changed.items():
+            ordered = sorted(windows, key=lambda window: window.started_at)
+            _save_session_windows(
+                outbox, session_id, ordered[-_MAX_WINDOWS_PER_SESSION:]
+            )
+        watermark.advance(high_water)
 
     result = {}
     for session_id in session_ids:

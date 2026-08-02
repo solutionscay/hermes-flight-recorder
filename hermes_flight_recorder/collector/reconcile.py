@@ -167,20 +167,30 @@ def reconcile(
         exec_rows = (
             _load_execution_rows(home) if source_enabled(capture, "cron") else []
         )
-        _detect_sequence_gaps(
-            outbox,
-            events,
-            installation_id,
-            counts,
-            when,
-            sequence_high_water,
-            cfg.sequence_gap_limit,
-        )
+        # The sequence and terminal detectors judge only the in-memory event
+        # snapshot loaded above, so their finding emission batches into one
+        # outbox transaction each (issue #160). The coverage and knowledge
+        # detectors interleave durable-store reads (and, for knowledge, file
+        # hashing) with their emits, so they batch per pre-read row set (or
+        # not at all) inside their own modules.
+        with outbox.batch():
+            _detect_sequence_gaps(
+                outbox,
+                events,
+                installation_id,
+                counts,
+                when,
+                sequence_high_water,
+                cfg.sequence_gap_limit,
+            )
         _detect_coverage_gaps(
             outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
         )
         if source_enabled(capture, "hook"):
-            _detect_missing_terminals(outbox, events, counts, when, cfg, horizon)
+            with outbox.batch():
+                _detect_missing_terminals(
+                    outbox, events, counts, when, cfg, horizon
+                )
         if source_enabled(capture, "cron"):
             _detect_missed_cron(
                 outbox,
@@ -333,8 +343,13 @@ def _detect_missed_cron(
     for r in exec_rows:
         if r["claimed_epoch"] is not None:
             exec_by_job[r["job_id"]].append(r["claimed_epoch"])
-    for job in jobs:
-        _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon)
+    # jobs.json and the execution rows are already in memory; the per-job
+    # finding emission commits as one transaction (issue #160).
+    with outbox.batch():
+        for job in jobs:
+            _missed_for_job(
+                outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon
+            )
 
 
 def _missed_for_job(outbox, job, exec_by_job, counts, when, cfg, ticker_dead, horizon) -> None:

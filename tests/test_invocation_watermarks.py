@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from hermes_flight_recorder.collector.invocation_watermarks import (
     read_invocation_windows,
 )
@@ -35,6 +37,10 @@ class MemoryOutbox:
 
     def high_water(self):
         return 10000
+
+    @contextmanager
+    def batch(self):
+        yield self
 
     def iter_events(self, *, after_sequence=0):
         self.after_sequences.append(after_sequence)

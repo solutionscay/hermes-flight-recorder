@@ -97,53 +97,58 @@ def _poll_board(outbox, board: str, db_path: Path, counts, home_mode, since=None
         return
     events, runs, tasks = batch.events, batch.runs, batch.tasks
     rt = runtime_stamp("kanban", home_mode=home_mode)
-    for ev in events:
-        if occurred_before(since, ev["created_at"]):
-            continue  # created before the capture horizon (no backfill)
-        event_type = _KIND_EVENT.get(ev["kind"])
-        if event_type is None:
-            continue
-        task = tasks.get(ev["task_id"])
-        payload = _payload(board, ev, task, runs.get(ev["run_id"]))
-        record = build_record(
-            event_type=event_type,
-            occurred_at=float(ev["created_at"] or 0.0),
-            source="kanban:task_events",
-            capture_method="poll:kanban:task_events",
-            runtime=rt,
-            correlation_id=ev["task_id"],
-            session_id=task["session_id"] if task else None,
-            payload=payload,
-        )
-        append_and_count(
-            outbox, counts, record, dedup_key=f"kanban:{board}:event:{ev['id']}"
-        )
+    # The board was read by read_board above; append this board's events and
+    # advance its watermarks in one outbox transaction, so a crash rolls back
+    # rows and cursors together (issue #160).
+    with outbox.batch():
+        for ev in events:
+            if occurred_before(since, ev["created_at"]):
+                continue  # created before the capture horizon (no backfill)
+            event_type = _KIND_EVENT.get(ev["kind"])
+            if event_type is None:
+                continue
+            task = tasks.get(ev["task_id"])
+            payload = _payload(board, ev, task, runs.get(ev["run_id"]))
+            record = build_record(
+                event_type=event_type,
+                occurred_at=float(ev["created_at"] or 0.0),
+                source="kanban:task_events",
+                capture_method="poll:kanban:task_events",
+                runtime=rt,
+                correlation_id=ev["task_id"],
+                session_id=task["session_id"] if task else None,
+                payload=payload,
+            )
+            append_and_count(
+                outbox, counts, record, dedup_key=f"kanban:{board}:event:{ev['id']}"
+            )
 
-    # Attempt history: one task.attempt_ended per ended run (outcome set). A
-    # still-running run (outcome NULL) is skipped until a later poll sees it
-    # closed; a closed run's outcome is final, so dedup on run_id is idempotent.
-    for run_id in sorted(runs):
-        run = runs[run_id]
-        if run["outcome"] is None:
-            continue
-        if occurred_before(since, run["ended_at"] or run["started_at"]):
-            continue  # attempt ended before the capture horizon (no backfill)
-        task = tasks.get(run["task_id"])
-        record = build_record(
-            event_type="task.attempt_ended",
-            occurred_at=float(run["ended_at"] or run["started_at"] or 0.0),
-            source="kanban:task_runs",
-            capture_method="poll:kanban:task_runs",
-            runtime=rt,
-            correlation_id=run["task_id"],
-            session_id=task["session_id"] if task else None,
-            payload=_attempt_payload(board, run),
-        )
-        append_and_count(
-            outbox, counts, record, dedup_key=f"kanban:{board}:run:{run_id}"
-        )
+        # Attempt history: one task.attempt_ended per ended run (outcome set).
+        # A still-running run (outcome NULL) is skipped until a later poll sees
+        # it closed; a closed run's outcome is final, so dedup on run_id is
+        # idempotent.
+        for run_id in sorted(runs):
+            run = runs[run_id]
+            if run["outcome"] is None:
+                continue
+            if occurred_before(since, run["ended_at"] or run["started_at"]):
+                continue  # attempt ended before the capture horizon (no backfill)
+            task = tasks.get(run["task_id"])
+            record = build_record(
+                event_type="task.attempt_ended",
+                occurred_at=float(run["ended_at"] or run["started_at"] or 0.0),
+                source="kanban:task_runs",
+                capture_method="poll:kanban:task_runs",
+                runtime=rt,
+                correlation_id=run["task_id"],
+                session_id=task["session_id"] if task else None,
+                payload=_attempt_payload(board, run),
+            )
+            append_and_count(
+                outbox, counts, record, dedup_key=f"kanban:{board}:run:{run_id}"
+            )
 
-    batch.advance()
+        batch.advance()
 
 
 def _payload(board: str, ev, task, run) -> dict[str, Any]:

@@ -40,6 +40,7 @@ import os
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -211,6 +212,9 @@ class Outbox(KnowledgeOutboxMixin):
         # use it for consecutive mutations without a private decryption key.
         self._knowledge_plaintext: dict[str, dict[str, bytes]] = {}
         self._installation_id: str | None = None
+        # Depth of the open ``batch()`` context; 0 means every append runs in
+        # its own ``BEGIN IMMEDIATE`` transaction (the historical behavior).
+        self._batch_depth = 0
         self._apply_migrations()
 
     # --- construction ---------------------------------------------------
@@ -551,6 +555,54 @@ class Outbox(KnowledgeOutboxMixin):
         )
         return created
 
+    @contextmanager
+    def batch(self) -> Iterator["Outbox"]:
+        """Group appends and meta writes into one durable transaction.
+
+        Opens ``BEGIN IMMEDIATE`` once, so every ``append`` /
+        ``append_if_new``, cursor, and meta write inside the block joins a
+        single write transaction that commits on exit and rolls back as one on
+        an exception. A nested ``batch()`` joins the open transaction instead
+        of deadlocking on the shared connection; only the outermost block
+        commits or rolls back. Dedup re-checks inside a batch run within the
+        already-open transaction, so a dedup hit starts no extra transaction.
+
+        Never hold a batch open across slow non-database work (source file
+        reads, content hashing): gather the source rows first, then batch only
+        the append loop.
+        """
+        if self._batch_depth:
+            self._batch_depth += 1
+            try:
+                yield self
+            finally:
+                self._batch_depth -= 1
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        self._batch_depth = 1
+        try:
+            yield self
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            self._forget_process_dek()
+            raise
+        else:
+            self._conn.execute("COMMIT")
+        finally:
+            self._batch_depth = 0
+
+    def _forget_process_dek(self) -> None:
+        """Drop the cached data key after a rollback.
+
+        The rolled-back transaction may have minted this process's DEK, in
+        which case its wrapped form in ``content_keys`` rolled back with it.
+        Forgetting the cached plaintext makes the next content write mint (and
+        durably record) a fresh key instead of encrypting under a key version
+        that no longer exists.
+        """
+        self._dek = None
+        self._key_version = None
+
     def event_by_dedup_key(self, dedup_key: str) -> dict[str, Any] | None:
         """Return a retained event by its stable producer identity."""
         row = self._conn.execute(
@@ -592,7 +644,11 @@ class Outbox(KnowledgeOutboxMixin):
         inst = rec["installation_id"]
 
         conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
+        # Inside an open batch() the transaction already exists and commits
+        # (or rolls back) with the batch; run every statement within it.
+        in_batch = self._batch_depth > 0
+        if not in_batch:
+            conn.execute("BEGIN IMMEDIATE")
         try:
             if dedup_key is not None:
                 # append() promises the stored record on a dedup hit;
@@ -603,7 +659,8 @@ class Outbox(KnowledgeOutboxMixin):
                     f"SELECT {column} FROM events WHERE dedup_key=?", (dedup_key,)
                 ).fetchone()
                 if existing is not None:
-                    conn.execute("COMMIT")
+                    if not in_batch:
+                        conn.execute("COMMIT")
                     return (parse(existing[0]) if return_stored else rec), False
 
                 pruned = conn.execute(
@@ -612,7 +669,8 @@ class Outbox(KnowledgeOutboxMixin):
                     (dedup_key,),
                 ).fetchone()
                 if pruned is not None:
-                    conn.execute("COMMIT")
+                    if not in_batch:
+                        conn.execute("COMMIT")
                     if return_stored:
                         # The full envelope was intentionally removed. Return
                         # the caller's logical record with the original stable
@@ -673,10 +731,16 @@ class Outbox(KnowledgeOutboxMixin):
                 "ON CONFLICT(installation_id) DO UPDATE SET high_water=excluded.high_water",
                 (inst, rec["producer_sequence"]),
             )
-            conn.execute("COMMIT")
+            if not in_batch:
+                conn.execute("COMMIT")
             return rec, True
         except Exception:
-            conn.execute("ROLLBACK")
+            # Inside a batch the open transaction stays usable: a failed
+            # statement is rolled back by SQLite itself, earlier appends in
+            # the batch survive, and the batch decides commit or rollback.
+            if not in_batch:
+                conn.execute("ROLLBACK")
+                self._forget_process_dek()
             raise
 
     def _inline_singleton_size(self, record: dict[str, Any], plaintext_bytes: int) -> int:
