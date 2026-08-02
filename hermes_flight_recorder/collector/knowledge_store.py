@@ -506,6 +506,58 @@ def _safe_bundle_path(path: str) -> bool:
     return all(part not in {"", ".", ".."} for part in path.split("/"))
 
 
+# A file whose mtime OR ctime falls within this many seconds of being
+# fingerprinted is treated as always-dirty (its stats are not cached).
+# Filesystem timestamps come from a coarse kernel clock, so a change landing
+# in the same clock tick as the state we hashed can leave
+# (mtime_ns, ctime_ns, size) identical while the content differs — the classic
+# racily-clean window (ctime matters too: a backdating writer restores mtime
+# but its utime lands on the same coarse clock). Refusing to cache fresh
+# timestamps costs one extra read on the tick after a change (~15 s later)
+# and closes the window.
+_RACY_WINDOW_SECONDS = 2.0
+
+
+def _stat_fingerprint(
+    files: list[tuple[str, Path]],
+) -> list[tuple[str, int, int, int]] | None:
+    """Per-file ``(rel_path, mtime_ns, ctime_ns, size)``, or None on any error.
+
+    ``ctime_ns`` guards the same-mtime same-size edge: restoring a file's
+    mtime after an edit (``utime``) still bumps ctime, which the writer cannot
+    set back on POSIX. A None result (a file vanished mid-scan) disables the
+    short-circuit so the full read path reports the error as before.
+    """
+    fingerprint: list[tuple[str, int, int, int]] = []
+    try:
+        for rel_path, path in files:
+            stat = path.stat()
+            fingerprint.append(
+                (rel_path, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+            )
+    except OSError:
+        return None
+    return fingerprint
+
+
+def _stat_cache(outbox: Any) -> dict[str, dict[str, Any]]:
+    """The per-process stat cache, scoped to this outbox instance.
+
+    Living on the outbox (not the module) means a fresh process or a second
+    store never inherits another store's idea of "unchanged" — a cold start
+    re-hashes once, which is fine.
+    """
+    cache = getattr(outbox, "_knowledge_stat_cache", None)
+    if cache is None:
+        cache = {}
+        outbox._knowledge_stat_cache = cache
+    return cache
+
+
+def _limits_key(config: Any) -> tuple[int, int, int]:
+    return (config.max_file_count, config.max_file_bytes, config.max_artifact_bytes)
+
+
 def _capture(
     outbox: Any,
     config: Any,
@@ -517,7 +569,32 @@ def _capture(
     *,
     runtime: dict[str, Any] | None = None,
 ) -> bool:
-    """Record a new version of one artifact if its content changed."""
+    """Record a new version of one artifact if its content changed.
+
+    Steady-state short-circuit (issue #159): when every file's
+    ``(mtime_ns, ctime_ns, size)`` matches the fingerprint cached at the last
+    capture — and the store's latest version still carries the manifest that
+    fingerprint hashed to — nothing is read or hashed. Any cache miss, stat
+    mismatch, or store disagreement (a tombstone, a foreground writer) falls
+    back to the full read+hash path unchanged.
+    """
+    cache = _stat_cache(outbox)
+    fingerprint = _stat_fingerprint(files)
+    cached = cache.get(artifact_id)
+    if (
+        fingerprint is not None
+        and cached is not None
+        and cached["fingerprint"] == fingerprint
+        and cached["limits"] == _limits_key(config)
+    ):
+        latest = outbox.latest_knowledge_version(artifact_id)
+        if (
+            latest is not None
+            and not latest["is_tombstone"]
+            and latest["manifest_hash"] == cached["manifest_hash"]
+        ):
+            return False
+
     manifest, plaintext_files, occurred_at, skipped_files = _snapshot_files(
         outbox,
         config,
@@ -544,16 +621,30 @@ def _capture(
         origin="background",
         skipped_files=skipped_files,
     )
+    # The store's latest version now matches this manifest (appended, or an
+    # exact duplicate of it), so the pre-read fingerprint is safe to cache —
+    # unless any timestamp is inside the racily-clean window, where a
+    # same-tick write could hide behind identical stats. Then stay dirty.
+    settled_before_ns = (time.time() - _RACY_WINDOW_SECONDS) * 1e9
+    if fingerprint is not None and all(
+        mtime_ns < settled_before_ns and ctime_ns < settled_before_ns
+        for _, mtime_ns, ctime_ns, _ in fingerprint
+    ):
+        cache[artifact_id] = {
+            "fingerprint": fingerprint,
+            "limits": _limits_key(config),
+            "manifest_hash": outbox._manifest_hash(manifest),
+        }
+    else:
+        cache.pop(artifact_id, None)
     if created:
         log_skipped_files(artifact_id, skipped_files)
         _apply_retention(outbox, config, artifact_id)
         if runtime is not None:
             artifact = outbox.knowledge_artifact(artifact_id)
-            version = next(
-                item
-                for item in outbox.knowledge_versions(artifact_id)
-                if item["seq"] == seq
-            )
+            # The version just appended is the latest by construction, and
+            # retention always keeps the latest — one row instead of the chain.
+            version = outbox.latest_knowledge_version(artifact_id)
             _emit_version_event(
                 outbox,
                 runtime,
@@ -572,6 +663,8 @@ def _tombstone_vanished(outbox: Any, config: Any, seen: set[str]) -> int:
     for artifact_id in outbox.knowledge_artifact_ids():
         if artifact_id in seen:
             continue
+        # The artifact's files are gone; any cached stat fingerprint is stale.
+        _stat_cache(outbox).pop(artifact_id, None)
         latest = outbox.latest_knowledge_version(artifact_id)
         if latest is None or latest["is_tombstone"]:
             continue
@@ -633,15 +726,19 @@ def _emit_artifact_events(
     idempotent across restarts and shared by both the scanner's bulk pass and
     the reconciler's targeted heal.
     """
+    cursor_key = f"knowledge:emitted:{artifact_id}"
+    last_emitted = int(outbox.get_meta(cursor_key) or 0)
+    # Load only the rows above the cursor (issue #161): at steady state the
+    # cursor sits at the latest seq, so this parses zero version rows instead
+    # of JSON-decoding the artifact's whole chain to discard it.
+    pending = outbox.knowledge_versions_after(artifact_id, last_emitted)
+    if not pending:
+        return 0
     artifact = outbox.knowledge_artifact(artifact_id)
     if artifact is None:
         return 0
-    cursor_key = f"knowledge:emitted:{artifact_id}"
-    last_emitted = int(outbox.get_meta(cursor_key) or 0)
     emitted = 0
-    for version in outbox.knowledge_versions(artifact_id):
-        if version["seq"] <= last_emitted:
-            continue
+    for version in pending:
         if not version["is_tombstone"] and not has_secret(
             outbox._flight_recorder_home
         ):
