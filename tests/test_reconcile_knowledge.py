@@ -16,21 +16,16 @@ Self-contained: builds a real Hermes-shaped home and ages file mtimes with
 
 from __future__ import annotations
 
-import json
 import os
 
+from helpers import new_outbox
+
 from hermes_flight_recorder.collector import knowledge_store
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
 
+# Anchor differs from helpers.B on purpose: knowledge drift is mtime-based.
 B = 1_800_000_000.0
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def write(path, text: str) -> None:

@@ -21,9 +21,8 @@ from hermes_flight_recorder.collector.outbox import Outbox
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
-    monkeypatch.delenv("HERMES_HOME", raising=False)
+def _clean_env(clean_env):
+    """Every test here runs with the recorder env vars cleared."""
 
 
 # --- precedence ---------------------------------------------------------

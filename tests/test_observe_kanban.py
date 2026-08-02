@@ -11,40 +11,23 @@ where a hand-built event makes an assertion sharper.
 
 from __future__ import annotations
 
-import sqlite3
+import helpers
+from helpers import new_outbox
 
 from hermes_flight_recorder import observe
 from hermes_flight_recorder.cli import main
 from hermes_flight_recorder.collector import kanban_db
-from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.outbox import Outbox
 
 # Reuse the collector test's board builder so the two stay in lock-step on the
 # real kanban.db shape.
 from tests.test_kanban_collector import make_board
 
-B = 1784415000.0
 
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def add(ob, event_type, *, occurred_at=B, correlation_id="corr", session_id=None,
-        payload=None):
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source="test",
-        capture_method="test",
-        runtime={"kind": "kanban", "engine": "standard"},
-        correlation_id=correlation_id,
-        session_id=session_id,
-        payload=payload or {},
-    )
-    return ob.append(rec)
+def add(ob, event_type, **over):
+    """Kanban-flavoured event: the runtime kind differs from the default."""
+    over.setdefault("runtime", {"kind": "kanban", "engine": "standard"})
+    return helpers.add(ob, event_type, **over)
 
 
 def seed_board(tmp_path) -> Outbox:

@@ -10,11 +10,8 @@ declares no YAML dependency).
 
 from __future__ import annotations
 
-import sqlite3
-
 from hermes_flight_recorder.collector import cron_db, state_db
 from hermes_flight_recorder.collector._common import read_home_mode, runtime_stamp
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.envelope import validate
 
 from test_state_adapter import make_cron, make_state_db, new_outbox

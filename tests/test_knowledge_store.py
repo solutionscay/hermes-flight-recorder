@@ -17,8 +17,9 @@ from pathlib import Path
 
 import pytest
 
+from helpers import new_outbox
+
 from hermes_flight_recorder.collector import keystore, knowledge_store
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.recorder_config import KnowledgeConfig
 from hermes_flight_recorder.collector.sync import (
     MAX_INGEST_BATCH_BYTES,
@@ -36,12 +37,6 @@ def knowledge_events(ob):
         if record.get("payload", {}).get("event_type") == knowledge_store.KNOWLEDGE_EVENT:
             out.append(record)
     return out
-
-
-def new_outbox(tmp_path):
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def write(path, text):

@@ -6,6 +6,15 @@ import json
 import sqlite3
 from pathlib import Path
 
+import helpers
+from helpers import (
+    ASYNC_DELEGATIONS_DDL,
+    MESSAGES_FULL,
+    SESSIONS_FULL,
+    USAGE_FULL,
+    new_outbox,
+)
+
 from hermes_flight_recorder.collector import state_db
 from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.hook import SPOOL_FILENAME, drain
@@ -13,37 +22,19 @@ from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.recorder_config import CaptureConfig
 
 
-def new_outbox(tmp_path: Path) -> Outbox:
-    outbox = Outbox.open(tmp_path / "bridge")
-    outbox.initialize()
-    return outbox
-
-
 def make_state_db(home: Path, sessions: list[tuple] | None = None) -> sqlite3.Connection:
-    connection = sqlite3.connect(home / "state.db")
-    connection.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
-            message_count INT, tool_call_count INT, input_tokens INT, output_tokens INT,
-            estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
-            profile_name TEXT, expiry_finalized INT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
-            timestamp REAL, finish_reason TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
-            api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
-            reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
-        CREATE TABLE async_delegations (delegation_id TEXT, origin_session TEXT,
-            parent_session_id TEXT, state TEXT, delivery_state TEXT, owner_pid INT,
-            dispatched_at REAL, event_json TEXT, result_json TEXT);
-        """
+    """Build the shared full-schema state.db, then hand back a live
+    connection so tests can keep inserting rows between polls."""
+    helpers.make_state_db(
+        home,
+        sessions=sessions
+        or [("root", "discord", None, "model-a", 0, 0, 0, 0, 0.0, 1.0, None, None, None, 0)],
+        sessions_columns=SESSIONS_FULL,
+        messages_columns=MESSAGES_FULL,
+        usage_columns=USAGE_FULL,
+        extra_ddl=ASYNC_DELEGATIONS_DDL,
     )
-    connection.executemany(
-        "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        sessions or [("root", "discord", None, "model-a", 0, 0, 0, 0, 0.0, 1.0, None, None, None, 0)],
-    )
-    connection.commit()
-    return connection
+    return sqlite3.connect(home / "state.db")
 
 
 def append_spool(home: Path, events: list[tuple[str, str, float]]) -> None:

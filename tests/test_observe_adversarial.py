@@ -16,39 +16,11 @@ malformed cycle renders each session once instead of recursing forever.
 
 from __future__ import annotations
 
+from helpers import B, add, new_outbox
+
 from hermes_flight_recorder import observe
-from hermes_flight_recorder.collector._common import build_record
-from hermes_flight_recorder.collector.outbox import Outbox
-
-B = 1784415000.0
-
 
 # --- outbox-backed helpers (mirrors tests/test_observe.py) --------------
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def add(ob, event_type, *, occurred_at=B, session_id=None, parent_session_id=None,
-        correlation_id="corr", invocation_id=None, payload=None, partial=False,
-        content=None):
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source="test",
-        capture_method="test",
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=correlation_id,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        invocation_id=invocation_id,
-        payload=payload or {},
-        partial=partial,
-    )
-    return ob.append(rec, content=content)
-
-
 # --- raw record helper (bypasses envelope validation on purpose) -------
 def mk(event_type, *, session_id=None, parent_session_id=None, correlation_id="corr",
        occurred_at=B, producer_sequence=1, installation_id="inst",

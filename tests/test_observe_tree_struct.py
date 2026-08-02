@@ -17,41 +17,19 @@ envelopes; nothing here relies on wall-clock time.
 
 from __future__ import annotations
 
-import sqlite3
+from helpers import (
+    ASYNC_DELEGATIONS_DDL,
+    B,
+    MESSAGES_FULL,
+    SESSIONS_FULL,
+    USAGE_FULL,
+    add,
+    make_state_db,
+    new_outbox,
+)
 
 from hermes_flight_recorder import observe
-from hermes_flight_recorder.cli import main  # noqa: F401  (kept per spec's import list; unused directly here)
-from hermes_flight_recorder.collector import cron_db, state_db  # noqa: F401  (cron_db unused; state_db used below)
-from hermes_flight_recorder.collector._common import build_record
-from hermes_flight_recorder.collector.outbox import Outbox
-from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
-
-B = 1784415000.0
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def add(ob, event_type, *, occurred_at=B, session_id=None, parent_session_id=None,
-        correlation_id="corr", invocation_id=None, payload=None, partial=False,
-        content=None):
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source="test",
-        capture_method="test",
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=correlation_id,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        invocation_id=invocation_id,
-        payload=payload or {},
-        partial=partial,
-    )
-    return ob.append(rec, content=content)
+from hermes_flight_recorder.collector import state_db
 
 
 # --- deep nesting ---------------------------------------------------------
@@ -227,38 +205,18 @@ def test_deep_nesting_via_real_state_db_poll_pipeline(tmp_path):
     outbox renders the identical tree shape as the hand-built case."""
     hh = tmp_path / "hermes"
     hh.mkdir()
-    db = sqlite3.connect(hh / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
-            message_count INT, tool_call_count INT, input_tokens INT, output_tokens INT,
-            estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
-            profile_name TEXT, expiry_finalized INT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
-            timestamp REAL, finish_reason TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
-            api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
-            reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
-        CREATE TABLE async_delegations (delegation_id TEXT, origin_session TEXT,
-            parent_session_id TEXT, state TEXT, delivery_state TEXT,
-            owner_pid INT, dispatched_at REAL, event_json TEXT, result_json TEXT);
-        """
+    make_state_db(
+        hh,
+        sessions=[
+            ("P", "cli", None, "m", 0, 0, 0, 0, 0.0, B, B + 50, "done", "default", 1),
+            ("C1", "subagent", "P", "m", 0, 0, 0, 0, 0.0, B + 1, B + 40, "agent_close", "default", 1),
+            ("C2", "subagent", "C1", "m", 0, 0, 0, 0, 0.0, B + 2, B + 30, "agent_close", "default", 1),
+        ],
+        sessions_columns=SESSIONS_FULL,
+        messages_columns=MESSAGES_FULL,
+        usage_columns=USAGE_FULL,
+        extra_ddl=ASYNC_DELEGATIONS_DDL,
     )
-    db.execute(
-        "INSERT INTO sessions VALUES ('P','cli',NULL,'m',0,0,0,0,0.0,?,?,'done','default',1)",
-        (B, B + 50),
-    )
-    db.execute(
-        "INSERT INTO sessions VALUES ('C1','subagent','P','m',0,0,0,0,0.0,?,?,'agent_close','default',1)",
-        (B + 1, B + 40),
-    )
-    db.execute(
-        "INSERT INTO sessions VALUES ('C2','subagent','C1','m',0,0,0,0,0.0,?,?,'agent_close','default',1)",
-        (B + 2, B + 30),
-    )
-    db.commit()
-    db.close()
 
     ob = new_outbox(tmp_path)
     state_db.poll(ob, hh)

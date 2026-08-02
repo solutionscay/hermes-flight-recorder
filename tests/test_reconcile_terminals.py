@@ -19,19 +19,9 @@ cases assert that exactly-at-timeout does NOT flag (the reconciler uses
 
 from __future__ import annotations
 
-from hermes_flight_recorder.collector._common import build_record
-from hermes_flight_recorder.collector.outbox import Outbox
+from helpers import B, append_event, new_outbox
+
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
-
-# A fixed epoch anchor (mirrors tests/test_reconcile.py) so timestamps
-# round-trip deterministically.
-B = 1784415000.0
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def terminal_missing(outbox, subject_type=None):
@@ -45,21 +35,6 @@ def terminal_missing(outbox, subject_type=None):
             continue
         out.append(e)
     return out
-
-
-def append_event(ob, event_type, **over):
-    """Append a minimal valid producer event straight to the outbox."""
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=over.pop("occurred_at", B),
-        source=over.pop("source", "hook:test"),
-        capture_method=over.pop("capture_method", "hook:test"),
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=over.pop("correlation_id", "corr"),
-        payload=over.pop("payload", {}),
-        **over,
-    )
-    return ob.append(rec)
 
 
 # --- invocation ------------------------------------------------------------

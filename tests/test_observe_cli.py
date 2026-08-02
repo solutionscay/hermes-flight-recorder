@@ -6,38 +6,10 @@ from __future__ import annotations
 
 import pytest
 
+from helpers import B, add, new_outbox
+
 from hermes_flight_recorder import observe
 from hermes_flight_recorder.cli import main
-from hermes_flight_recorder.collector._common import build_record
-from hermes_flight_recorder.collector.outbox import Outbox
-
-B = 1784415000.0
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def add(ob, event_type, *, occurred_at=B, session_id=None, parent_session_id=None,
-        correlation_id="corr", invocation_id=None, payload=None, partial=False,
-        content=None):
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source="test",
-        capture_method="test",
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=correlation_id,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        invocation_id=invocation_id,
-        payload=payload or {},
-        partial=partial,
-    )
-    return ob.append(rec, content=content)
-
 
 # --- not initialized ------------------------------------------------------
 def test_observe_not_initialized_exits_2_with_stderr_hint(tmp_path, capsys):

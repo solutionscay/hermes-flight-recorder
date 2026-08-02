@@ -14,42 +14,15 @@ made here.
 
 from __future__ import annotations
 
-import datetime
 import sqlite3
 
-from hermes_flight_recorder.collector._common import INSTALLED_AT_META_KEY, build_record
-from hermes_flight_recorder.collector.outbox import Outbox
+import helpers
+from helpers import B, append_event, iso, new_outbox
+from helpers import _executions_db as make_executions_db
+
+from hermes_flight_recorder.collector._common import INSTALLED_AT_META_KEY
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
-
-# A fixed epoch anchor and a US-Central-like offset, mirroring the cron store.
-B = 1784415000.0
-TZ = datetime.timezone(datetime.timedelta(hours=-5))
-
-
-def iso(epoch: float) -> str:
-    return datetime.datetime.fromtimestamp(epoch, TZ).isoformat()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def append_event(ob, event_type, **over):
-    """Append a minimal valid producer event straight to the outbox."""
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=over.pop("occurred_at", B),
-        source=over.pop("source", "hook:test"),
-        capture_method=over.pop("capture_method", "hook:test"),
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=over.pop("correlation_id", "corr"),
-        payload=over.pop("payload", {}),
-        **over,
-    )
-    return ob.append(rec)
 
 
 def coverage_gaps(ob, subject_type: str | None = None):
@@ -70,40 +43,15 @@ def coverage_gaps(ob, subject_type: str | None = None):
 
 
 # --- durable-store builders ----------------------------------------------
-_SESSIONS_SCHEMA = """
-CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
-    started_at REAL, ended_at REAL, expiry_finalized INT, profile_name TEXT);
-CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-    content TEXT);
-CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
-"""
-
-
 def make_state_db(hh, *, sessions=(), messages=(), model_usage=()):
-    """Build a minimal state.db. Each arg is a list of column-value tuples
-    matching the CREATE TABLE column order above.
-    """
-    db = sqlite3.connect(hh / "state.db")
-    db.executescript(_SESSIONS_SCHEMA)
-    db.executemany("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)", sessions)
-    db.executemany("INSERT INTO messages VALUES (?,?,?,?)", messages)
-    db.executemany("INSERT INTO session_model_usage VALUES (?,?,?)", model_usage)
-    db.commit()
-    db.close()
-
-
-def make_executions_db(cron_dir, rows):
-    """rows: list of (id, job_id, status, claimed_at_iso, started_at_iso, finished_at_iso)."""
-    db = sqlite3.connect(cron_dir / "executions.db")
-    db.execute(
-        "CREATE TABLE executions (id TEXT, job_id TEXT, source TEXT, pid INT, status TEXT, "
-        "claimed_at TEXT, started_at TEXT, finished_at TEXT, error TEXT)"
+    """Minimal state.db whose ``messages`` rows also carry ``content``."""
+    helpers.make_state_db(
+        hh,
+        sessions=sessions,
+        messages=messages,
+        model_usage=model_usage,
+        messages_columns=helpers.MESSAGES_MIN + ", content TEXT",
     )
-    db.executemany(
-        "INSERT INTO executions VALUES (?,?,'builtin',1,?,?,?,?,NULL)", rows
-    )
-    db.commit()
-    db.close()
 
 
 # Small, explicit, deterministic windows — never wall-clock defaults.

@@ -16,49 +16,15 @@ through a real reconcile() run against a durable state.db.
 from __future__ import annotations
 
 import datetime
-import sqlite3
 
 import pytest
 
+from helpers import B, add, make_state_db, new_outbox
+
 from hermes_flight_recorder import observe
 from hermes_flight_recorder.cli import main
-from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
-
-B = 1784415000.0
-
-_SESSIONS_SCHEMA = """
-CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
-    started_at REAL, ended_at REAL, expiry_finalized INT, profile_name TEXT);
-CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT);
-CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
-"""
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def add(ob, event_type, *, occurred_at=B, session_id=None, parent_session_id=None,
-        correlation_id="corr", invocation_id=None, payload=None, partial=False,
-        content=None):
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source="test",
-        capture_method="test",
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=correlation_id,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        invocation_id=invocation_id,
-        payload=payload or {},
-        partial=partial,
-    )
-    return ob.append(rec, content=content)
 
 
 def raw_finding(event_type, seq, *, installation_id="inst-1", **payload):
@@ -274,11 +240,7 @@ def test_report_reflects_a_real_reconciler_coverage_gap_finding(tmp_path):
     # not a terminal_missing, is what surfaces here.)
     hh = tmp_path / "hermes"
     hh.mkdir()
-    db = sqlite3.connect(hh / "state.db")
-    db.executescript(_SESSIONS_SCHEMA)
-    db.execute("INSERT INTO sessions VALUES ('S','cli',NULL,?,NULL,0,NULL)", (B,))
-    db.commit()
-    db.close()
+    make_state_db(hh, sessions=[("S", "cli", None, B, None, 0, None)])
 
     ob = new_outbox(tmp_path)
     reconcile(ob, hh, now=B + 500, config=ReconcileConfig(coverage_grace=0.0))

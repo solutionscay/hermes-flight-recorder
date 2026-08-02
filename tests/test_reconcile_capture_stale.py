@@ -14,21 +14,12 @@ home is needed — capture liveness is a pure outbox-meta signal.
 
 from __future__ import annotations
 
-from collections import Counter
+from helpers import B, new_outbox
 
 from hermes_flight_recorder.collector import CAPTURE_HEARTBEAT_KEY
 from hermes_flight_recorder.collector.health import RECONCILE_HEALTH_KEY, read_health
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
-
-B = 1784415000.0
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def stale_findings(outbox):

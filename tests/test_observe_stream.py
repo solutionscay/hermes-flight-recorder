@@ -14,44 +14,15 @@ from __future__ import annotations
 
 import datetime
 import hashlib
-import json
-import sqlite3
+
+from helpers import B, _executions_db, _jobs_json, add, new_outbox
 
 from hermes_flight_recorder import observe
-from hermes_flight_recorder.cli import main  # noqa: F401  (imported per task spec; CLI not re-tested here)
-from hermes_flight_recorder.collector import cron_db, state_db  # noqa: F401  (state_db imported per task spec)
-from hermes_flight_recorder.collector._common import build_record
-from hermes_flight_recorder.collector.outbox import Outbox
-from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile  # noqa: F401
-
-B = 1784415000.0
+from hermes_flight_recorder.collector import cron_db
+from hermes_flight_recorder.collector.reconcile import reconcile
 
 
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
-
-
-def add(ob, event_type, *, occurred_at=B, session_id=None, parent_session_id=None,
-        correlation_id="corr", invocation_id=None, payload=None, partial=False,
-        content=None):
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source="test",
-        capture_method="test",
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=correlation_id,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        invocation_id=invocation_id,
-        payload=payload or {},
-        partial=partial,
-    )
-    return ob.append(rec, content=content)
-
-
+# Kept local: this file's fixtures carry UTC offsets (helpers.iso uses -5).
 def iso(epoch: float) -> str:
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat()
 
@@ -235,25 +206,6 @@ def test_short_renders_epoch_as_iso_and_cost_as_decimal():
 
 
 # --- integration: real cron_db.poll + reconcile pipeline through stream ----
-def _executions_db(cron_dir, rows) -> None:
-    db = sqlite3.connect(cron_dir / "executions.db")
-    db.execute(
-        "CREATE TABLE executions (id TEXT, job_id TEXT, source TEXT, pid INT, status TEXT, "
-        "claimed_at TEXT, started_at TEXT, finished_at TEXT, error TEXT)"
-    )
-    db.executemany(
-        "INSERT INTO executions VALUES (?,?,'builtin',1,?,?,?,?,NULL)",
-        [(exid, job, status, claimed, started, finished)
-         for (exid, job, status, claimed, started, finished) in rows],
-    )
-    db.commit()
-    db.close()
-
-
-def _jobs_json(cron_dir, jobs) -> None:
-    (cron_dir / "jobs.json").write_text(json.dumps({"jobs": jobs}))
-
-
 def test_stream_renders_real_cron_pipeline_output_in_strict_sequence_order(tmp_path):
     """cron_db.poll() captures run_claimed/run_finished, reconcile() derives
     a cron.run_missed finding; render_stream must show all of them, in

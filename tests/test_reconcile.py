@@ -7,30 +7,26 @@ fixed ``now`` and small windows so wall-clock never enters.
 
 from __future__ import annotations
 
-import datetime
-import json
-import sqlite3
 from collections import Counter
 
+from helpers import (
+    ASYNC_DELEGATIONS_DDL,
+    B,
+    MESSAGES_FULL,
+    SESSIONS_FULL,
+    USAGE_FULL,
+    _executions_db,
+    _interval_job,
+    _jobs_json,
+    append_event,
+    iso,
+    make_state_db,
+    new_outbox,
+)
+
 from hermes_flight_recorder.collector import state_db
-from hermes_flight_recorder.collector.outbox import Outbox
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
-from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.envelope import validate
-
-# A fixed epoch anchor and a US-Central offset like the real cron store.
-B = 1784415000.0
-TZ = datetime.timezone(datetime.timedelta(hours=-5))
-
-
-def iso(epoch: float) -> str:
-    return datetime.datetime.fromtimestamp(epoch, TZ).isoformat()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def types(outbox) -> Counter:
@@ -42,21 +38,6 @@ def findings(outbox, event_type):
         e for e in outbox.iter_events()
         if e["payload"]["event_type"] == event_type and e["source"] == "reconciler"
     ]
-
-
-def append_event(ob, event_type, **over):
-    """Append a minimal valid producer event straight to the outbox."""
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=over.pop("occurred_at", B),
-        source=over.pop("source", "hook:test"),
-        capture_method=over.pop("capture_method", "hook:test"),
-        runtime={"kind": "cli", "engine": "standard"},
-        correlation_id=over.pop("correlation_id", "corr"),
-        payload=over.pop("payload", {}),
-        **over,
-    )
-    return ob.append(rec)
 
 
 # --- sequence gaps ------------------------------------------------------
@@ -85,18 +66,8 @@ def test_dropped_sequence_surfaces_as_gap_detected(tmp_path):
 # --- coverage gaps ------------------------------------------------------
 def test_durable_row_with_no_captured_event_is_uncaptured(tmp_path):
     hh = tmp_path / "hermes"; hh.mkdir()
-    db = sqlite3.connect(hh / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT,
-            started_at REAL, ended_at REAL, expiry_finalized INT, profile_name TEXT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
-        """
-    )
     # started_at = now, so the open session is NOT terminal-missing yet.
-    db.execute("INSERT INTO sessions VALUES ('S','cli',NULL,?,NULL,0,NULL)", (B,))
-    db.commit(); db.close()
+    make_state_db(hh, sessions=[("S", "cli", None, B, None, 0, None)])
     ob = new_outbox(tmp_path)
 
     reconcile(ob, hh, now=B, config=ReconcileConfig(coverage_grace=0.0))
@@ -273,64 +244,14 @@ def test_cron_expression_missed_fire(tmp_path):
 
 # --- fixtures -----------------------------------------------------------
 def _full_state_db(hh) -> None:
-    db = sqlite3.connect(hh / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
-            message_count INT, tool_call_count INT, input_tokens INT, output_tokens INT,
-            estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
-            profile_name TEXT, expiry_finalized INT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
-            timestamp REAL, finish_reason TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT,
-            api_call_count INT, input_tokens INT, output_tokens INT, cache_read_tokens INT,
-            reasoning_tokens INT, estimated_cost_usd REAL, cost_status TEXT, last_seen REAL);
-        CREATE TABLE async_delegations (delegation_id TEXT, origin_session TEXT,
-            parent_session_id TEXT, state TEXT, delivery_state TEXT,
-            owner_pid INT, dispatched_at REAL, event_json TEXT, result_json TEXT);
-        """
-    )
     # A parent that ended (so no terminal-missing) plus one tool message and usage.
-    db.execute(
-        "INSERT INTO sessions VALUES ('P','cli',NULL,'m',1,1,10,1,0.0,?,?,'done','default',1)",
-        (B, B + 10),
+    make_state_db(
+        hh,
+        sessions=[("P", "cli", None, "m", 1, 1, 10, 1, 0.0, B, B + 10, "done", "default", 1)],
+        messages=[(5, "P", "tool", "read", "tc", None, '{"exit_code":0}', B + 2, None)],
+        model_usage=[("P", "m", "", 1, 10, 1, 0, 0, 0.0, "estimated", B + 5)],
+        sessions_columns=SESSIONS_FULL,
+        messages_columns=MESSAGES_FULL,
+        usage_columns=USAGE_FULL,
+        extra_ddl=ASYNC_DELEGATIONS_DDL,
     )
-    db.execute(
-        "INSERT INTO messages VALUES (5,'P','tool','read','tc',NULL,'{\"exit_code\":0}',?,NULL)",
-        (B + 2,),
-    )
-    db.execute(
-        "INSERT INTO session_model_usage VALUES ('P','m','',1,10,1,0,0,0.0,'estimated',?)",
-        (B + 5,),
-    )
-    db.commit(); db.close()
-
-
-def _executions_db(cron, rows) -> None:
-    db = sqlite3.connect(cron / "executions.db")
-    db.execute(
-        "CREATE TABLE executions (id TEXT, job_id TEXT, source TEXT, pid INT, status TEXT, "
-        "claimed_at TEXT, started_at TEXT, finished_at TEXT, error TEXT)"
-    )
-    db.executemany(
-        "INSERT INTO executions VALUES (?,?,'builtin',1,?,?,?,?,NULL)",
-        [(exid, job, status, claimed, started, finished)
-         for (exid, job, status, claimed, started, finished) in rows],
-    )
-    db.commit(); db.close()
-
-
-def _jobs_json(cron, jobs) -> None:
-    (cron / "jobs.json").write_text(json.dumps({"jobs": jobs}))
-
-
-def _interval_job(job_id, *, minutes, created) -> dict:
-    return {
-        "id": job_id,
-        "enabled": True,
-        "state": "scheduled",
-        "created_at": iso(created),
-        "schedule": {"kind": "interval", "minutes": minutes},
-        "repeat": {"times": None, "completed": 0},
-    }

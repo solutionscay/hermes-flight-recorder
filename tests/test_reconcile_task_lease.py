@@ -14,13 +14,11 @@ a ``ReconcileConfig`` with small windows, so nothing depends on wall-clock. Only
 from __future__ import annotations
 
 import sqlite3
-from collections import Counter
 
-from hermes_flight_recorder.collector.outbox import Outbox
+from helpers import B, new_outbox
+
 from hermes_flight_recorder.collector.reconcile import ReconcileConfig, reconcile
 from hermes_flight_recorder.envelope import validate
-
-B = 1784415000.0
 
 _RUNS_DDL = (
     "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, claim_lock TEXT, "
@@ -37,12 +35,6 @@ def kanban_db(path, runs) -> None:
     db.executemany("INSERT INTO task_runs VALUES (?,?,?,?,?,?,?,?)", runs)
     db.commit()
     db.close()
-
-
-def new_outbox(tmp_path) -> Outbox:
-    ob = Outbox.open(tmp_path / "bridge")
-    ob.initialize()
-    return ob
 
 
 def lease_findings(outbox):

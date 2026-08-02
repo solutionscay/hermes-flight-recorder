@@ -7,9 +7,9 @@ long-lived Hermes home does not ingest the entire past.
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
+
+from helpers import MESSAGES_FULL, SESSIONS_FULL, make_state_db
 
 from hermes_flight_recorder.collector import lifecycle, run_pass
 from hermes_flight_recorder.collector._common import (
@@ -20,37 +20,25 @@ from hermes_flight_recorder.collector.outbox import Outbox
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    monkeypatch.delenv("SC_HERMES_FLIGHT_RECORDER_HOME", raising=False)
-    monkeypatch.delenv("HERMES_HOME", raising=False)
+def _clean_env(clean_env):
+    """Every test here runs with the recorder env vars cleared."""
 
 
 def _make_state(hermes, sessions, messages) -> None:
-    db = sqlite3.connect(hermes / "state.db")
-    db.executescript(
-        """
-        CREATE TABLE sessions (id TEXT, source TEXT, parent_session_id TEXT, model TEXT,
-            message_count INT, tool_call_count INT, input_tokens INT, output_tokens INT,
-            estimated_cost_usd REAL, started_at REAL, ended_at REAL, end_reason TEXT,
-            profile_name TEXT, expiry_finalized INT);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
-            tool_name TEXT, tool_call_id TEXT, effect_disposition TEXT, content TEXT,
-            timestamp REAL, finish_reason TEXT);
-        CREATE TABLE session_model_usage (session_id TEXT, model TEXT, task TEXT);
-        """
+    """sessions: (sid, started) tuples; messages: (sid, role, ts, content)."""
+    make_state_db(
+        hermes,
+        sessions=[
+            (sid, "cli", None, "m", 0, 0, 0, 0, 0.0, started, None, None, "default", 1)
+            for (sid, started) in sessions
+        ],
+        messages=[
+            (i, sid, role, None, None, None, content, ts, None)
+            for i, (sid, role, ts, content) in enumerate(messages, 1)
+        ],
+        sessions_columns=SESSIONS_FULL,
+        messages_columns=MESSAGES_FULL,
     )
-    for sid, started in sessions:
-        db.execute(
-            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, "cli", None, "m", 0, 0, 0, 0, 0.0, started, None, None, "default", 1),
-        )
-    for i, (sid, role, ts, content) in enumerate(messages, 1):
-        db.execute(
-            "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)",
-            (i, sid, role, None, None, None, content, ts, None),
-        )
-    db.commit()
-    db.close()
 
 
 def _install(tmp_path, *, backfill: bool):
