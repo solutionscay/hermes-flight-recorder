@@ -91,12 +91,14 @@ Restart the Hermes gateway to load the hook. It never registers an OS service.
 
 `hermes-flight-recorder serve --hermes-home <path>` then runs one portable
 foreground process: it drains the hook spool and polls the durable stores on
-`capture.interval_seconds` (default 15s), reconciles the stores against the
-outbox on `reconcile.interval_seconds` (default 60s) — independently, so it
-flags capture staleness even when capture is broken — and syncs when a sync
-config is present. A `runtime.lock` in the recorder home enforces a single
-instance; SIGINT/SIGTERM shut it down cleanly. Native service managers (systemd,
-launchd, Windows Service) wrap this same command.
+`capture.interval_seconds` (default 15s). It checks runtime health on
+`reconcile.interval_seconds` (default 60s), so it can find capture failures.
+It runs a complete integrity audit on `reconcile.audit_interval_seconds`
+(default 3600s). It also syncs when a sync config is present. A `runtime.lock`
+in the recorder home enforces a single instance. SIGINT and SIGTERM shut it
+down cleanly. Native service managers can wrap this same command.
+
+See [Collector watermarks](watermarks.md) for the incremental scan contract.
 
 `run`, `reconcile`, and `sync` remain available as one-shot passes for an
 external scheduler, and `observe` renders the log locally.
@@ -220,9 +222,10 @@ reconciliation fields. Tombstones contain no encrypted body or full envelope;
 they stop durable-store polls from recreating delivered events and stop
 reconciliation from reporting intentional retention as capture loss.
 
-`capture.interval_seconds` (default 15) and `reconcile.interval_seconds`
-(default 60) set the `serve` cadences; the one-shot `run` and `reconcile`
-commands ignore them. `sync.max_records` and `sync.max_bytes` control each batch.
+`capture.interval_seconds` (default 15), `reconcile.interval_seconds`
+(default 60), and `reconcile.audit_interval_seconds` (default 3600) set the
+`serve` cadences. The one-shot `run` and `reconcile` commands ignore them.
+`sync.max_records` and `sync.max_bytes` control each batch.
 `sync.max_bytes` never raises the 4 MiB protocol ceiling.
 `sync.max_batches_per_tick` limits the network work for each `serve` sync tick.
 The default is one batch. The one-shot `sync` command still drains the backlog.
@@ -244,7 +247,8 @@ object), `HFR_CAPTURE_INTERVAL_SECONDS`, `HFR_RETENTION_ENABLED`,
 `HFR_KNOWLEDGE_HISTORY`, `HFR_KNOWLEDGE_MAX_VERSIONS`,
 `HFR_KNOWLEDGE_MAX_FILE_BYTES`, `HFR_KNOWLEDGE_MAX_FILE_COUNT`,
 `HFR_KNOWLEDGE_MAX_ARTIFACT_BYTES`,
-`HFR_RECONCILE_INTERVAL_SECONDS`, `HFR_SYNC_INTERVAL_SECONDS`,
+`HFR_RECONCILE_INTERVAL_SECONDS`, `HFR_RECONCILE_AUDIT_INTERVAL_SECONDS`,
+`HFR_SYNC_INTERVAL_SECONDS`,
 `HFR_SYNC_MAX_RECORDS`, `HFR_SYNC_MAX_BYTES`, and
 `HFR_SYNC_MAX_BATCHES_PER_TICK`. The ingest URL and Cloudflare
 Access credentials remain

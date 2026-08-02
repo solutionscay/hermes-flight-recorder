@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from typing import Any
 
 from .version import build_identity
 
@@ -180,7 +179,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
                 args.flight_recorder_home,
                 args.hermes_home,
                 source=args.source,
-                ref=args.ref,
+                commit=args.commit,
                 editable=args.editable,
             )
     except UpdateError as exc:
@@ -316,61 +315,9 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
 
 
 def _cmd_observe(args: argparse.Namespace) -> int:
-    from . import observe
+    from .cli_observe import run
 
-    since: float | None = None
-    if args.since is not None:
-        try:
-            since = observe.parse_since(args.since)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-
-    outbox = _open_outbox(args)
-    try:
-        if not _check_initialized(outbox):
-            return 2
-
-        records = observe.load(outbox, session=args.session, since=since)
-
-        # Default to the stream view when no view is selected.
-        views = [
-            v
-            for v in ("stream", "tree", "report", "kanban", "knowledge")
-            if getattr(args, v)
-        ]
-        if not views:
-            views = ["stream"]
-
-        exit_code = 0
-        for i, view in enumerate(views):
-            if i:
-                print()
-            if view == "stream":
-                print(f"── stream ({len(records)} events) ──")
-                for line in observe.render_stream(records):
-                    print(line)
-            elif view == "tree":
-                print("── tree ──")
-                for line in observe.render_tree(records, session=args.session):
-                    print(line)
-            elif view == "report":
-                print("── report ──")
-                lines, code = observe.render_report(records)
-                for line in lines:
-                    print(line)
-                exit_code = code
-            elif view == "kanban":
-                print("── kanban ──")
-                for line in observe.render_kanban(records):
-                    print(line)
-            elif view == "knowledge":
-                print("── knowledge ──")
-                for line in observe.render_knowledge(outbox, records):
-                    print(line)
-    finally:
-        outbox.close()
-    return exit_code
+    return run(args, open_outbox=_open_outbox, check_initialized=_check_initialized)
 
 
 def _cmd_prune(args: argparse.Namespace) -> int:
@@ -402,172 +349,14 @@ def _cmd_prune(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    """Print a health readout from the outbox and return non-zero if unhealthy.
+    from .cli_status import run
 
-    On-demand answer to "is capture alive and is the server caught up?" — the
-    human counterpart to the ``reconcile.capture_stale`` alert. Store-only (no
-    Hermes home, no network), so it is safe to run any time and a cron/monitor
-    can gate on the exit code: 0 healthy, 1 unhealthy (capture stale or never
-    recorded a success).
-    """
-    from .collector import CAPTURE_HEARTBEAT_KEY, recorder_config
-    from .collector.health import (
-        RECONCILE_HEALTH_KEY,
-        read_health,
-        source_health_key,
+    return run(
+        args,
+        open_outbox=_open_outbox,
+        check_initialized=_check_initialized,
+        flight_recorder_home=_flight_recorder_home,
     )
-    from .collector.reconcile import ReconcileConfig
-    from .collector.recorder_config import (
-        CAPTURE_SOURCE_NAMES,
-        source_enabled,
-        source_required,
-    )
-    from .collector.sync import delivery_cursor
-
-    threshold = ReconcileConfig().capture_stale_after
-    now = time.time()
-
-    try:
-        runtime_config = recorder_config.load(_flight_recorder_home(args))
-    except recorder_config.RecorderConfigError as exc:
-        print(f"status not configured: {exc}", file=sys.stderr)
-        return 2
-
-    outbox = _open_outbox(args)
-    try:
-        if not _check_initialized(outbox):
-            return 2
-
-        print(f"installation:    {outbox.installation_id}")
-        healthy = True
-        package_build = build_identity()
-        print(f"package build:   {package_build}")
-        installed_build = outbox.get_meta("installed_build")
-        if installed_build is not None:
-            from .collector._common import resolve_hermes_home
-            from .collector.hook import (
-                HOOK_DIR_NAME,
-                baked_flight_recorder_build,
-            )
-
-            hook_dir = (
-                resolve_hermes_home(args.hermes_home) / "hooks" / HOOK_DIR_NAME
-            )
-            hook_build = baked_flight_recorder_build(hook_dir)
-            if installed_build == package_build == hook_build:
-                print(f"hook build:      OK — {hook_build}")
-            else:
-                healthy = False
-                print(
-                    "hook build:      MISMATCH — "
-                    f"installed {installed_build!r}, package {package_build!r}, "
-                    f"hook {hook_build!r}"
-                )
-
-        high_water = outbox.high_water()
-        cursor = delivery_cursor(outbox)
-        pending = high_water - cursor
-        print(
-            f"outbox:          producer high-water {high_water}, "
-            f"delivery cursor {cursor}, pending {pending}"
-        )
-
-        raw = outbox.get_meta(CAPTURE_HEARTBEAT_KEY)
-        if raw is None:
-            print("capture:         NO SUCCESS RECORDED (capture has never run)")
-            healthy = False
-        else:
-            try:
-                last = float(raw)
-            except (TypeError, ValueError):
-                print(f"capture:         UNREADABLE heartbeat ({raw!r})")
-                healthy = False
-            else:
-                age = now - last
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last))
-                verdict = "OK" if age <= threshold else "STALE"
-                if age > threshold:
-                    healthy = False
-                print(
-                    f"capture:         {verdict} — last success {stamp} "
-                    f"({int(age)}s ago, threshold {int(threshold)}s)"
-                )
-
-        for source in CAPTURE_SOURCE_NAMES:
-            if not source_enabled(runtime_config.capture, source):
-                continue
-            required = source_required(runtime_config.capture, source)
-            state = read_health(outbox, source_health_key(source))
-            verdict, source_healthy = _health_verdict(state, now, threshold)
-            if required and not source_healthy:
-                healthy = False
-            policy = "required" if required else "optional"
-            print(
-                f"source {source}: {policy} {verdict}; "
-                f"{_health_details(state, now)}"
-            )
-
-        reconcile_threshold = max(
-            threshold, runtime_config.reconcile.interval_seconds * 3
-        )
-        reconcile_state = read_health(outbox, RECONCILE_HEALTH_KEY)
-        verdict, reconcile_healthy = _health_verdict(
-            reconcile_state, now, reconcile_threshold
-        )
-        if not reconcile_healthy:
-            healthy = False
-        print(
-            f"reconcile:       {verdict}; "
-            f"{_health_details(reconcile_state, now)}"
-        )
-    finally:
-        outbox.close()
-    return 0 if healthy else 1
-
-
-def _health_verdict(
-    state: dict[str, Any], now: float, stale_after: float
-) -> tuple[str, bool]:
-    if "unreadable" in state:
-        return "UNREADABLE", False
-    failures = state.get("consecutive_failures", 0)
-    try:
-        if int(failures) > 0:
-            return "BROKEN", False
-    except (TypeError, ValueError):
-        return "UNREADABLE", False
-    last = state.get("last_success_at")
-    try:
-        age = now - float(last)
-    except (TypeError, ValueError):
-        return "NO SUCCESS RECORDED", False
-    if age > stale_after:
-        return "STALE", False
-    return "OK", True
-
-
-def _health_details(state: dict[str, Any], now: float) -> str:
-    if "unreadable" in state:
-        return f"state {state['unreadable']!r}"
-
-    last_success = _health_time(state.get("last_success_at"), now)
-    last_error = _health_time(state.get("last_error_at"), now)
-    error = state.get("last_error")
-    failures = state.get("consecutive_failures", 0)
-    error_text = f"{last_error} ({error})" if error else "never"
-    return (
-        f"last success {last_success}; last error {error_text}; "
-        f"consecutive failures {failures}"
-    )
-
-
-def _health_time(value: Any, now: float) -> str:
-    try:
-        when = float(value)
-    except (TypeError, ValueError):
-        return "never"
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
-    return f"{stamp} ({int(now - when)}s ago)"
 
 
 def _sync_summary(outbox, before_cursor: int) -> tuple[int, int, int]:
@@ -869,9 +658,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Git URL or local checkout to install (default: the public repository).",
     )
     p_update.add_argument(
-        "--ref",
+        "--commit",
         default=None,
-        help="Required for Git sources. Give a release tag, branch, or full commit.",
+        help="Required for Git sources. Give a full 40-character or 64-character hash.",
     )
     p_update.add_argument(
         "--editable",

@@ -23,6 +23,6 @@ until an operator runs an explicit lock update.
 4. Push the tag without moving it after publication.
 5. Record the tag and full commit in the release notes.
 
-An update can use the release tag or the full commit. The updater resolves the
-requested value before package installation. It records both the requested
-value and the installed commit.
+An update uses the full commit from the release notes. The updater checks the
+commit before package installation. It records the requested commit and the
+installed commit.

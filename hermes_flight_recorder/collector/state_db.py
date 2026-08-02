@@ -26,7 +26,6 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,40 +40,12 @@ from ._common import (
     runtime_stamp,
     safe_json_dict,
     occurred_before,
-    sqlite_column_or_default,
-    sqlite_table_columns,
-    sqlite_table_exists,
     state_db_path,
 )
 from .recorder_config import CaptureConfig
-
-_SESSION_COL_DEFAULTS = (
-    ("id", "NULL"),
-    ("source", "NULL"),
-    ("parent_session_id", "NULL"),
-    ("model", "NULL"),
-    ("message_count", "0"),
-    ("tool_call_count", "0"),
-    # Usage and cost fields use NULL fallbacks deliberately.  A missing
-    # legacy-schema column means "unknown", not a measured zero.
-    ("api_call_count", "NULL"),
-    ("input_tokens", "NULL"),
-    ("output_tokens", "NULL"),
-    ("cache_read_tokens", "NULL"),
-    ("cache_write_tokens", "NULL"),
-    ("reasoning_tokens", "NULL"),
-    ("estimated_cost_usd", "NULL"),
-    ("actual_cost_usd", "NULL"),
-    ("cost_status", "NULL"),
-    ("cost_source", "NULL"),
-    ("started_at", "NULL"),
-    ("ended_at", "NULL"),
-    ("end_reason", "NULL"),
-    ("profile_name", "NULL"),
-    # Missing expiry_finalized means the Hermes schema predates that nuance;
-    # treat ended sessions as stable instead of permanently partial.
-    ("expiry_finalized", "1"),
-)
+from . import state_watermarks
+from .invocation_watermarks import InvocationWindow
+from .invocation_watermarks import read_invocation_windows
 
 _TERMINAL_USAGE_FIELDS = (
     "api_call_count",
@@ -89,13 +60,6 @@ _TERMINAL_USAGE_FIELDS = (
     "cost_source",
 )
 
-
-def _session_select(columns: set[str]) -> str:
-    return ", ".join(
-        sqlite_column_or_default(columns, name, default)
-        for name, default in _SESSION_COL_DEFAULTS
-    )
-
 _USAGE_COUNTERS = (
     "api_call_count",
     "input_tokens",
@@ -104,23 +68,10 @@ _USAGE_COUNTERS = (
     "reasoning_tokens",
     "estimated_cost_usd",
 )
-_USAGE_STATE_VERSION = "delta-v1"
-# v1 advanced one global cursor while selecting only role='tool'. A new
-# cursor intentionally starts at zero once so upgrades backfill durable
-# user/assistant content; existing tool rows hit their stable dedup keys.
-_MESSAGE_CURSOR = "state.db:messages:v2"
+_USAGE_STATE_VERSION = state_watermarks.USAGE_STATE_VERSION
 # Hermes persists an incoming user message shortly before firing agent:start.
 # Keep the skew narrow so an old, unrelated row cannot attach to a later turn.
 _USER_START_SKEW_SECONDS = 30.0
-
-
-@dataclass(frozen=True)
-class _InvocationWindow:
-    """One hook-derived turn window for one exact session."""
-
-    invocation_id: str
-    started_at: float
-    ended_at: float | None
 
 
 def poll(
@@ -150,17 +101,51 @@ def poll(
 
     conn = open_sqlite_read_only(db_path)
     try:
-        session_cols = sqlite_table_columns(conn, "sessions")
-        sessions = conn.execute(f"SELECT {_session_select(session_cols)} FROM sessions").fetchall()
-        parent_map = {r["id"]: r["parent_session_id"] for r in sessions}
-        profile_of = {r["id"]: (r["profile_name"] or "default") for r in sessions}
-        invocation_windows = _invocation_windows(outbox)
+        roles = tuple(
+            role
+            for role in ("user", "assistant", "tool")
+            if role in capture.message_roles
+        )
+        messages = state_watermarks.read_messages(outbox, conn, roles)
+        delegations = state_watermarks.read_delegations(outbox, conn)
+        subject_ids = {
+            row["session_id"]
+            for row in messages.rows
+            if isinstance(row["session_id"], str)
+        }
+        subject_ids.update(
+            value
+            for row in delegations.rows
+            for value in (row["origin_session"], row["parent_session_id"])
+            if isinstance(value, str)
+        )
+        sessions = state_watermarks.read_sessions(
+            outbox, conn, subject_ids
+        )
+        usage_ids = subject_ids | {
+            row["id"]
+            for row in sessions.emit_rows
+            if isinstance(row["id"], str)
+        }
+        usage = state_watermarks.read_model_usage(outbox, conn, usage_ids)
+        parent_map = {
+            row["id"]: row["parent_session_id"] for row in sessions.context_rows
+        }
+        profile_of = {
+            row["id"]: (row["profile_name"] or "default")
+            for row in sessions.context_rows
+        }
+        invocation_windows = read_invocation_windows(outbox, usage_ids)
 
         counts: dict[str, int] = defaultdict(int)
-        _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since)
+        _poll_sessions(
+            outbox, sessions.emit_rows, parent_map, counts, home_mode, since
+        )
+        sessions.advance()
         _poll_messages(
             outbox,
             conn,
+            messages.rows,
             parent_map,
             profile_of,
             invocation_windows,
@@ -171,12 +156,29 @@ def poll(
             home,
             since,
         )
+        messages.advance()
         _poll_model_usage(
-            outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode, since
+            outbox,
+            usage.rows,
+            parent_map,
+            profile_of,
+            invocation_windows,
+            counts,
+            home_mode,
+            since,
         )
+        usage.advance()
         _poll_delegations(
-            outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode, since
+            outbox,
+            delegations.rows,
+            parent_map,
+            profile_of,
+            invocation_windows,
+            counts,
+            home_mode,
+            since,
         )
+        delegations.advance()
         return dict(counts)
     finally:
         conn.close()
@@ -266,6 +268,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode, since=None) 
 def _poll_messages(
     outbox,
     conn,
+    rows,
     parent_map,
     profile_of,
     invocation_windows,
@@ -276,50 +279,6 @@ def _poll_messages(
     hermes_home,
     since=None,
 ) -> None:
-    cursor = int(outbox.get_cursor(_MESSAGE_CURSOR) or 0)
-    supported_roles = tuple(
-        role
-        for role in ("user", "assistant", "tool")
-        if role in capture_config.message_roles
-    )
-    columns = sqlite_table_columns(conn, "messages")
-    select_cols = ", ".join(
-        sqlite_column_or_default(columns, name)
-        for name in (
-            "id",
-            "session_id",
-            "role",
-            "tool_name",
-            "tool_call_id",
-            "effect_disposition",
-            "content",
-            "timestamp",
-            "finish_reason",
-            "tool_calls",
-        )
-    )
-
-    # Bind the high-water mark and selected rows to one SQLite snapshot.
-    # End the read transaction before outbox writes so Hermes writers do not
-    # wait for message processing to finish in rollback-journal mode.
-    conn.execute("BEGIN")
-    try:
-        snapshot_max = int(
-            conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-        )
-        upper_bound = max(cursor, snapshot_max)
-        if supported_roles:
-            placeholders = ",".join("?" for _ in supported_roles)
-            rows = conn.execute(
-                f"SELECT {select_cols} FROM messages "
-                f"WHERE id > ? AND id <= ? AND role IN ({placeholders}) ORDER BY id",
-                (cursor, upper_bound, *supported_roles),
-            ).fetchall()
-        else:
-            rows = []
-    finally:
-        conn.rollback()
-
     for r in rows:
         if occurred_before(since, r["timestamp"]):
             continue  # predates the capture horizon; cursor still advances
@@ -428,35 +387,9 @@ def _poll_messages(
             hermes_home,
         )
 
-    # Move the cursor only after every row in this snapshot was processed.
-    outbox.set_cursor(_MESSAGE_CURSOR, upper_bound)
-
-
 def _poll_model_usage(
-    outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode, since=None
+    outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode, since=None
 ) -> None:
-    if not sqlite_table_exists(conn, "session_model_usage"):
-        return
-    columns = sqlite_table_columns(conn, "session_model_usage")
-    select_cols = ", ".join(
-        sqlite_column_or_default(columns, name, default)
-        for name, default in (
-            ("session_id", "NULL"),
-            ("model", "NULL"),
-            ("task", "NULL"),
-            ("api_call_count", "0"),
-            ("input_tokens", "0"),
-            ("output_tokens", "0"),
-            ("cache_read_tokens", "0"),
-            ("reasoning_tokens", "0"),
-            ("estimated_cost_usd", "0"),
-            ("cost_status", "NULL"),
-            ("last_seen", "0"),
-        )
-    )
-    rows = conn.execute(
-        f"SELECT {select_cols} FROM session_model_usage"
-    ).fetchall()
     identities = [
         (str(row["session_id"]), str(row["model"] or ""), str(row["task"] or ""))
         for row in rows
@@ -528,14 +461,8 @@ def _poll_model_usage(
 
 
 def _poll_delegations(
-    outbox, conn, parent_map, profile_of, invocation_windows, counts, home_mode, since=None
+    outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode, since=None
 ) -> None:
-    if not sqlite_table_exists(conn, "async_delegations"):
-        return
-    rows = conn.execute(
-        "SELECT delegation_id, origin_session, parent_session_id, state, delivery_state, "
-        "owner_pid, dispatched_at, event_json, result_json FROM async_delegations"
-    ).fetchall()
     for r in rows:
         if occurred_before(since, r["dispatched_at"]):
             continue  # dispatched before the capture horizon (no backfill)
@@ -574,51 +501,8 @@ def _poll_delegations(
         )
 
 
-def _invocation_windows(outbox: Any) -> dict[str, list[_InvocationWindow]]:
-    """Reconstruct exact-session invocation windows from durable hook events.
-
-    Windows come from the outbox instead of transient drain state, so a tool
-    poll in a later process or after the terminal hook was drained produces
-    the same attribution. A later start caps an incomplete earlier turn.
-    """
-    starts: dict[str, list[tuple[float, str]]] = defaultdict(list)
-    terminals: dict[str, float] = {}
-    for event in outbox.iter_events():
-        event_type = event.get("payload", {}).get("event_type")
-        if event_type not in ("invocation.started", "invocation.completed"):
-            continue
-        # Durable message rows reuse invocation.* as their content carrier.
-        # They must not recursively redefine the hook-derived time windows.
-        if not str(event.get("capture_method", "")).startswith("hook:agent:"):
-            continue
-        sid = event.get("session_id")
-        invocation_id = event.get("invocation_id")
-        if not sid or not invocation_id:
-            continue
-        occurred_at = _number(event.get("occurred_at"))
-        if event_type == "invocation.started":
-            starts[sid].append((occurred_at, invocation_id))
-        else:
-            current = terminals.get(invocation_id)
-            if current is None or occurred_at < current:
-                terminals[invocation_id] = occurred_at
-
-    result: dict[str, list[_InvocationWindow]] = {}
-    for sid, session_starts in starts.items():
-        ordered = sorted(session_starts)
-        windows: list[_InvocationWindow] = []
-        for index, (started_at, invocation_id) in enumerate(ordered):
-            ended_at = terminals.get(invocation_id)
-            next_start = ordered[index + 1][0] if index + 1 < len(ordered) else None
-            if next_start is not None and (ended_at is None or ended_at >= next_start):
-                ended_at = next_start
-            windows.append(_InvocationWindow(invocation_id, started_at, ended_at))
-        result[sid] = windows
-    return result
-
-
 def _infer_invocation(
-    windows: dict[str, list[_InvocationWindow]], sid: str | None, occurred_at: Any
+    windows: dict[str, list[InvocationWindow]], sid: str | None, occurred_at: Any
 ) -> str | None:
     """Return the containing invocation for this exact session and timestamp."""
     if not sid:
@@ -626,7 +510,7 @@ def _infer_invocation(
     timestamp = _number(occurred_at)
     if timestamp <= 0:
         return None
-    candidate: _InvocationWindow | None = None
+    candidate: InvocationWindow | None = None
     for window in windows.get(sid, ()):
         if window.started_at > timestamp:
             break
@@ -639,7 +523,7 @@ def _infer_invocation(
 
 
 def _infer_message_invocation(
-    windows: dict[str, list[_InvocationWindow]],
+    windows: dict[str, list[InvocationWindow]],
     sid: str | None,
     occurred_at: Any,
     role: str,

@@ -223,22 +223,12 @@ Stop the `serve` process through the service manager that runs it. The updater
 does not stop or restart systemd, launchd, a Windows service, or the Hermes
 gateway.
 
-Update to a release tag or a full commit. The updater resolves a tag to its
-full commit before it changes the package:
+Update to a full commit hash:
 
 ```bash
 hermes-flight-recorder update \
   --hermes-home "<HERMES_HOME>" \
-  --ref "<RELEASE_TAG_OR_FULL_COMMIT>"
-```
-
-You can select a branch for a test update. The updater records and installs the
-commit that the branch points to at the start of the update:
-
-```bash
-hermes-flight-recorder update \
-  --hermes-home "<HERMES_HOME>" \
-  --ref "<BRANCH>"
+  --commit "<FULL_COMMIT_HASH>"
 ```
 
 To test the current contents of a local checkout, including uncommitted changes,
@@ -260,9 +250,9 @@ package, it creates a recovery snapshot under
 consistent SQLite backup, the operator key files, recorder and sync configuration,
 the installed-version record, and the old hook.
 
-After pip installs the selected source, a new Python process applies registered
+After pip installs the selected commit, a new Python process applies registered
 outbox migrations, regenerates the hook, and records the installed revision.
-The process stops if that revision differs from the resolved revision. It then
+The process stops if that revision differs from the requested commit. It then
 verifies the installation. The installation id, key, events, delivery state,
 capture cursors, and configuration remain in place unless a documented schema
 migration deliberately changes an identity.

@@ -122,28 +122,27 @@ def test_prepare_update_refuses_while_serve_lock_is_held(tmp_path):
     assert not (fr_home / PENDING_UPDATE_FILENAME).exists()
 
 
-def test_git_ref_resolves_to_an_exact_pip_requirement(tmp_path, monkeypatch):
+def test_git_commit_produces_an_exact_pip_requirement(tmp_path, monkeypatch):
     hermes, fr_home = _hermes(tmp_path)
     revision = "a" * 40
     monkeypatch.setattr(
-        update_module, "resolve_git_revision", lambda source, ref: revision
+        update_module, "validate_git_commit", lambda source, commit: revision
     )
     _backup, pip_command, _completion = prepare_update(
         fr_home,
         hermes,
         source="git+https://example.test/flight-recorder.git",
-        ref="feature/update-test",
+        commit=revision,
     )
     assert pip_command[-1] == f"git+https://example.test/flight-recorder.git@{revision}"
     target = json.loads((fr_home / PENDING_UPDATE_FILENAME).read_text())["target"]
-    assert target["requested_revision"] == "feature/update-test"
-    assert target["resolved_revision"] == revision
+    assert target["commit"] == revision
 
 
 def test_remote_update_requires_a_revision(tmp_path):
     hermes, fr_home = _hermes(tmp_path)
 
-    with pytest.raises(UpdateError, match="requires --ref"):
+    with pytest.raises(UpdateError, match="requires --commit"):
         prepare_update(fr_home, hermes)
 
     assert not (fr_home / BACKUP_DIRNAME).exists()
@@ -152,41 +151,54 @@ def test_remote_update_requires_a_revision(tmp_path):
 def test_revision_check_runs_before_backup(tmp_path, monkeypatch):
     hermes, fr_home = _hermes(tmp_path)
 
-    def missing_revision(source, ref):
+    def missing_revision(source, commit):
         raise UpdateError("revision does not exist")
 
-    monkeypatch.setattr(update_module, "resolve_git_revision", missing_revision)
+    monkeypatch.setattr(update_module, "validate_git_commit", missing_revision)
     with pytest.raises(UpdateError, match="does not exist"):
         prepare_update(
             fr_home,
             hermes,
             source="git+https://example.test/flight-recorder.git",
-            ref="missing",
+            commit="a" * 40,
         )
 
     assert not (fr_home / BACKUP_DIRNAME).exists()
 
 
-def test_resolve_git_tag_uses_peeled_commit():
-    tag_object = "1" * 40
+@pytest.mark.parametrize("commit", ["v1.2.3", "main", "abc1234"])
+def test_remote_update_rejects_any_non_full_commit(tmp_path, commit):
+    hermes, fr_home = _hermes(tmp_path)
+
+    with pytest.raises(UpdateError, match="full 40-character or 64-character hash"):
+        prepare_update(
+            fr_home,
+            hermes,
+            source="git+https://example.test/flight-recorder.git",
+            commit=commit,
+        )
+
+    assert not (fr_home / BACKUP_DIRNAME).exists()
+
+
+def test_full_commit_is_checked_with_a_shallow_fetch():
     commit = "2" * 40
+    commands = []
 
     def runner(command, **_kwargs):
-        assert command[:2] == ["git", "ls-remote"]
-        output = (
-            f"{tag_object}\trefs/tags/v1.2.3\n"
-            f"{commit}\trefs/tags/v1.2.3^{{}}\n"
-        )
+        commands.append(command)
+        output = f"{commit}\n" if command[-2:] == ["rev-parse", "FETCH_HEAD^{commit}"] else ""
         return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
 
     assert (
-        update_module.resolve_git_revision(
+        update_module.validate_git_commit(
             "git+https://example.test/flight-recorder.git",
-            "v1.2.3",
+            commit,
             runner=runner,
         )
         == commit
     )
+    assert commands[1][-2:] == ["https://example.test/flight-recorder.git", commit]
 
 
 def test_update_runs_pip_then_new_package_completion(tmp_path):
@@ -258,13 +270,13 @@ def test_completion_rejects_an_unexpected_installed_revision(tmp_path, monkeypat
     expected = "a" * 40
     installed = "b" * 40
     monkeypatch.setattr(
-        update_module, "resolve_git_revision", lambda source, ref: expected
+        update_module, "validate_git_commit", lambda source, commit: expected
     )
     prepare_update(
         fr_home,
         hermes,
         source="git+https://example.test/flight-recorder.git",
-        ref="v1.2.3",
+        commit=expected,
     )
     monkeypatch.setattr(
         update_module,
@@ -272,7 +284,7 @@ def test_completion_rejects_an_unexpected_installed_revision(tmp_path, monkeypat
         lambda: VersionInfo("1.2.3", installed, "v1.2.3", "git+https://example.test"),
     )
 
-    with pytest.raises(UpdateError, match="does not match resolved revision"):
+    with pytest.raises(UpdateError, match="does not match requested commit"):
         complete_update(fr_home, hermes, log=lambda _message: None)
 
     assert not (fr_home / LAST_UPDATE_FILENAME).exists()
@@ -283,23 +295,22 @@ def test_completion_reports_requested_and_installed_revisions(tmp_path, monkeypa
     installed = update_module.current_version().revision
     assert installed is not None
     monkeypatch.setattr(
-        update_module, "resolve_git_revision", lambda source, ref: installed
+        update_module, "validate_git_commit", lambda source, commit: installed
     )
     prepare_update(
         fr_home,
         hermes,
         source="git+https://example.test/flight-recorder.git",
-        ref="v1.2.3",
+        commit=installed,
     )
     messages: list[str] = []
 
     complete_update(fr_home, hermes, log=messages.append)
 
-    assert "requested revision:   v1.2.3" in messages
+    assert f"requested commit:     {installed}" in messages
     assert f"installed revision:   {installed}" in messages
     record = json.loads((fr_home / INSTALLED_VERSION_FILENAME).read_text())
-    assert record["selected_ref"] == "v1.2.3"
-    assert record["resolved_revision"] == installed
+    assert record["selected_commit"] == installed
     assert record["installed_revision"] == installed
 
 

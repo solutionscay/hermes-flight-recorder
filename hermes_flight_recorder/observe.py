@@ -423,37 +423,46 @@ def _render_task(
     # Pair each attempt's claim with its end by run_id, and remember when each
     # run first appears so the timeline reads oldest-first even though run ids
     # are not chronological (a reclaimed early attempt can carry a higher id).
-    claims: dict[Any, dict[str, Any]] = {}
-    ends: dict[Any, dict[str, Any]] = {}
-    run_time: dict[Any, float] = {}
-    for r in rows:
-        p = r["payload"]
-        rid = p.get("run_id")
-        if rid is not None:
-            t = _as_float(r.get("occurred_at"))
-            if rid not in run_time or t < run_time[rid]:
-                run_time[rid] = t
-        if p["event_type"] == "task.claimed" and rid is not None:
-            claims[rid] = p
-        elif p["event_type"] == "task.attempt_ended":
-            ends[rid] = p
+    claims, ends, run_time = _task_attempt_index(rows)
 
     # Latest status: the tasks.status snapshot on the newest task-level event
     # (rows are ascending, so the last non-attempt event is the newest).
-    status = next(
+    status = _task_status(rows)
+    lines.append(f"▣ task {task_id}  [{status}]  board={board}")
+    _render_task_holder(rows, ends, lines)
+    _render_task_attempts(claims, ends, run_time, lines)
+    _render_task_terminals(rows, lines)
+
+
+def _task_attempt_index(rows):
+    claims: dict[Any, dict[str, Any]] = {}
+    ends: dict[Any, dict[str, Any]] = {}
+    run_time: dict[Any, float] = {}
+    for record in rows:
+        payload = record["payload"]
+        run_id = payload.get("run_id")
+        if run_id is not None:
+            occurred_at = _as_float(record.get("occurred_at"))
+            run_time[run_id] = min(run_time.get(run_id, occurred_at), occurred_at)
+        if payload["event_type"] == "task.claimed" and run_id is not None:
+            claims[run_id] = payload
+        elif payload["event_type"] == "task.attempt_ended":
+            ends[run_id] = payload
+    return claims, ends, run_time
+
+
+def _task_status(rows) -> str:
+    return next(
         (
-            r["payload"].get("status") or "?"
-            for r in reversed(rows)
-            if r["payload"]["event_type"] != "task.attempt_ended"
+            record["payload"].get("status") or "?"
+            for record in reversed(rows)
+            if record["payload"]["event_type"] != "task.attempt_ended"
         ),
         "?",
     )
-    lines.append(f"▣ task {task_id}  [{status}]  board={board}")
 
-    # Current holder + lease: the newest event carrying a holder. Attempt events
-    # are appended in run-id order, not chronological order, so pick by
-    # occurred_at (tie-broken by stream position), not the last row. It is still
-    # held only when that event is an open claim (no attempt_ended for its run).
+
+def _render_task_holder(rows, ends, lines) -> None:
     holder_ev = max(
         (r for r in rows if r["payload"].get("holder") is not None),
         key=lambda r: (_as_float(r.get("occurred_at")), _stream_key(r)),
@@ -467,6 +476,8 @@ def _render_task(
         lease = f"  expires={expires}" if expires is not None else ""
         lines.append(f"    holder {p['holder']}  [{'held' if held else 'released'}]{lease}")
 
+
+def _render_task_attempts(claims, ends, run_time, lines) -> None:
     run_ids = sorted(set(claims) | set(ends), key=lambda rid: (run_time.get(rid, 0.0), rid))
     if run_ids:
         lines.append("    attempts:")
@@ -479,6 +490,8 @@ def _render_task(
                 outcome = "running"
             lines.append(f"      run {rid}  {holder}  {outcome}")
 
+
+def _render_task_terminals(rows, lines) -> None:
     terminals = [r for r in rows if r["payload"]["event_type"] in TASK_TERMINAL_TYPES]
     if terminals:
         lines.append("    terminals:")

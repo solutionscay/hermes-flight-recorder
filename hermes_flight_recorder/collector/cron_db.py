@@ -38,6 +38,11 @@ from ._common import (
     ticker_last_success_path,
     to_epoch,
 )
+from .watermark import Watermark
+
+
+_EXECUTION_WATERMARK = "cron.db:executions:v1"
+_EXECUTION_OVERLAP = 32
 
 
 def poll(
@@ -70,7 +75,24 @@ def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
             ("id", "job_id", "source", "pid", "status", "claimed_at",
              "started_at", "finished_at", "error"),
         )
-        rows = conn.execute(f"SELECT {select} FROM executions").fetchall()
+        watermark = Watermark(
+            outbox, _EXECUTION_WATERMARK, overlap=_EXECUTION_OVERLAP
+        )
+        lower_bound = watermark.lower_bound()
+        conn.execute("BEGIN")
+        try:
+            upper_bound = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM executions"
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"SELECT rowid AS _watermark, {select} FROM executions "
+                "WHERE rowid > ? AND rowid <= ? ORDER BY rowid",
+                (lower_bound, upper_bound),
+            ).fetchall()
+        finally:
+            conn.rollback()
     finally:
         conn.close()
 
@@ -124,6 +146,8 @@ def _poll_executions(outbox, home: Path, counts, home_mode, since=None) -> None:
             content=r["error"] if r["error"] else None,
             dedup_key=f"cron:finished:{exid}",
         )
+
+    watermark.advance(upper_bound)
 
 
 def _poll_heartbeat(outbox, home: Path, counts, home_mode) -> None:

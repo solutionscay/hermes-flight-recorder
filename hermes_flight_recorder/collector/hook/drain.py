@@ -30,6 +30,7 @@ import hashlib
 import json
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -226,133 +227,155 @@ def _pair_invocation_id(outbox: Any, sid: str | None, offset: Any, is_start: boo
     return f"{sid}:hook:{offset}"
 
 
+@dataclass(frozen=True)
+class _MapInput:
+    event_type: str
+    context: dict[str, Any]
+    occurred_at: float
+    source: str
+    capture_method: str
+    runtime: dict[str, Any]
+    offset: Any
+    session_ids: dict[str, str]
+    outbox: Any
+
+
 def _map_event(
     obj: dict[str, Any], offset: Any, session_ids: dict[str, str], outbox: Any
 ) -> tuple[dict[str, Any], str | None] | None:
-    """Map one raw spool record to (envelope_record, content) or None.
-
-    ``session_ids`` accumulates the ``session_key`` -> ``session_id`` map
-    from session-start events, so a later session-end can recover its
-    ``session_id`` within the same drain.
-    """
+    """Map one raw spool record to an envelope record and optional content."""
     event_type = obj.get("event_type")
     if not isinstance(event_type, str):
         return None
-    ctx = obj.get("context") or {}
-    if not isinstance(ctx, dict):
-        ctx = {}
-    occurred_at = float(obj.get("captured_at") or 0.0)
-
+    context = obj.get("context") or {}
+    if not isinstance(context, dict):
+        context = {}
     base = event_type.split(":", 1)[0]
-    capture_method = f"hook:{event_type}"
-    source = f"hook:{base}"
-    runtime = runtime_stamp(base)
+    value = _MapInput(
+        event_type=event_type,
+        context=context,
+        occurred_at=float(obj.get("captured_at") or 0.0),
+        source=f"hook:{base}",
+        capture_method=f"hook:{event_type}",
+        runtime=runtime_stamp(base),
+        offset=offset,
+        session_ids=session_ids,
+        outbox=outbox,
+    )
+    handler = _EVENT_MAPPERS.get(event_type)
+    return handler(value) if handler is not None else None
 
-    if event_type == "gateway:startup":
-        channels = ctx.get("platforms")
-        return (
-            build_record(
-                event_type="runtime.gateway_started",
-                occurred_at=occurred_at,
-                source=source,
-                capture_method=capture_method,
-                runtime=gateway_runtime_stamp(
-                    channels=channels,
-                    gateway_id=_gateway_id(outbox, occurred_at, offset),
-                ),
-                correlation_id=f"gateway:{offset}",
-                # Keep payload.platforms for backward compatibility; the
-                # channels also live on the runtime stamp now.
-                payload=_clean({"platforms": channels}),
-            ),
-            None,
-        )
 
-    if event_type == "session:start":
-        sid = ctx.get("session_id")
-        skey = ctx.get("session_key")
-        if sid and skey:
-            session_ids[skey] = sid
-        return (
-            build_record(
-                event_type="session.created",
-                occurred_at=occurred_at,
-                source=source,
-                capture_method=capture_method,
-                runtime=runtime,
-                correlation_id=sid or skey or f"hook:{offset}",
-                session_id=sid,
-                session_key=skey,
-                payload=_clean(
-                    {
-                        "platform": ctx.get("platform"),
-                        # The originating ingress surface. Hooks observe the
-                        # gateway Platform value; state.db observes the
-                        # session source. Both are open-ended labels for the
-                        # same concept, so neither is enum-normalized.
-                        # `or None` drops the '' the hook sends for a LOCAL
-                        # session (_clean only strips None, not empty string).
-                        "surface": ctx.get("platform") or None,
-                        "user_id": ctx.get("user_id"),
-                    }
+def _map_gateway_start(value: _MapInput):
+    channels = value.context.get("platforms")
+    return (
+        build_record(
+            event_type="runtime.gateway_started",
+            occurred_at=value.occurred_at,
+            source=value.source,
+            capture_method=value.capture_method,
+            runtime=gateway_runtime_stamp(
+                channels=channels,
+                gateway_id=_gateway_id(
+                    value.outbox, value.occurred_at, value.offset
                 ),
             ),
-            None,
-        )
+            correlation_id=f"gateway:{value.offset}",
+            payload=_clean({"platforms": channels}),
+        ),
+        None,
+    )
 
-    if event_type in ("session:end", "session:reset"):
-        skey = ctx.get("session_key")
-        sid = session_ids.get(skey) if skey else None
-        return (
-            build_record(
-                event_type="session.ended",
-                occurred_at=occurred_at,
-                source=source,
-                capture_method=capture_method,
-                runtime=runtime,
-                correlation_id=sid or skey or f"hook:{offset}",
-                session_id=sid,
-                session_key=skey,
-                partial=True,  # provisional: a reset is not a real end, and
-                # end_reason is unknown until the state adapter reconstructs it
-                payload=_clean(
-                    {
-                        "platform": ctx.get("platform"),
-                        "user_id": ctx.get("user_id"),
-                        "reason": "reset" if event_type == "session:reset" else "end",
-                    }
-                ),
+
+def _map_session_start(value: _MapInput):
+    session_id = value.context.get("session_id")
+    session_key = value.context.get("session_key")
+    if session_id and session_key:
+        value.session_ids[session_key] = session_id
+    return (
+        build_record(
+            event_type="session.created",
+            occurred_at=value.occurred_at,
+            source=value.source,
+            capture_method=value.capture_method,
+            runtime=value.runtime,
+            correlation_id=session_id or session_key or f"hook:{value.offset}",
+            session_id=session_id,
+            session_key=session_key,
+            payload=_clean(
+                {
+                    "platform": value.context.get("platform"),
+                    "surface": value.context.get("platform") or None,
+                    "user_id": value.context.get("user_id"),
+                }
             ),
-            None,
-        )
+        ),
+        None,
+    )
 
-    if event_type in ("agent:start", "agent:end"):
-        sid = ctx.get("session_id")
-        is_start = event_type == "agent:start"
-        payload = {
-            "platform": ctx.get("platform"),
-            "user_id": ctx.get("user_id"),
-            "chat_type": ctx.get("chat_type"),
-        }
-        if is_start:
-            payload["thread_id"] = ctx.get("thread_id")
-            payload["chat_id"] = ctx.get("chat_id")
-        return (
-            build_record(
-                event_type="invocation.started" if is_start else "invocation.completed",
-                occurred_at=occurred_at,
-                source=source,
-                capture_method=capture_method,
-                runtime=runtime,
-                correlation_id=sid or f"hook:{offset}",
-                session_id=sid,
-                # No turn id is exposed to hooks; paired via outbox meta so
-                # start and end share one id (see _pair_invocation_id).
-                invocation_id=_pair_invocation_id(outbox, sid, offset, is_start),
-                partial=True,
-                payload=_clean(payload),
+
+def _map_session_end(value: _MapInput):
+    session_key = value.context.get("session_key")
+    session_id = value.session_ids.get(session_key) if session_key else None
+    reason = "reset" if value.event_type == "session:reset" else "end"
+    return (
+        build_record(
+            event_type="session.ended",
+            occurred_at=value.occurred_at,
+            source=value.source,
+            capture_method=value.capture_method,
+            runtime=value.runtime,
+            correlation_id=session_id or session_key or f"hook:{value.offset}",
+            session_id=session_id,
+            session_key=session_key,
+            partial=True,
+            payload=_clean(
+                {
+                    "platform": value.context.get("platform"),
+                    "user_id": value.context.get("user_id"),
+                    "reason": reason,
+                }
             ),
-            None,
-        )
+        ),
+        None,
+    )
 
-    return None  # an event we do not map; ignore it
+
+def _map_agent(value: _MapInput):
+    session_id = value.context.get("session_id")
+    is_start = value.event_type == "agent:start"
+    payload = {
+        "platform": value.context.get("platform"),
+        "user_id": value.context.get("user_id"),
+        "chat_type": value.context.get("chat_type"),
+    }
+    if is_start:
+        payload["thread_id"] = value.context.get("thread_id")
+        payload["chat_id"] = value.context.get("chat_id")
+    return (
+        build_record(
+            event_type="invocation.started" if is_start else "invocation.completed",
+            occurred_at=value.occurred_at,
+            source=value.source,
+            capture_method=value.capture_method,
+            runtime=value.runtime,
+            correlation_id=session_id or f"hook:{value.offset}",
+            session_id=session_id,
+            invocation_id=_pair_invocation_id(
+                value.outbox, session_id, value.offset, is_start
+            ),
+            partial=True,
+            payload=_clean(payload),
+        ),
+        None,
+    )
+
+
+_EVENT_MAPPERS = {
+    "gateway:startup": _map_gateway_start,
+    "session:start": _map_session_start,
+    "session:end": _map_session_end,
+    "session:reset": _map_session_end,
+    "agent:start": _map_agent,
+    "agent:end": _map_agent,
+}

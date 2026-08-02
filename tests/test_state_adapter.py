@@ -309,6 +309,49 @@ def test_state_repoll_is_idempotent(tmp_path):
     assert second.get("tool.call_completed", 0) == 0  # cursor honored: no re-scan of messages
 
 
+def test_old_open_session_is_polled_until_it_finalizes(tmp_path):
+    hh = tmp_path / "hermes"
+    hh.mkdir()
+    db = sqlite3.connect(hh / "state.db")
+    db.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, parent_session_id TEXT, model TEXT,
+            message_count INT, tool_call_count INT, started_at REAL, ended_at REAL,
+            end_reason TEXT, profile_name TEXT, expiry_finalized INT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
+            timestamp REAL, finish_reason TEXT
+        );
+        """
+    )
+    db.execute(
+        "INSERT INTO sessions VALUES "
+        "('old-open', 'cli', NULL, 'm', 0, 0, 1, NULL, NULL, NULL, 0)"
+    )
+    db.executemany(
+        "INSERT INTO sessions VALUES (?, 'cli', NULL, 'm', 0, 0, ?, ?, 'done', NULL, 1)",
+        ((f"closed-{row}", row, row + 0.5) for row in range(2, 102)),
+    )
+    db.commit()
+    db.close()
+    ob = new_outbox(tmp_path)
+
+    state_db.poll(ob, hh)
+    db = sqlite3.connect(hh / "state.db")
+    db.execute(
+        "UPDATE sessions SET ended_at=200, end_reason='done', expiry_finalized=1 "
+        "WHERE id='old-open'"
+    )
+    db.commit()
+    db.close()
+
+    counts = state_db.poll(ob, hh)
+
+    assert counts.get("session.ended") == 1
+
+
 def test_message_insert_during_poll_is_captured_on_next_pass(tmp_path):
     hh = tmp_path / "hermes"; hh.mkdir()
     make_state_db(hh)

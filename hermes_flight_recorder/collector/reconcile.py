@@ -37,12 +37,14 @@ Four detectors, each grounded in the real probe (see issue #6):
 Every finding carries a deterministic ``dedup_key``, so a second run over
 the same durable state appends nothing new (idempotent). The reconciler
 never writes to any Hermes store.
+
+The frequent pass runs bounded runtime-health checks. The less frequent audit
+loads the retained stream and complete durable histories for integrity checks.
 """
 
 from __future__ import annotations
 
 import datetime
-import re
 import time
 from bisect import bisect_left
 from collections import defaultdict
@@ -50,40 +52,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..envelope import SESSION_START_TYPES
-from . import CAPTURE_HEARTBEAT_KEY, knowledge_store
+from . import knowledge_store
 from ._common import (
     INSTALLED_AT_META_KEY,
-    append_and_count,
-    build_record,
     executions_db_path,
-    gateway_starts_log_path,
-    gateway_state_path,
     jobs_path,
-    kanban_board_dbs,
     load_json_dict,
-    occurred_before,
     open_sqlite_read_only,
-    read_float,
     read_home_mode,
     resolve_hermes_home,
-    root_session,
-    runtime_stamp,
-    sqlite_column_or_default,
     sqlite_select_list,
-    sqlite_table_columns,
     sqlite_table_exists,
-    state_db_path,
-    ticker_heartbeat_path,
     to_epoch,
 )
 from .cron_schedule import expected_instants
 from .health import RECONCILE_HEALTH_KEY, record_success
 from .recorder_config import CaptureConfig, KnowledgeConfig, source_enabled
-
-_SOURCE = "reconciler"
-_CAPTURE = "derive:reconciler"
-_PID_RE = re.compile(r"PID (\d+)")
+from .reconcile_common import emit_finding as _emit
+from .reconcile_common import emit_terminal_missing as _emit_terminal_missing
+from .reconcile_coverage import _detect_coverage_gaps
+from .reconcile_runtime import (
+    detect_capture_stale as _detect_capture_stale,
+    detect_gateway_start_failed as _detect_gateway_start_failed,
+    detect_stale_task_leases as _detect_stale_task_leases,
+    ticker_is_stale as _ticker_is_stale,
+)
 
 
 @dataclass(frozen=True)
@@ -142,54 +135,64 @@ def reconcile(
     config: ReconcileConfig | None = None,
     capture_config: CaptureConfig | None = None,
     knowledge_config: KnowledgeConfig | None = None,
+    full_audit: bool = True,
 ) -> dict[str, int]:
-    """One reconcile pass. Returns per-event-type counts of new findings."""
+    """Run health checks and, when selected, the complete integrity audit."""
     cfg = config or ReconcileConfig()
     capture = capture_config or CaptureConfig()
     knowledge = knowledge_config or KnowledgeConfig()
     when = float(now) if now is not None else time.time()
     home = resolve_hermes_home(hermes_home)
-    installation_id = outbox.installation_id
     horizon = _install_horizon(outbox)
-
-    # Read the high-water before the stream. A concurrent append can then be
-    # present but outside this pass's range. It cannot advance the boundary
-    # after the stream snapshot and create a false trailing gap.
-    sequence_high_water = outbox.high_water(installation_id)
-    # Snapshot the retained stream and compact retention summaries once before
-    # any emission. Summaries keep intentionally pruned sequences and durable
-    # subjects from looking like capture loss without restoring event bodies.
-    events = list(outbox.iter_events(installation_id))
-    events.extend(outbox.iter_pruned_summaries(installation_id))
-    # Snapshot the cron executions once too; its enabled detectors share it.
-    exec_rows = (
-        _load_execution_rows(home) if source_enabled(capture, "cron") else []
-    )
     counts: dict[str, int] = defaultdict(int)
 
-    _detect_sequence_gaps(
-        outbox,
-        events,
-        installation_id,
-        counts,
-        when,
-        sequence_high_water,
-        cfg.sequence_gap_limit,
-    )
-    _detect_coverage_gaps(
-        outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
-    )
-    if source_enabled(capture, "hook"):
-        _detect_missing_terminals(outbox, events, counts, when, cfg, horizon)
     if source_enabled(capture, "gateway_log"):
         _detect_gateway_start_failed(outbox, home, counts, when)
-    if source_enabled(capture, "cron"):
-        _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon)
     if source_enabled(capture, "kanban"):
-        _detect_stale_task_leases(outbox, home, counts, when, cfg)
+        _detect_stale_task_leases(
+            outbox, home, counts, when, cfg, bounded=not full_audit
+        )
     _detect_capture_stale(outbox, counts, when, cfg)
-    if source_enabled(capture, "knowledge"):
-        _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
+    ticker_dead = False
+    if source_enabled(capture, "cron"):
+        ticker_dead = _ticker_is_stale(outbox, home, counts, when, cfg)
+
+    if full_audit:
+        installation_id = outbox.installation_id
+        # Bind the stream to a high-water that predates concurrent appends.
+        sequence_high_water = outbox.high_water(installation_id)
+        events = list(outbox.iter_events(installation_id))
+        events.extend(outbox.iter_pruned_summaries(installation_id))
+        exec_rows = (
+            _load_execution_rows(home) if source_enabled(capture, "cron") else []
+        )
+        _detect_sequence_gaps(
+            outbox,
+            events,
+            installation_id,
+            counts,
+            when,
+            sequence_high_water,
+            cfg.sequence_gap_limit,
+        )
+        _detect_coverage_gaps(
+            outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
+        )
+        if source_enabled(capture, "hook"):
+            _detect_missing_terminals(outbox, events, counts, when, cfg, horizon)
+        if source_enabled(capture, "cron"):
+            _detect_missed_cron(
+                outbox,
+                home,
+                exec_rows,
+                counts,
+                when,
+                cfg,
+                horizon,
+                ticker_dead=ticker_dead,
+            )
+        if source_enabled(capture, "knowledge"):
+            _detect_knowledge_gaps(outbox, home, counts, when, cfg, knowledge)
     record_success(outbox, RECONCILE_HEALTH_KEY, when)
     return dict(counts)
 
@@ -264,329 +267,6 @@ def _detect_sequence_gaps(
                 return
 
 
-# --- coverage gaps ------------------------------------------------------
-def _detect_coverage_gaps(
-    outbox, events, home, exec_rows, counts, when, config, capture_config, horizon
-):
-    """A durable row with no captured event proves a dropped capture."""
-    captured = _captured_subjects(events)
-    session_rows = []
-    parent_map = {}
-
-    state_path = state_db_path(home)
-    if source_enabled(capture_config, "state_db") and state_path.exists():
-        conn = open_sqlite_read_only(state_path)
-        try:
-            session_cols = sqlite_table_columns(conn, "sessions")
-            session_select = ", ".join(
-                sqlite_column_or_default(session_cols, name)
-                for name in (
-                    "id",
-                    "source",
-                    "parent_session_id",
-                    "started_at",
-                    "ended_at",
-                    "profile_name",
-                )
-            )
-            session_rows = conn.execute(
-                f"SELECT {session_select} FROM sessions"
-            ).fetchall()
-            parent_map = {r["id"]: r["parent_session_id"] for r in session_rows}
-            session_started = {r["id"]: r["started_at"] for r in session_rows}
-            _coverage_sessions(
-                outbox, session_rows, parent_map, captured, counts, when, config, horizon
-            )
-            _coverage_messages(
-                outbox,
-                conn,
-                parent_map,
-                session_started,
-                captured,
-                counts,
-                when,
-                config,
-                capture_config,
-                horizon,
-            )
-            _coverage_model_usage(
-                outbox, conn, parent_map, session_started, captured, counts, when, config, horizon
-            )
-        finally:
-            conn.close()
-
-    if source_enabled(capture_config, "cron"):
-        for r in exec_rows:
-            if occurred_before(horizon, r["claimed_epoch"] or r["finished_at"]):
-                continue
-            if r["id"] in captured["executions"]:
-                _clear_coverage_pending(outbox, "execution", r["id"])
-                continue
-            _emit_coverage(
-                outbox, counts, when,
-                subject_type="execution", subject_id=r["id"],
-                source_table="cron:executions.db", correlation_id=r["job_id"],
-                grace=config.coverage_grace,
-            )
-    if source_enabled(capture_config, "kanban"):
-        _coverage_kanban(outbox, home, captured, counts, when, config, horizon)
-
-
-def _coverage_sessions(
-    outbox, rows, parent_map, captured, counts, when, config, horizon
-) -> None:
-    for r in rows:
-        if occurred_before(horizon, r["started_at"]):
-            continue
-        sid = r["id"]
-        if sid in captured["sessions"]:
-            _clear_coverage_pending(outbox, "session", sid)
-            continue
-        corr = root_session(sid, parent_map) or sid
-        _emit_coverage(
-            outbox, counts, when,
-            subject_type="session", subject_id=sid,
-            source_table="state.db:sessions", correlation_id=corr,
-            session_id=sid, parent_session_id=r["parent_session_id"],
-            grace=config.coverage_grace,
-        )
-
-
-def _coverage_messages(
-    outbox, conn, parent_map, session_started, captured, counts, when, config, capture_config, horizon
-) -> None:
-    roles = tuple(
-        role
-        for role in ("user", "assistant", "tool")
-        if role in capture_config.message_roles
-    )
-    if not roles:
-        return
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
-    if not columns:
-        return  # no messages table on this Hermes home — nothing to reconcile
-    # Some narrow synthetic/legacy schemas do not expose content. In that
-    # case only tool rows can be proven capture-worthy; user/assistant rows
-    # need content to distinguish real text from empty tool-call scaffolding.
-    if "content" not in columns:
-        roles = tuple(role for role in roles if role == "tool")
-        if not roles:
-            return
-    placeholders = ",".join("?" for _ in roles)
-    content_predicate = (
-        " AND (role='tool' OR (content IS NOT NULL AND length(content) > 0))"
-        if "content" in columns
-        else ""
-    )
-    timestamp_expr = sqlite_column_or_default(columns, "timestamp")
-    rows = conn.execute(
-        f"SELECT id, session_id, {timestamp_expr} FROM messages "
-        f"WHERE role IN ({placeholders}){content_predicate}",
-        roles,
-    ).fetchall()
-    for r in rows:
-        sid = r["session_id"]
-        if occurred_before(horizon, r["timestamp"]):
-            continue
-        if r["timestamp"] is None and occurred_before(horizon, session_started.get(sid)):
-            continue
-        if r["id"] in captured["messages"]:
-            _clear_coverage_pending(outbox, "message", str(r["id"]))
-            continue
-        corr = root_session(sid, parent_map) or sid
-        _emit_coverage(
-            outbox, counts, when,
-            subject_type="message", subject_id=str(r["id"]),
-            source_table="state.db:messages", correlation_id=corr, session_id=sid,
-            grace=config.coverage_grace,
-        )
-
-
-def _coverage_model_usage(
-    outbox, conn, parent_map, session_started, captured, counts, when, config, horizon
-) -> None:
-    if not sqlite_table_exists(conn, "session_model_usage"):
-        return
-    rows = conn.execute(
-        "SELECT session_id, model, task FROM session_model_usage"
-    ).fetchall()
-    for r in rows:
-        if occurred_before(horizon, session_started.get(r["session_id"])):
-            continue
-        key = (r["session_id"], r["model"], r["task"])
-        subject_id = f"{r['session_id']}:{r['model']}:{r['task']}"
-        if key in captured["model_usage"]:
-            _clear_coverage_pending(outbox, "model_usage", subject_id)
-            continue
-        sid = r["session_id"]
-        corr = root_session(sid, parent_map) or sid
-        _emit_coverage(
-            outbox, counts, when,
-            subject_type="model_usage", subject_id=subject_id,
-            source_table="state.db:session_model_usage", correlation_id=corr, session_id=sid,
-            grace=config.coverage_grace,
-        )
-
-
-def _coverage_kanban(outbox, home, captured, counts, when, config, horizon) -> None:
-    """A durable Kanban task/run with no captured ``task.*`` event.
-
-    The Kanban analog of the session/execution coverage diff: every board's
-    ``tasks`` and ``task_runs`` rows are authoritative, so a row the live poll
-    never turned into a captured event is a dropped capture. The subject_id is
-    board-scoped (``board:id``) so equal ids across boards never collide and the
-    shared ``reconcile:cover:*`` dedup key stays unique per board.
-    """
-    for board, db_path in kanban_board_dbs(home):
-        conn = open_sqlite_read_only(db_path)
-        try:
-            present = {
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            if "tasks" in present:
-                task_cols = sqlite_table_columns(conn, "tasks")
-                tasks = conn.execute(
-                    "SELECT id, session_id, "
-                    f"{sqlite_column_or_default(task_cols, 'created_at')}, "
-                    f"{sqlite_column_or_default(task_cols, 'started_at')} FROM tasks"
-                ).fetchall()
-            else:
-                tasks = []
-            if "task_runs" in present:
-                run_cols = sqlite_table_columns(conn, "task_runs")
-                runs = conn.execute(
-                    "SELECT id, task_id, "
-                    f"{sqlite_column_or_default(run_cols, 'started_at')}, "
-                    f"{sqlite_column_or_default(run_cols, 'ended_at')} FROM task_runs"
-                ).fetchall()
-            else:
-                runs = []
-        finally:
-            conn.close()
-        for r in tasks:
-            if occurred_before(horizon, r["created_at"] or r["started_at"]):
-                continue
-            if (board, r["id"]) in captured["tasks"]:
-                _clear_coverage_pending(outbox, "task", f"{board}:{r['id']}")
-                continue
-            _emit_coverage(
-                outbox, counts, when,
-                subject_type="task", subject_id=f"{board}:{r['id']}",
-                source_table=f"kanban:{board}:tasks", correlation_id=r["id"],
-                session_id=r["session_id"],
-                grace=config.coverage_grace,
-            )
-        for r in runs:
-            if occurred_before(horizon, r["started_at"] or r["ended_at"]):
-                continue
-            if (board, r["id"]) in captured["task_runs"]:
-                _clear_coverage_pending(outbox, "task_run", f"{board}:{r['id']}")
-                continue
-            _emit_coverage(
-                outbox, counts, when,
-                subject_type="task_run", subject_id=f"{board}:{r['id']}",
-                source_table=f"kanban:{board}:task_runs", correlation_id=r["task_id"],
-                grace=config.coverage_grace,
-            )
-
-
-def _captured_subjects(events) -> dict[str, set]:
-    """Index the captured stream by the durable subject each event covers."""
-    sessions: set[str] = set()
-    messages: set[int] = set()
-    model_usage: set[tuple] = set()
-    executions: set[str] = set()
-    tasks: set[tuple] = set()
-    task_runs: set[tuple] = set()
-    for e in events:
-        pl = e.get("payload", {})
-        et = pl.get("event_type")
-        if et in SESSION_START_TYPES:
-            if e.get("session_id") is not None:
-                sessions.add(e["session_id"])
-        mid = pl.get("message_row_id")
-        if mid is not None:
-            messages.add(mid)
-        if et == "model.usage_recorded":
-            model_usage.add((e.get("session_id"), pl.get("model"), pl.get("task")))
-        elif et == "cron.run_claimed":
-            exid = pl.get("execution_id")
-            if exid is not None:
-                executions.add(exid)
-        elif isinstance(et, str) and et.startswith("task."):
-            # Every task.* event carries board + task_id; task.claimed and
-            # task.attempt_ended additionally carry the owning run_id.
-            board = pl.get("board")
-            task_id = pl.get("task_id")
-            if board is not None and task_id is not None:
-                tasks.add((board, task_id))
-            run_id = pl.get("run_id")
-            if board is not None and run_id is not None:
-                task_runs.add((board, run_id))
-    return {
-        "sessions": sessions,
-        "messages": messages,
-        "model_usage": model_usage,
-        "executions": executions,
-        "tasks": tasks,
-        "task_runs": task_runs,
-    }
-
-
-def _emit_coverage(
-    outbox, counts, when, *, subject_type, subject_id, source_table, correlation_id,
-    grace, session_id=None, parent_session_id=None,
-) -> None:
-    if not _coverage_ready(outbox, subject_type, subject_id, when, grace):
-        return
-    _emit(
-        outbox, counts,
-        event_type="reconcile.gap_detected",
-        occurred_at=when,
-        correlation_id=correlation_id,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        partial=True,  # inferred: the poll saw a row the live stream missed
-        payload={
-            "gap_kind": "uncaptured_row",
-            "subject_type": subject_type,
-            "subject_id": subject_id,
-            "source_table": source_table,
-        },
-        dedup_key=f"reconcile:cover:{subject_type}:{subject_id}",
-    )
-
-
-def _coverage_pending_key(subject_type: str, subject_id: Any) -> str:
-    return f"reconcile:coverage_pending:{subject_type}:{subject_id}"
-
-
-def _clear_coverage_pending(outbox, subject_type: str, subject_id: Any) -> None:
-    outbox.delete_meta(_coverage_pending_key(subject_type, subject_id))
-
-
-def _coverage_ready(
-    outbox, subject_type: str, subject_id: Any, when: float, grace: float
-) -> bool:
-    """Wait through a capture tick before an absent durable row is a gap."""
-    if grace <= 0:
-        return True
-    key = _coverage_pending_key(subject_type, subject_id)
-    raw = outbox.get_meta(key)
-    if raw is None:
-        outbox.set_meta(key, repr(when))
-        return False
-    try:
-        first_seen = float(raw)
-    except (TypeError, ValueError):
-        outbox.set_meta(key, repr(when))
-        return False
-    return when - first_seen >= grace
-
-
 # --- missing terminals --------------------------------------------------
 def _detect_missing_terminals(outbox, events, counts, when, cfg, horizon) -> None:
     """An invocation.started with no invocation.completed, past its window.
@@ -641,149 +321,18 @@ def _detect_missing_terminals(outbox, events, counts, when, cfg, horizon) -> Non
         )
 
 
-def _emit_terminal_missing(
-    outbox,
-    counts,
-    *,
-    occurred_at,
-    correlation_id,
-    subject_type,
-    subject_id,
-    start_event_type,
-    expected_terminal_event_type,
-    dedup_key,
-    details=None,
-    session_id=None,
-    parent_session_id=None,
-    invocation_id=None,
-    profile="default",
-) -> None:
-    payload = {
-        "subject_type": subject_type,
-        "subject_id": subject_id,
-        "start_event_type": start_event_type,
-        "expected_terminal_event_type": expected_terminal_event_type,
-    }
-    payload.update(details or {})
-    _emit(
-        outbox,
-        counts,
-        event_type="reconcile.terminal_missing",
-        occurred_at=occurred_at,
-        correlation_id=correlation_id,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        invocation_id=invocation_id,
-        profile=profile,
-        partial=True,
-        payload=payload,
-        dedup_key=dedup_key,
-    )
-
-
-# --- stale task leases --------------------------------------------------
-def _detect_stale_task_leases(outbox, home, counts, when, cfg) -> None:
-    """An open Kanban claim whose lease lapsed with a dead heartbeat.
-
-    The Kanban analog of the stale-ticker signal. A ``task_runs`` row still open
-    (``outcome`` NULL) whose ``claim_expires`` passed — past a grace, with a
-    heartbeat stale beyond the window — is a worker that died mid-attempt: no
-    terminal is coming until Hermes reclaims it. The durable row is
-    authoritative and current (a live worker renews ``claim_expires`` by
-    heartbeat, so a lapsed lease *is* the death signal), exactly as a cron
-    execution is judged from its own ``finished_at``.
-    """
-    for run in _load_open_task_runs(home):
-        if not _lease_is_dead(run, when, cfg):
-            continue
-        board, run_id = run["board"], run["id"]
-        _emit_terminal_missing(
-            outbox,
-            counts,
-            occurred_at=when,
-            correlation_id=run["task_id"],
-            subject_type="task_run",
-            subject_id=str(run_id),
-            start_event_type="task.claimed",
-            expected_terminal_event_type="task.attempt_ended",
-            details={
-                "board": board,
-                "task_id": run["task_id"],
-                "run_id": run_id,
-                "holder": run["claim_lock"],
-                "claim_expires": run["claim_expires"],
-                "last_heartbeat_at": run["last_heartbeat_at"],
-                "start_occurred_at": run["started_at"],
-                "age_seconds": when - run["claim_expires"],
-            },
-            dedup_key=f"reconcile:terminal:task_run:{board}:{run_id}",
-        )
-
-
-def _lease_is_dead(run: dict[str, Any], when: float, cfg: ReconcileConfig) -> bool:
-    """Whether an open attempt's lease has lapsed with a dead heartbeat.
-
-    The shared stale-lease predicate: the ``claim_expires`` lapsed past the
-    grace, and the heartbeat is stale beyond the window (or absent). A live
-    worker renews ``claim_expires`` by heartbeat, so both failing means the
-    worker is gone. Public to the live-check gate so it validates this exact
-    boundary rather than a copy of it.
-    """
-    expires = run["claim_expires"]
-    if expires is None or when - expires <= cfg.task_lease_grace:
-        return False  # no lease, or still within its (possibly renewed) lease
-    hb = run["last_heartbeat_at"]
-    if hb is not None and when - hb <= cfg.task_heartbeat_stale_after:
-        return False  # a fresh heartbeat — the worker is alive, Hermes will renew
-    return True
-
-
-def _load_open_task_runs(home: Path) -> list[dict[str, Any]]:
-    """Every still-open attempt (``outcome`` NULL) across all boards."""
-    runs: list[dict[str, Any]] = []
-    for board, db_path in kanban_board_dbs(home):
-        conn = open_sqlite_read_only(db_path)
-        try:
-            cols = sqlite_table_columns(conn, "task_runs")
-            if "outcome" not in cols:
-                rows = []  # no such table/column — nothing open to judge
-            else:
-                select = sqlite_select_list(
-                    conn,
-                    "task_runs",
-                    ("id", "task_id", "claim_lock", "claim_expires", "worker_pid",
-                     "last_heartbeat_at", "started_at"),
-                )
-                rows = conn.execute(
-                    f"SELECT {select} FROM task_runs WHERE outcome IS NULL"
-                ).fetchall()
-        finally:
-            conn.close()
-        for r in rows:
-            runs.append(
-                {
-                    "board": board,
-                    "id": r["id"],
-                    "task_id": r["task_id"],
-                    "claim_lock": r["claim_lock"],
-                    "claim_expires": r["claim_expires"],
-                    "worker_pid": r["worker_pid"],
-                    "last_heartbeat_at": r["last_heartbeat_at"],
-                    "started_at": r["started_at"],
-                }
-            )
-    return runs
-
-
 # --- missed cron --------------------------------------------------------
-def _detect_missed_cron(outbox, home, exec_rows, counts, when, cfg, horizon) -> None:
+def _detect_missed_cron(
+    outbox, home, exec_rows, counts, when, cfg, horizon, *, ticker_dead=None
+) -> None:
     jobs = _load_jobs(jobs_path(home))
     if not jobs:
         return
 
     # A stale heartbeat means the whole scheduler is dead: one installation
     # signal, and suppress the per-job trailing catch-up it would explain.
-    ticker_dead = _ticker_is_stale(outbox, home, counts, when, cfg)
+    if ticker_dead is None:
+        ticker_dead = _ticker_is_stale(outbox, home, counts, when, cfg)
 
     exec_by_job: dict[str, list[float]] = defaultdict(list)
     for r in exec_rows:
@@ -921,203 +470,6 @@ def _cron_missed(expr, execs, created, now, cfg, tz=None):
         is_tail = expected[-1] >= now - 60.0
         runs.append((run_first, run_count, is_tail))
     return runs
-
-
-# --- gateway start failure ----------------------------------------------
-def _detect_gateway_start_failed(outbox, home, counts, when) -> None:
-    """A gateway that failed to start, hit a token conflict, or vanished.
-
-    Hermes fires the ``gateway:startup`` hook only on success, so a failed
-    start emits no hook event — it is invisible to live capture (the same
-    silent-failure class as ``cron.run_missed``). Hermes does write the
-    failure durably, so the reconciler reads it read-only:
-
-    - **Case A — startup_failed.** ``gateway_state.json`` has
-      ``gateway_state='startup_failed'`` with an ``exit_reason``.
-    - **Case B — token_conflict.** A duplicate bot token keeps the gateway
-      degraded/running but marks the platform with an ``error_code`` ending
-      ``_lock`` (e.g. ``discord-bot-token_lock``) / an "already in use (PID N)"
-      message. Names the platform and the conflicting PID.
-    - **Case C — absent.** ``gateway-starts.log`` shows the gateway started
-      before, but its runtime status file is gone. Conservative: only when no
-      ``gateway_state.json`` exists at all, so a clean ``gateway stop`` (which
-      leaves ``gateway_state='stopped'``) is never flagged.
-
-    Never keys liveness off ``updated_at`` — a healthy idle gateway never
-    advances it. Every finding is ``partial``; each dedup key is anchored on a
-    durable event time (never the reconcile-run ``when``), so a second pass
-    over the same state appends nothing. The raw ``exit_reason`` /
-    ``error_message`` is sensitive and goes only into encrypted content.
-    """
-    state_path = gateway_state_path(home)
-    if state_path.exists():
-        data = load_json_dict(state_path)
-        state = data.get("gateway_state")
-        updated_at = to_epoch(data.get("updated_at")) or 0.0
-
-        if state == "startup_failed":
-            reason = data.get("exit_reason") or ""
-            _emit(
-                outbox, counts,
-                event_type="runtime.gateway_start_failed",
-                occurred_at=updated_at or when,
-                correlation_id="gateway",
-                partial=True,
-                payload={"reason_class": _classify_gateway_reason(reason), "gateway_state": state},
-                content=reason or None,
-                dedup_key=f"reconcile:gateway_start_failed:startup_failed:{int(updated_at)}",
-            )
-
-        platforms = data.get("platforms")
-        if isinstance(platforms, dict):
-            for pname, pinfo in platforms.items():
-                if not isinstance(pinfo, dict):
-                    continue
-                code = pinfo.get("error_code") or ""
-                msg = pinfo.get("error_message") or ""
-                if not (code.endswith("_lock") or "already in use" in msg):
-                    continue
-                pid = _parse_pid(msg)
-                p_updated = to_epoch(pinfo.get("updated_at")) or updated_at or when
-                _emit(
-                    outbox, counts,
-                    event_type="runtime.gateway_start_failed",
-                    occurred_at=p_updated,
-                    correlation_id=f"gateway:{pname}",
-                    partial=True,
-                    payload={
-                        "reason_class": "token_conflict",
-                        "gateway_state": state,
-                        "platform": pname,
-                        "error_code": code or None,
-                        "conflicting_pid": pid,
-                    },
-                    content=msg or None,
-                    dedup_key=(
-                        f"reconcile:gateway_start_failed:token_conflict:"
-                        f"{pname}:{pid if pid is not None else 'unknown'}"
-                    ),
-                )
-        return
-
-    # Case C: started before (history) but the status file is gone.
-    last_start = _last_start_epoch(gateway_starts_log_path(home))
-    if last_start is not None:
-        _emit(
-            outbox, counts,
-            event_type="runtime.gateway_start_failed",
-            occurred_at=last_start,
-            correlation_id="gateway",
-            partial=True,
-            payload={"reason_class": "absent", "last_start_at": last_start},
-            dedup_key=f"reconcile:gateway_start_failed:absent:{int(last_start)}",
-        )
-
-
-def _classify_gateway_reason(text: str) -> str:
-    """Map a gateway exit_reason to a plaintext reason class. Best-effort."""
-    low = (text or "").lower()
-    if "already in use" in low or "_lock" in low or "conflict" in low:
-        return "token_conflict"
-    if "policy" in low:
-        return "policy_open"
-    if "config" in low or "invalid" in low or "not found" in low:
-        return "config_invalid"
-    return "unknown"
-
-
-def _parse_pid(text: str) -> int | None:
-    match = _PID_RE.search(text or "")
-    return int(match.group(1)) if match else None
-
-
-def _last_start_epoch(path: Path) -> float | None:
-    """The last epoch in gateway-starts.log (a newline list of floats)."""
-    if not path.exists():
-        return None
-    last: float | None = None
-    try:
-        for line in path.read_text().splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                last = float(stripped)
-            except ValueError:
-                continue
-    except OSError:
-        return None
-    return last
-
-
-# --- ticker liveness ----------------------------------------------------
-def _ticker_is_stale(outbox, home, counts, when, cfg) -> bool:
-    hb = read_float(ticker_heartbeat_path(home))
-    if hb is None:
-        return False
-    staleness = when - hb
-    if staleness <= cfg.ticker_stale_after:
-        return False
-    _emit_terminal_missing(
-        outbox,
-        counts,
-        occurred_at=when,
-        correlation_id="cron:ticker",
-        subject_type="cron_ticker",
-        subject_id="cron:ticker",
-        start_event_type="cron.ticker_heartbeat",
-        expected_terminal_event_type="cron.ticker_heartbeat",
-        details={
-            "heartbeat": hb,
-            "staleness_seconds": staleness,
-        },
-        dedup_key=f"reconcile:ticker_stale:{int(hb)}",
-    )
-    return True
-
-
-# --- capture liveness ---------------------------------------------------
-def _detect_capture_stale(outbox, counts, when, cfg) -> None:
-    """The Flight Recorder watching its OWN capture loop.
-
-    ``run_pass`` stamps ``capture:last_success_at`` on every completed pass.
-    The reconciler fires on its own realtime timer, independent of capture, so
-    a capture loop that stopped ticking — a dead timer, a crash-loop, a hung
-    pass — leaves this heartbeat frozen while reconcile keeps running. That is
-    exactly the silent outage that ran ~3h20m unseen: capture reported
-    active/success while never firing.
-
-    A heartbeat older than the window emits ONE ``reconcile.capture_stale``
-    finding, keyed on the frozen heartbeat so a dead capture alerts once, not
-    once per reconcile minute. An absent heartbeat means no baseline yet (a
-    fresh install where capture never ran); it raises no alert, mirroring the
-    ticker-staleness rule. The signal is installation-wide, so it correlates on
-    the installation id like a sequence gap does.
-    """
-    raw = outbox.get_meta(CAPTURE_HEARTBEAT_KEY)
-    if raw is None:
-        return
-    try:
-        last = float(raw)
-    except (TypeError, ValueError):
-        return  # malformed heartbeat: treat as no baseline, never crash
-    staleness = when - last
-    if staleness <= cfg.capture_stale_after:
-        return
-    _emit(
-        outbox,
-        counts,
-        event_type="reconcile.capture_stale",
-        occurred_at=when,
-        correlation_id=outbox.installation_id,
-        partial=True,
-        payload={
-            "last_success_at": last,
-            "staleness_seconds": staleness,
-            "threshold_seconds": cfg.capture_stale_after,
-        },
-        dedup_key=f"reconcile:capture_stale:{int(last)}",
-    )
 
 
 # --- knowledge drift + event gap ----------------------------------------
@@ -1283,37 +635,3 @@ def _tz_of(value: Any) -> datetime.tzinfo | None:
         return datetime.datetime.fromisoformat(value).tzinfo
     except ValueError:
         return None
-
-
-# --- emit ---------------------------------------------------------------
-def _emit(
-    outbox,
-    counts,
-    *,
-    event_type: str,
-    occurred_at: float,
-    correlation_id: str,
-    payload: dict[str, Any],
-    dedup_key: str,
-    session_id: str | None = None,
-    parent_session_id: str | None = None,
-    invocation_id: str | None = None,
-    profile: str = "default",
-    partial: bool = True,
-    content: str | None = None,
-) -> None:
-    rec = build_record(
-        event_type=event_type,
-        occurred_at=occurred_at,
-        source=_SOURCE,
-        capture_method=_CAPTURE,
-        runtime=runtime_stamp("reconciler"),
-        correlation_id=correlation_id,
-        payload=payload,
-        session_id=session_id,
-        parent_session_id=parent_session_id,
-        invocation_id=invocation_id,
-        profile=profile,
-        partial=partial,
-    )
-    append_and_count(outbox, counts, rec, content=content, dedup_key=dedup_key)

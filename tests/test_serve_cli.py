@@ -33,6 +33,31 @@ class _DummyOutbox:
         pass
 
 
+def test_complete_audit_has_its_own_slower_schedule():
+    config = recorder_config.RecorderConfig(
+        reconcile=recorder_config.ReconcileRuntimeConfig(
+            interval_seconds=60.0,
+            audit_interval_seconds=3600.0,
+        )
+    )
+
+    tasks = S._build_tasks(
+        _DummyOutbox(),
+        "unused-hermes-home",
+        config,
+        None,
+        None,
+        None,
+        None,
+        S.configure_logging(),
+    )
+
+    by_name = {task.name: task for task in tasks}
+    assert by_name["reconcile"].interval == 60.0
+    assert by_name["audit"].interval == 3600.0
+    assert by_name["audit"].deadline > by_name["reconcile"].deadline
+
+
 def _run_serve(monkeypatch, *, capture, reconcile, stop, **kw):
     monkeypatch.setattr(S, "_capture", capture)
     monkeypatch.setattr(S, "_reconcile", reconcile)

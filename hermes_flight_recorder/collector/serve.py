@@ -160,6 +160,15 @@ def _build_tasks(
     tasks.append(
         _Task("reconcile", rec_iv, lambda: _reconcile(outbox, hermes_home, config, log), start)
     )
+    audit_iv = config.reconcile.audit_interval_seconds
+    tasks.append(
+        _Task(
+            "audit",
+            audit_iv,
+            lambda: _audit(outbox, hermes_home, config, log),
+            start + audit_iv,
+        )
+    )
 
     if sync_run is not None:
         sync_iv = sync_interval or config.sync.interval_seconds or _SYNC_FALLBACK_INTERVAL
@@ -274,8 +283,22 @@ def _reconcile(outbox, hermes_home, config, log: logging.Logger) -> None:
         hermes_home,
         capture_config=config.capture,
         knowledge_config=config.knowledge,
+        full_audit=False,
     )
     log.info("reconcile: %d finding(s)", sum(counts.values()))
+
+
+def _audit(outbox, hermes_home, config, log: logging.Logger) -> None:
+    from .reconcile import reconcile
+
+    counts = reconcile(
+        outbox,
+        hermes_home,
+        capture_config=config.capture,
+        knowledge_config=config.knowledge,
+        full_audit=True,
+    )
+    log.info("audit: %d finding(s)", sum(counts.values()))
 
 
 def _sync(outbox, transport, config, log: logging.Logger) -> None:
