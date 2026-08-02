@@ -61,6 +61,7 @@ def poll(
     *,
     knowledge_config: Any = None,
     on_artifact_error: Callable[[str, Exception], None] | None = None,
+    home_mode: str | None = None,
 ) -> dict[str, int]:
     """One read-only scan of the knowledge surface.
 
@@ -69,12 +70,17 @@ def poll(
     not yet have one (so the encrypted server ledger receives both foreground and
     background writes, and any versions that predate this transport are
     backfilled). Returns per-event-type counts.
+
+    ``home_mode`` is the terminal home-mode policy resolved by the caller
+    (``run_pass`` resolves it once per capture pass, issue #164); when None,
+    a standalone call resolves it itself.
     """
     from .recorder_config import KnowledgeConfig
 
     config = knowledge_config or KnowledgeConfig()
     home = resolve_hermes_home(hermes_home)
-    home_mode = read_home_mode(hermes_home)
+    if home_mode is None:
+        home_mode = read_home_mode(hermes_home)
     runtime = runtime_stamp("knowledge", home_mode=home_mode)
 
     seen: set[str] = set()

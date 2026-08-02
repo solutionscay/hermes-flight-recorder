@@ -155,3 +155,41 @@ def test_knowledge_artifact_errors_set_source_failure(tmp_path, monkeypatch):
     assert state["consecutive_failures"] == 1
     assert state["last_error_at"] == 300.0
     assert "PermissionError" in state["last_error"]
+
+
+def test_capture_pass_reads_config_yaml_at_most_once(tmp_path, monkeypatch):
+    """One capture pass resolves home_mode exactly once (issue #164).
+
+    Before the fix, every durable-store poll re-read ``config.yaml`` — and
+    ``gateway_log`` re-read it once per matched log line. ``run_pass`` now
+    resolves it a single time and hands the string down.
+    """
+    from pathlib import Path
+
+    home = tmp_path / "hermes"
+    (home / "logs").mkdir(parents=True)
+    (home / "config.yaml").write_text("terminal:\n  home_mode: profile\n")
+    # Two matched failure lines: the per-line re-read was the worst offender.
+    (home / "logs" / "agent.log").write_text(
+        "2026-08-01 10:00:00,000 ERROR [S1] agent.conversation_loop: "
+        "API call failed after 3 retries. HTTP 429 | provider=p model=m\n"
+        "2026-08-01 10:00:01,000 ERROR [S2] agent.conversation_loop: "
+        "API call failed after 3 retries. HTTP 500 | provider=p model=m\n"
+    )
+
+    config_reads: list[Path] = []
+    real_read_text = Path.read_text
+
+    def counting_read_text(self, *args, **kwargs):
+        if self.name == "config.yaml":
+            config_reads.append(self)
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    ob = Outbox.open(tmp_path / "bridge")
+    ob.initialize()
+    totals = run_pass(ob, home, on_source_error=lambda *_: None)
+
+    assert totals.get("model.call_failed") == 2  # the log lines were captured
+    assert len(config_reads) == 1

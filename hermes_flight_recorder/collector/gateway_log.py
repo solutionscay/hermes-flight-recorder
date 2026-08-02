@@ -39,17 +39,26 @@ _HTTP_STATUS = re.compile(r"\bHTTP\s+(\d{3})\b", re.IGNORECASE)
 
 
 def poll(
-    outbox: Any, hermes_home: str | Path | None = None, *, since: float | None = None
+    outbox: Any,
+    hermes_home: str | Path | None = None,
+    *,
+    since: float | None = None,
+    home_mode: str | None = None,
 ) -> dict[str, int]:
     """Capture newly appended terminal provider failures from ``agent.log``.
 
     ``since`` is the capture horizon (``install --no-backfill``); failures logged
-    before it are skipped so history is not backfilled.
+    before it are skipped so history is not backfilled. ``home_mode`` is the
+    terminal home-mode policy resolved by the caller (``run_pass`` resolves it
+    once per capture pass, issue #164); when None, a standalone call resolves
+    it itself — in either case exactly once, never per matched log line.
     """
     home = resolve_hermes_home(hermes_home)
     path = home / "logs" / "agent.log"
     if not path.exists():
         return {}
+    if home_mode is None:
+        home_mode = read_home_mode(hermes_home)
 
     cursor = _read_cursor(outbox, path)
     counts: dict[str, int] = defaultdict(int)
@@ -68,7 +77,7 @@ def poll(
                 outbox,
                 line.decode("utf-8", errors="replace").rstrip("\r\n"),
                 counts,
-                home,
+                home_mode,
                 since,
             )
 
@@ -94,7 +103,7 @@ def _read_cursor(outbox: Any, path: Path) -> int:
 
 
 def _capture_line(
-    outbox: Any, line: str, counts: dict[str, int], home: Path, since: float | None = None
+    outbox: Any, line: str, counts: dict[str, int], home_mode: str, since: float | None = None
 ) -> None:
     match = _FAILURE.match(line)
     if match is None:
@@ -119,7 +128,7 @@ def _capture_line(
         occurred_at=occurred_at,
         source="logs:agent.log",
         capture_method="poll:gateway-log",
-        runtime=runtime_stamp("model", home_mode=read_home_mode(home)),
+        runtime=runtime_stamp("model", home_mode=home_mode),
         correlation_id=fields["session_id"],
         session_id=fields["session_id"],
         payload=payload,

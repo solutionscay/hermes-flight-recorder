@@ -76,15 +76,23 @@ _RUN_DISPOSITION = {
 }
 
 def poll(
-    outbox: Any, hermes_home: str | Path | None = None, *, since: float | None = None
+    outbox: Any,
+    hermes_home: str | Path | None = None,
+    *,
+    since: float | None = None,
+    home_mode: str | None = None,
 ) -> dict[str, int]:
     """One read-only poll pass over every Kanban board. Returns per-type counts.
 
     ``since`` is the capture horizon (``install --no-backfill``); task events and
-    attempts older than it are skipped so history is not backfilled.
+    attempts older than it are skipped so history is not backfilled. ``home_mode``
+    is the terminal home-mode policy resolved by the caller (``run_pass``
+    resolves it once per capture pass, issue #164); when None, a standalone
+    call resolves it itself.
     """
     home = resolve_hermes_home(hermes_home)
-    home_mode = read_home_mode(hermes_home)
+    if home_mode is None:
+        home_mode = read_home_mode(hermes_home)
     counts: dict[str, int] = defaultdict(int)
     for board, db_path in kanban_board_dbs(home):
         _poll_board(outbox, board, db_path, counts, home_mode, since)

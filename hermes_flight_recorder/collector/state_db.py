@@ -87,6 +87,7 @@ def poll(
     capture_config: CaptureConfig | None = None,
     knowledge_config: Any = None,
     since: float | None = None,
+    home_mode: str | None = None,
 ) -> dict[str, int]:
     """One read-only poll pass over ``state.db``. Returns per-type counts.
 
@@ -94,6 +95,10 @@ def poll(
     whose activity predates it are skipped, so history is not backfilled. The
     session parent/profile maps are still built from every row so post-horizon
     activity in an older session keeps its attribution.
+
+    ``home_mode`` is the terminal home-mode policy resolved by the caller
+    (``run_pass`` resolves it once per capture pass, issue #164); when None,
+    a standalone call resolves it itself.
     """
     home = resolve_hermes_home(hermes_home)
     db_path = state_db_path(home)
@@ -103,7 +108,8 @@ def poll(
     # Resolve configuration and the terminal home-mode policy once per poll,
     # not per record.
     capture = capture_config or CaptureConfig()
-    home_mode = read_home_mode(hermes_home)
+    if home_mode is None:
+        home_mode = read_home_mode(hermes_home)
 
     conn = open_sqlite_read_only(db_path)
     try:
