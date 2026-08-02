@@ -508,7 +508,7 @@ def test_fleet_mutation_uses_disk_after_state_after_restart(tmp_path, monkeypatc
     assert counts["knowledge.record_written"] == 1
     versions = reopened.knowledge_versions("skill:fleet")
     assert [version["seq"] for version in versions] == [1, 2]
-    assert versions[-1]["manifest"][0]["blob_hash"] == reopened._content_hash(
+    assert versions[-1]["manifest"][0]["blob_hash"] == reopened.content_hash(
         b"# Fleet\nv2\n"
     )
     assert not keystore.has_secret(bridge)

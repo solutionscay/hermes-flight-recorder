@@ -209,7 +209,6 @@ class Outbox(KnowledgeOutboxMixin):
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._flight_recorder_home = self.path.parent
         self._conn = sqlite3.connect(str(self.path), isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -222,14 +221,19 @@ class Outbox(KnowledgeOutboxMixin):
         # Cache of DEKs unwrapped for reads this process, keyed by key_version,
         # so decrypting many records under one epoch unwraps once.
         self._dek_by_version: dict[str, bytes] = {}
-        # Keep the current knowledge state in process memory. A fleet host can
-        # use it for consecutive mutations without a private decryption key.
-        self._knowledge_plaintext: dict[str, dict[str, bytes]] = {}
+        # In-memory knowledge state (plaintext + stat caches) is owned by
+        # KnowledgeOutboxMixin; this only triggers its initialization.
+        self._init_knowledge_state()
         self._installation_id: str | None = None
         # Depth of the open ``batch()`` context; 0 means every append runs in
         # its own ``BEGIN IMMEDIATE`` transaction (the historical behavior).
         self._batch_depth = 0
         self._apply_migrations()
+
+    @property
+    def flight_recorder_home(self) -> Path:
+        """The flight recorder home directory this outbox lives in."""
+        return self.path.parent
 
     # --- construction ---------------------------------------------------
     @classmethod
@@ -358,7 +362,7 @@ class Outbox(KnowledgeOutboxMixin):
         fleet agent already holds ``operator.pub`` and no private key; its
         public key is used and no key is minted.
         """
-        home = self._flight_recorder_home
+        home = self.flight_recorder_home
         if not keystore.has_public(home) and not keystore.has_secret(home):
             keystore.ensure_solo_keypair(home)
         return keystore.load_public_key(home)
@@ -448,7 +452,7 @@ class Outbox(KnowledgeOutboxMixin):
         """
         if keypair is not None:
             return keypair
-        return keystore.load_keypair(self._flight_recorder_home)
+        return keystore.load_keypair(self.flight_recorder_home)
 
     def _dek_for_version(
         self, key_version: str, keypair: cc.OperatorKeyPair
@@ -519,7 +523,7 @@ class Outbox(KnowledgeOutboxMixin):
         )
         expected_bytes = payload.get("content_plaintext_bytes")
         expected_hash = payload.get("content_plaintext_hash")
-        if expected_bytes != len(raw) or expected_hash != self._content_hash(raw):
+        if expected_bytes != len(raw) or expected_hash != self.content_hash(raw):
             raise OutboxError(f"chunked content {content_ref} failed verification")
         return raw
 
@@ -743,7 +747,7 @@ class Outbox(KnowledgeOutboxMixin):
                         "content_ref": rec["event_id"],
                         "content_chunk_count": len(chunk_records),
                         "content_plaintext_bytes": len(raw_content),
-                        "content_plaintext_hash": self._content_hash(raw_content),
+                        "content_plaintext_hash": self.content_hash(raw_content),
                     }
                 )
                 rec["payload"] = payload
@@ -814,7 +818,7 @@ class Outbox(KnowledgeOutboxMixin):
     ) -> list[dict[str, Any]]:
         """Build encrypted transport chunks that immediately precede a parent."""
         chunk_count = (len(raw) + _CONTENT_CHUNK_BYTES - 1) // _CONTENT_CHUNK_BYTES
-        full_hash = self._content_hash(raw)
+        full_hash = self.content_hash(raw)
         records = []
         for index, offset in enumerate(
             range(0, len(raw), _CONTENT_CHUNK_BYTES)

@@ -391,7 +391,7 @@ def _snapshot_files(
                 )
             )
             continue
-        digest = outbox.put_blob(raw) if store else outbox._content_hash(raw)
+        digest = outbox.put_blob(raw) if store else outbox.content_hash(raw)
         manifest.append({"path": rel_path, "blob_hash": digest})
         plaintext_files[rel_path] = raw
         captured_bytes += len(raw)
@@ -546,20 +546,6 @@ def _stat_fingerprint(
     return fingerprint
 
 
-def _stat_cache(outbox: Any) -> dict[str, dict[str, Any]]:
-    """The per-process stat cache, scoped to this outbox instance.
-
-    Living on the outbox (not the module) means a fresh process or a second
-    store never inherits another store's idea of "unchanged" — a cold start
-    re-hashes once, which is fine.
-    """
-    cache = getattr(outbox, "_knowledge_stat_cache", None)
-    if cache is None:
-        cache = {}
-        outbox._knowledge_stat_cache = cache
-    return cache
-
-
 def _limits_key(config: Any) -> tuple[int, int, int]:
     return (config.max_file_count, config.max_file_bytes, config.max_artifact_bytes)
 
@@ -584,7 +570,7 @@ def _capture(
     mismatch, or store disagreement (a tombstone, a foreground writer) falls
     back to the full read+hash path unchanged.
     """
-    cache = _stat_cache(outbox)
+    cache = outbox.knowledge_stat_cache
     fingerprint = _stat_fingerprint(files)
     cached = cache.get(artifact_id)
     if (
@@ -639,7 +625,7 @@ def _capture(
         cache[artifact_id] = {
             "fingerprint": fingerprint,
             "limits": _limits_key(config),
-            "manifest_hash": outbox._manifest_hash(manifest),
+            "manifest_hash": outbox.manifest_hash(manifest),
         }
     else:
         cache.pop(artifact_id, None)
@@ -670,7 +656,7 @@ def _tombstone_vanished(outbox: Any, config: Any, seen: set[str]) -> int:
         if artifact_id in seen:
             continue
         # The artifact's files are gone; any cached stat fingerprint is stale.
-        _stat_cache(outbox).pop(artifact_id, None)
+        outbox.knowledge_stat_cache.pop(artifact_id, None)
         latest = outbox.latest_knowledge_version(artifact_id)
         if latest is None or latest["is_tombstone"]:
             continue
@@ -746,7 +732,7 @@ def _emit_artifact_events(
     emitted = 0
     for version in pending:
         if not version["is_tombstone"] and not has_secret(
-            outbox._flight_recorder_home
+            outbox.flight_recorder_home
         ):
             # A fleet agent cannot reconstruct an old bundle from encrypted
             # blobs. New versions emit from the plaintext captured in the same

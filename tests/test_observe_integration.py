@@ -228,7 +228,7 @@ def test_content_never_decrypted_in_any_rendered_view(tmp_path):
 # --- CLI end to end --------------------------------------------------------
 def test_cli_observe_report_reads_full_pipeline_outbox_end_to_end(tmp_path, capsys):
     ob, _hh = _run_pipeline(tmp_path)
-    flight_recorder_home = str(ob._flight_recorder_home)
+    flight_recorder_home = str(ob.flight_recorder_home)
     ob.close()
 
     code = main(["observe", "--report", "--flight-recorder-home", flight_recorder_home])

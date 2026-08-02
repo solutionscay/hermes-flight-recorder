@@ -338,9 +338,9 @@ def _record_version(
         None,
     )
     if is_tombstone:
-        outbox._knowledge_plaintext.pop(artifact["artifact_id"], None)
+        outbox.invalidate_knowledge_plaintext(artifact["artifact_id"])
     else:
-        outbox._knowledge_plaintext[artifact["artifact_id"]] = dict(files)
+        outbox.cache_knowledge_plaintext(artifact["artifact_id"], files)
     return version, files
 
 

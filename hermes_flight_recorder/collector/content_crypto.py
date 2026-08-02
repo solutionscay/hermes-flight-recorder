@@ -65,6 +65,7 @@ __all__ = [
     "unwrap_dek",
     "seal",
     "unseal",
+    "content_hash",
     "encrypt_content",
     "decrypt_content",
 ]
@@ -259,6 +260,16 @@ def unwrap_dek(keypair: OperatorKeyPair, wrapped: bytes) -> bytes:
 
 
 # --- content ------------------------------------------------------------
+def content_hash(raw: bytes) -> str:
+    """The canonical plaintext content-hash format: ``sha256:<hexdigest>``.
+
+    The single definition shared by the event path (``encrypt_content``) and
+    the knowledge-blob path (``KnowledgeOutboxMixin.content_hash``), so the
+    format or algorithm cannot drift between the two.
+    """
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def encrypt_content(dek: bytes, content: str | bytes) -> tuple[bytes, bytes, str]:
     """Encrypt content with a data key.
 
@@ -268,8 +279,7 @@ def encrypt_content(dek: bytes, content: str | bytes) -> tuple[bytes, bytes, str
     raw = content.encode("utf-8") if isinstance(content, str) else content
     nonce = os.urandom(_NONCE_BYTES)
     ciphertext = AESGCM(dek).encrypt(nonce, raw, None)
-    content_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
-    return ciphertext, nonce, content_hash
+    return ciphertext, nonce, content_hash(raw)
 
 
 def decrypt_content(dek: bytes, ciphertext: bytes, nonce: bytes) -> bytes:
