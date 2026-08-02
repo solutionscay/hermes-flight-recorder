@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,23 @@ _USER_START_SKEW_SECONDS = 30.0
 # giant transaction. A crash between slices re-scans into dedup hits — the
 # same tolerance the per-row commits had.
 _MESSAGE_BATCH_ROWS = 500
+
+
+@dataclass(frozen=True)
+class _PollContext:
+    """The shared read context of one ``state.db`` poll pass.
+
+    The session parent/profile maps and the hook-derived invocation windows
+    are built once per pass and consumed by every ``_poll_*`` source, so they
+    travel as one argument instead of a repeated positional tuple.
+    """
+
+    outbox: Any
+    parent_map: dict[str, Any]
+    profile_of: dict[str, str]
+    invocation_windows: dict[str, list[InvocationWindow]]
+    counts: dict[str, int]
+    home_mode: str
 
 
 def poll(
@@ -139,35 +157,35 @@ def poll(
             if isinstance(row["id"], str)
         }
         usage = state_watermarks.read_model_usage(outbox, conn, usage_ids)
-        parent_map = {
-            row["id"]: row["parent_session_id"] for row in sessions.context_rows
-        }
-        profile_of = {
-            row["id"]: (row["profile_name"] or "default")
-            for row in sessions.context_rows
-        }
-        invocation_windows = read_invocation_windows(outbox, usage_ids)
+        ctx = _PollContext(
+            outbox=outbox,
+            parent_map={
+                row["id"]: row["parent_session_id"] for row in sessions.context_rows
+            },
+            profile_of={
+                row["id"]: (row["profile_name"] or "default")
+                for row in sessions.context_rows
+            },
+            invocation_windows=read_invocation_windows(outbox, usage_ids),
+            counts=defaultdict(int),
+            home_mode=home_mode,
+        )
 
         # Each source's append loop plus its watermark advance runs in one
         # outbox transaction (issue #160): a crash rolls back the rows and the
         # cursor together, so a re-poll re-reads exactly the same range. The
         # source rows were all gathered above, so no batch holds the write
         # lock across a read of a Hermes store.
-        counts: dict[str, int] = defaultdict(int)
+        counts = ctx.counts
         with outbox.batch():
-            _poll_sessions(outbox, sessions.emit_rows, parent_map, counts, home_mode)
+            _poll_sessions(ctx, sessions.emit_rows)
             sessions.advance()
         knowledge_rows: list[tuple[Any, str, str | None, str]] = []
         for start in range(0, len(messages.rows), _MESSAGE_BATCH_ROWS):
             with outbox.batch():
                 _poll_messages(
-                    outbox,
+                    ctx,
                     messages.rows[start : start + _MESSAGE_BATCH_ROWS],
-                    parent_map,
-                    profile_of,
-                    invocation_windows,
-                    counts,
-                    home_mode,
                     capture,
                     knowledge_rows,
                 )
@@ -195,39 +213,23 @@ def poll(
             )
         messages.advance()
         with outbox.batch():
-            _poll_model_usage(
-                outbox,
-                usage.rows,
-                parent_map,
-                profile_of,
-                invocation_windows,
-                counts,
-                home_mode,
-            )
+            _poll_model_usage(ctx, usage.rows)
             usage.advance()
         with outbox.batch():
-            _poll_delegations(
-                outbox,
-                delegations.rows,
-                parent_map,
-                profile_of,
-                invocation_windows,
-                counts,
-                home_mode,
-            )
+            _poll_delegations(ctx, delegations.rows)
             delegations.advance()
         return dict(counts)
     finally:
         conn.close()
 
 
-def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
-    for r in sessions:
+def _poll_sessions(ctx: _PollContext, rows) -> None:
+    for r in rows:
         sid = r["id"]
         is_sub = r["source"] == "subagent"
         kind = r["source"] or "unknown"
         profile = r["profile_name"] or "default"
-        corr = root_session(sid, parent_map) or sid
+        corr = root_session(sid, ctx.parent_map) or sid
 
         created, ended = SESSION_LIFECYCLE["subagent" if is_sub else "session"]
         record = build_record(
@@ -235,7 +237,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
             occurred_at=r["started_at"],
             source="state.db:sessions",
             capture_method="poll:state.db:sessions",
-            runtime=runtime_stamp(kind, home_mode=home_mode),
+            runtime=runtime_stamp(kind, home_mode=ctx.home_mode),
             correlation_id=corr,
             session_id=sid,
             parent_session_id=r["parent_session_id"],
@@ -252,7 +254,9 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
                 "tool_call_count": r["tool_call_count"],
             },
         )
-        append_and_count(outbox, counts, record, dedup_key=f"state.db:{created}:{sid}")
+        append_and_count(
+            ctx.outbox, ctx.counts, record, dedup_key=f"state.db:{created}:{sid}"
+        )
 
         # A NULL ended_at is a live session, not a crash. Emit no terminal;
         # the reconciler decides terminal-missing after a lifetime window.
@@ -289,7 +293,7 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
             occurred_at=r["ended_at"],
             source="state.db:sessions",
             capture_method="poll:state.db:sessions",
-            runtime=runtime_stamp(kind, home_mode=home_mode),
+            runtime=runtime_stamp(kind, home_mode=ctx.home_mode),
             correlation_id=corr,
             session_id=sid,
             parent_session_id=r["parent_session_id"],
@@ -297,23 +301,17 @@ def _poll_sessions(outbox, sessions, parent_map, counts, home_mode) -> None:
             partial=False,
             payload=payload,
         )
-        append_and_count(outbox, counts, record, dedup_key=f"state.db:{ended}:{sid}")
+        append_and_count(
+            ctx.outbox, ctx.counts, record, dedup_key=f"state.db:{ended}:{sid}"
+        )
 
 
 def _poll_messages(
-    outbox,
-    rows,
-    parent_map,
-    profile_of,
-    invocation_windows,
-    counts,
-    home_mode,
-    capture_config,
-    knowledge_rows,
+    ctx: _PollContext, rows, capture_config, knowledge_rows
 ) -> None:
     for r in rows:
         sid = r["session_id"]
-        corr = root_session(sid, parent_map) or sid
+        corr = root_session(sid, ctx.parent_map) or sid
         role = r["role"]
         content = r["content"]
         # Hermes writes empty assistant rows to carry tool-call structure.
@@ -323,7 +321,7 @@ def _poll_messages(
             continue
 
         invocation_id = _infer_message_invocation(
-            invocation_windows, sid, r["timestamp"], role
+            ctx.invocation_windows, sid, r["timestamp"], role
         )
         limited_content, content_metadata = _limit_content(
             content, capture_config.max_content_bytes
@@ -357,17 +355,17 @@ def _poll_messages(
                 occurred_at=r["timestamp"] or 0.0,
                 source="state.db:messages",
                 capture_method="poll:state.db:messages",
-                runtime=runtime_stamp(role, home_mode=home_mode),
+                runtime=runtime_stamp(role, home_mode=ctx.home_mode),
                 correlation_id=corr,
                 session_id=sid,
                 invocation_id=invocation_id,
-                profile=profile_of.get(sid, "default"),
+                profile=ctx.profile_of.get(sid, "default"),
                 partial=content_metadata["content_truncated"],
                 payload=payload,
             )
             append_and_count(
-                outbox,
-                counts,
+                ctx.outbox,
+                ctx.counts,
                 record,
                 content=limited_content,
                 dedup_key=f"state.db:{role}:{r['id']}",
@@ -389,17 +387,17 @@ def _poll_messages(
             occurred_at=r["timestamp"] or 0.0,
             source="state.db:messages",
             capture_method="poll:state.db:messages",
-            runtime=runtime_stamp("tool", home_mode=home_mode),
+            runtime=runtime_stamp("tool", home_mode=ctx.home_mode),
             correlation_id=corr,
             session_id=sid,
             invocation_id=invocation_id,
-            profile=profile_of.get(sid, "default"),
+            profile=ctx.profile_of.get(sid, "default"),
             partial=content_metadata["content_truncated"],
             payload=payload,
         )
         captured = append_and_count(
-            outbox,
-            counts,
+            ctx.outbox,
+            ctx.counts,
             record,
             content=limited_content,
             dedup_key=f"state.db:tool:{r['id']}",
@@ -410,20 +408,20 @@ def _poll_messages(
         # knowledge candidate either (pre-horizon mutations never did).
         if captured and r["tool_name"] in ("skill_manage", "memory"):
             knowledge_rows.append(
-                (r, corr, invocation_id, profile_of.get(sid, "default"))
+                (r, corr, invocation_id, ctx.profile_of.get(sid, "default"))
             )
 
-def _poll_model_usage(
-    outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode
-) -> None:
+
+def _poll_model_usage(ctx: _PollContext, rows) -> None:
     identities = [
         (str(row["session_id"]), str(row["model"] or ""), str(row["task"] or ""))
         for row in rows
     ]
+    outbox = ctx.outbox
     previous_states = _usage_states(outbox, identities)
     for r in rows:
         sid = str(r["session_id"])
-        corr = root_session(sid, parent_map) or sid
+        corr = root_session(sid, ctx.parent_map) or sid
         identity = (sid, str(r["model"] or ""), str(r["task"] or ""))
         current = {key: _number(r[key]) for key in _USAGE_COUNTERS}
         current["last_seen"] = _number(r["last_seen"])
@@ -445,7 +443,7 @@ def _poll_model_usage(
             else:
                 deltas[key] = after - before
 
-        invocation_id = _infer_invocation(invocation_windows, sid, r["last_seen"])
+        invocation_id = _infer_invocation(ctx.invocation_windows, sid, r["last_seen"])
         payload = {
             "model": identity[1],
             "task": identity[2],
@@ -463,18 +461,18 @@ def _poll_model_usage(
             occurred_at=r["last_seen"] or 0.0,
             source="state.db:session_model_usage",
             capture_method="poll:state.db:session_model_usage",
-            runtime=runtime_stamp("model", home_mode=home_mode),
+            runtime=runtime_stamp("model", home_mode=ctx.home_mode),
             correlation_id=corr,
             session_id=sid,
             invocation_id=invocation_id,
-            profile=profile_of.get(sid, "default"),
+            profile=ctx.profile_of.get(sid, "default"),
             payload=payload,
         )
         snapshot = json.dumps(current, sort_keys=True, separators=(",", ":"))
         snapshot_id = hashlib.sha256(snapshot.encode()).hexdigest()
         append_and_count(
             outbox,
-            counts,
+            ctx.counts,
             record,
             dedup_key=f"state.db:usage:{_usage_key(identity)}:{snapshot_id}",
         )
@@ -484,14 +482,14 @@ def _poll_model_usage(
     outbox.set_meta("state.db:model-usage-state-version", _USAGE_STATE_VERSION)
 
 
-def _poll_delegations(
-    outbox, rows, parent_map, profile_of, invocation_windows, counts, home_mode
-) -> None:
+def _poll_delegations(ctx: _PollContext, rows) -> None:
     for r in rows:
         parent = r["parent_session_id"] or r["origin_session"]
-        corr = root_session(parent, parent_map) or parent
+        corr = root_session(parent, ctx.parent_map) or parent
         event = safe_json_dict(r["event_json"])  # is_batch lives here, not as a column
-        invocation_id = _infer_invocation(invocation_windows, parent, r["dispatched_at"])
+        invocation_id = _infer_invocation(
+            ctx.invocation_windows, parent, r["dispatched_at"]
+        )
         payload = {
             "delegation_id": r["delegation_id"],
             "state": r["state"],
@@ -506,17 +504,17 @@ def _poll_delegations(
             occurred_at=r["dispatched_at"] or 0.0,
             source="state.db:async_delegations",
             capture_method="poll:state.db:async_delegations",
-            runtime=runtime_stamp("subagent", home_mode=home_mode),
+            runtime=runtime_stamp("subagent", home_mode=ctx.home_mode),
             correlation_id=corr,
             session_id=parent,
             parent_session_id=r["parent_session_id"],
             invocation_id=invocation_id,
-            profile=profile_of.get(parent, "default"),
+            profile=ctx.profile_of.get(parent, "default"),
             payload=payload,
         )
         append_and_count(
-            outbox,
-            counts,
+            ctx.outbox,
+            ctx.counts,
             record,
             content=_delegation_content(event, r["result_json"]),
             dedup_key=f"state.db:deleg:{r['delegation_id']}",

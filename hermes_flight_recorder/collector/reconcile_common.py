@@ -1,15 +1,38 @@
-"""Shared finding output for reconciliation passes."""
+"""Shared pass context and finding output for reconciliation passes."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ._common import append_and_count, build_record, runtime_stamp
 
 
+@dataclass(frozen=True)
+class ReconcilePass:
+    """The shared read context of one reconcile pass.
+
+    Built once by :func:`reconcile.reconcile` and passed to every detector as
+    a single argument, so adding a pass-wide field (as ``horizon`` once did)
+    touches one place instead of every signature in the chain. Pass-specific
+    inputs (the event summaries, the execution rows, a reused board list)
+    stay explicit parameters — they are data one detector consumes, not
+    context every detector shares.
+    """
+
+    outbox: Any
+    home: Path
+    counts: dict[str, int]
+    when: float
+    config: Any  # ReconcileConfig
+    capture_config: Any  # CaptureConfig
+    knowledge_config: Any  # KnowledgeConfig
+    horizon: float
+
+
 def emit_finding(
-    outbox,
-    counts,
+    ctx: ReconcilePass,
     *,
     event_type: str,
     occurred_at: float,
@@ -37,12 +60,13 @@ def emit_finding(
         profile=profile,
         partial=partial,
     )
-    append_and_count(outbox, counts, record, content=content, dedup_key=dedup_key)
+    append_and_count(
+        ctx.outbox, ctx.counts, record, content=content, dedup_key=dedup_key
+    )
 
 
 def emit_terminal_missing(
-    outbox,
-    counts,
+    ctx: ReconcilePass,
     *,
     occurred_at,
     correlation_id,
@@ -65,8 +89,7 @@ def emit_terminal_missing(
     }
     payload.update(details or {})
     emit_finding(
-        outbox,
-        counts,
+        ctx,
         event_type="reconcile.terminal_missing",
         occurred_at=occurred_at,
         correlation_id=correlation_id,
@@ -80,4 +103,4 @@ def emit_terminal_missing(
     )
 
 
-__all__ = ["emit_finding", "emit_terminal_missing"]
+__all__ = ["ReconcilePass", "emit_finding", "emit_terminal_missing"]

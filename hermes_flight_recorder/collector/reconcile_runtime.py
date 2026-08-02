@@ -21,7 +21,7 @@ from ._common import (
     ticker_heartbeat_path,
     to_epoch,
 )
-from .reconcile_common import emit_finding, emit_terminal_missing
+from .reconcile_common import ReconcilePass, emit_finding, emit_terminal_missing
 from .kanban_watermarks import open_run_ids
 from .watermark import meta_float
 
@@ -34,18 +34,15 @@ _GATEWAY_LOG_TAIL_BYTES = 8192
 
 
 def detect_stale_task_leases(
-    outbox, home, counts, when, config, *, bounded: bool = True, boards=None
+    ctx: ReconcilePass, *, full: bool = False, boards=None
 ) -> None:
-    for run in load_open_task_runs(
-        home, outbox=outbox if bounded else None, boards=boards
-    ):
-        if not lease_is_dead(run, when, config):
+    for run in load_open_task_runs(ctx.home, ctx.outbox, full=full, boards=boards):
+        if not lease_is_dead(run, ctx.when, ctx.config):
             continue
         board, run_id = run["board"], run["id"]
         emit_terminal_missing(
-            outbox,
-            counts,
-            occurred_at=when,
+            ctx,
+            occurred_at=ctx.when,
             correlation_id=run["task_id"],
             subject_type="task_run",
             subject_id=str(run_id),
@@ -59,7 +56,7 @@ def detect_stale_task_leases(
                 "claim_expires": run["claim_expires"],
                 "last_heartbeat_at": run["last_heartbeat_at"],
                 "start_occurred_at": run["started_at"],
-                "age_seconds": when - run["claim_expires"],
+                "age_seconds": ctx.when - run["claim_expires"],
             },
             dedup_key=f"reconcile:terminal:task_run:{board}:{run_id}",
         )
@@ -76,19 +73,21 @@ def lease_is_dead(run: dict[str, Any], when: float, config: Any) -> bool:
 
 
 def load_open_task_runs(
-    home: Path, *, outbox=None, boards=None
+    home: Path, outbox, *, full: bool = False, boards=None
 ) -> list[dict[str, Any]]:
     """Open task attempts per board. ``boards`` reuses a caller's board list.
 
-    In the bounded (frequent) mode, a board whose durable open-run id set is
-    empty — the common steady state — is skipped without opening its
-    ``kanban.db`` at all.
+    This layer owns the audit-scope decision: ``full=True`` (the audit) scans
+    every open ``task_runs`` row; ``full=False`` (the frequent pass) reads
+    only the runs the durable open-run watermark tracks, so a board whose
+    open-run id set is empty — the common steady state — is skipped without
+    opening its ``kanban.db`` at all.
     """
     runs: list[dict[str, Any]] = []
     if boards is None:
         boards = kanban_board_dbs(home)
     for board, db_path in boards:
-        ids = open_run_ids(outbox, board) if outbox is not None else None
+        ids = None if full else open_run_ids(outbox, board)
         if ids is not None and not ids:
             continue  # no open attempts recorded — nothing to read
         conn = open_sqlite_read_only(db_path)
@@ -143,8 +142,8 @@ def _select_open_run_ids(conn, select: str, ids: set[Any]) -> list[Any]:
     )
 
 
-def detect_gateway_start_failed(outbox, home, counts, when) -> None:
-    state_path = gateway_state_path(home)
+def detect_gateway_start_failed(ctx: ReconcilePass) -> None:
+    state_path = gateway_state_path(ctx.home)
     if state_path.exists():
         data = load_json_dict(state_path)
         state = data.get("gateway_state")
@@ -152,10 +151,9 @@ def detect_gateway_start_failed(outbox, home, counts, when) -> None:
         if state == "startup_failed":
             reason = data.get("exit_reason") or ""
             emit_finding(
-                outbox,
-                counts,
+                ctx,
                 event_type="runtime.gateway_start_failed",
-                occurred_at=updated_at or when,
+                occurred_at=updated_at or ctx.when,
                 correlation_id="gateway",
                 partial=True,
                 payload={
@@ -177,10 +175,11 @@ def detect_gateway_start_failed(outbox, home, counts, when) -> None:
                 if not (code.endswith("_lock") or "already in use" in message):
                     continue
                 pid = parse_pid(message)
-                platform_time = to_epoch(info.get("updated_at")) or updated_at or when
+                platform_time = (
+                    to_epoch(info.get("updated_at")) or updated_at or ctx.when
+                )
                 emit_finding(
-                    outbox,
-                    counts,
+                    ctx,
                     event_type="runtime.gateway_start_failed",
                     occurred_at=platform_time,
                     correlation_id=f"gateway:{name}",
@@ -200,11 +199,10 @@ def detect_gateway_start_failed(outbox, home, counts, when) -> None:
                 )
         return
 
-    last_start = last_start_epoch(gateway_starts_log_path(home))
+    last_start = last_start_epoch(gateway_starts_log_path(ctx.home))
     if last_start is not None:
         emit_finding(
-            outbox,
-            counts,
+            ctx,
             event_type="runtime.gateway_start_failed",
             occurred_at=last_start,
             correlation_id="gateway",
@@ -258,14 +256,13 @@ def last_start_epoch(path: Path) -> float | None:
     return last
 
 
-def ticker_is_stale(outbox, home, counts, when, config) -> bool:
-    heartbeat = read_float(ticker_heartbeat_path(home))
-    if heartbeat is None or when - heartbeat <= config.ticker_stale_after:
+def ticker_is_stale(ctx: ReconcilePass) -> bool:
+    heartbeat = read_float(ticker_heartbeat_path(ctx.home))
+    if heartbeat is None or ctx.when - heartbeat <= ctx.config.ticker_stale_after:
         return False
     emit_terminal_missing(
-        outbox,
-        counts,
-        occurred_at=when,
+        ctx,
+        occurred_at=ctx.when,
         correlation_id="cron:ticker",
         subject_type="cron_ticker",
         subject_id="cron:ticker",
@@ -273,31 +270,30 @@ def ticker_is_stale(outbox, home, counts, when, config) -> bool:
         expected_terminal_event_type="cron.ticker_heartbeat",
         details={
             "heartbeat": heartbeat,
-            "staleness_seconds": when - heartbeat,
+            "staleness_seconds": ctx.when - heartbeat,
         },
         dedup_key=f"reconcile:ticker_stale:{int(heartbeat)}",
     )
     return True
 
 
-def detect_capture_stale(outbox, counts, when, config) -> None:
-    last = meta_float(outbox, CAPTURE_HEARTBEAT_KEY)
+def detect_capture_stale(ctx: ReconcilePass) -> None:
+    last = meta_float(ctx.outbox, CAPTURE_HEARTBEAT_KEY)
     if last is None:
         return
-    staleness = when - last
-    if staleness <= config.capture_stale_after:
+    staleness = ctx.when - last
+    if staleness <= ctx.config.capture_stale_after:
         return
     emit_finding(
-        outbox,
-        counts,
+        ctx,
         event_type="reconcile.capture_stale",
-        occurred_at=when,
-        correlation_id=outbox.installation_id,
+        occurred_at=ctx.when,
+        correlation_id=ctx.outbox.installation_id,
         partial=True,
         payload={
             "last_success_at": last,
             "staleness_seconds": staleness,
-            "threshold_seconds": config.capture_stale_after,
+            "threshold_seconds": ctx.config.capture_stale_after,
         },
         dedup_key=f"reconcile:capture_stale:{int(last)}",
     )
