@@ -88,12 +88,17 @@ def run_pass(
     from collections import Counter
 
     from . import cron_db, gateway_log, kanban_db, knowledge_store, state_db
+    from ._common import read_home_mode
     from .health import record_error, record_success, source_health_key
     from .hook import drain as drain_hook_spool
     from .recorder_config import CaptureConfig, source_enabled
 
     since = _capture_since(outbox)
     capture = capture_config or CaptureConfig()
+    # Resolve the terminal home-mode policy once per pass; every durable-store
+    # poll stamps it, and re-reading config.yaml per source (or per matched log
+    # line) is pure waste (issue #164).
+    home_mode = read_home_mode(hermes_home)
 
     totals: Counter[str] = Counter()
     knowledge_errors: list[Exception] = []
@@ -120,25 +125,32 @@ def run_pass(
                 capture_config=capture,
                 knowledge_config=knowledge_config,
                 since=since,
+                home_mode=home_mode,
             ),
             _DURABLE_STORE_ERRORS,
         ),
         (
             "cron",
             "cron",
-            lambda: cron_db.poll(outbox, hermes_home, since=since),
+            lambda: cron_db.poll(
+                outbox, hermes_home, since=since, home_mode=home_mode
+            ),
             _DURABLE_STORE_ERRORS,
         ),
         (
             "kanban",
             "kanban",
-            lambda: kanban_db.poll(outbox, hermes_home, since=since),
+            lambda: kanban_db.poll(
+                outbox, hermes_home, since=since, home_mode=home_mode
+            ),
             _DURABLE_STORE_ERRORS,
         ),
         (
             "gateway_log",
             "gateway log",
-            lambda: gateway_log.poll(outbox, hermes_home, since=since),
+            lambda: gateway_log.poll(
+                outbox, hermes_home, since=since, home_mode=home_mode
+            ),
             _DURABLE_STORE_ERRORS,
         ),
         (
@@ -149,6 +161,7 @@ def run_pass(
                 hermes_home,
                 knowledge_config=knowledge_config,
                 on_artifact_error=capture_knowledge_error,
+                home_mode=home_mode,
             ),
             _DURABLE_STORE_ERRORS,
         ),
