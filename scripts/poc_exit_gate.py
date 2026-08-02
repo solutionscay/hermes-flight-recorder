@@ -29,8 +29,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# The CI wrappers spec-load this file, so put the sibling _gate module on the path.
+# The CI wrappers spec-load this file, so put the sibling _gate module on the
+# path, and the repo root so a raw checkout imports the co-located package.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _gate import run_gate
 from hermes_flight_recorder import observe
