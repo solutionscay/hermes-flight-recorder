@@ -714,9 +714,8 @@ def _capture_knowledge_mutation(
     ):
         return
     result = safe_json_dict(tool_row["content"])
-    if result.get("success") is not True or result.get("staged") is True:
-        return
-
+    # knowledge_mutation.capture rejects unsuccessful or staged results at
+    # its API boundary; no pre-check here.
     paired = _find_tool_call(
         conn,
         session_id=tool_row["session_id"],
