@@ -17,6 +17,7 @@ from ._common import (
 )
 from .recorder_config import source_enabled
 from .reconcile_common import emit_finding as _emit
+from .watermark import meta_float
 
 
 # --- coverage gaps ------------------------------------------------------
@@ -393,13 +394,8 @@ def _coverage_ready(
     if grace <= 0:
         return True
     key = _coverage_pending_key(subject_type, subject_id)
-    raw = outbox.get_meta(key)
-    if raw is None:
-        outbox.set_meta(key, repr(when))
-        return False
-    try:
-        first_seen = float(raw)
-    except (TypeError, ValueError):
+    first_seen = meta_float(outbox, key)
+    if first_seen is None:
         outbox.set_meta(key, repr(when))
         return False
     return when - first_seen >= grace

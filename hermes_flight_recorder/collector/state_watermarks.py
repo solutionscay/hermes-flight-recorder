@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 from ._common import (
     sqlite_column_or_default,
+    sqlite_select_chunked,
     sqlite_table_columns,
     sqlite_table_exists,
 )
-from .watermark import Watermark
+from .watermark import Watermark, load_meta_json, save_meta_json
 
 MESSAGE_WATERMARK = "state.db:messages:v2"
 MESSAGE_OVERLAP = 32
@@ -69,10 +69,7 @@ class SessionBatch:
 
     def advance(self) -> None:
         self.watermark.advance(self.high_water)
-        self.meta_store.set_meta(
-            _OPEN_SESSIONS_META,
-            json.dumps(self.open_ids, separators=(",", ":")),
-        )
+        save_meta_json(self.meta_store, _OPEN_SESSIONS_META, self.open_ids)
 
 
 def read_messages(outbox, conn, roles: tuple[str, ...]) -> RowBatch:
@@ -95,12 +92,7 @@ def read_messages(outbox, conn, roles: tuple[str, ...]) -> RowBatch:
     )
     conn.execute("BEGIN")
     try:
-        high_water = max(
-            watermark.read(),
-            int(
-                conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-            ),
-        )
+        high_water = watermark.high_water(conn, "messages", "id")
         if roles:
             placeholders = ",".join("?" for _ in roles)
             rows = conn.execute(
@@ -139,18 +131,12 @@ def read_model_usage(outbox, conn, session_ids: set[str]) -> RowBatch:
         return RowBatch(
             conn.execute(f"SELECT {select} FROM session_model_usage").fetchall()
         )
-    rows = []
-    values = list(session_ids)
-    for start in range(0, len(values), 500):
-        group = values[start : start + 500]
-        placeholders = ",".join("?" for _ in group)
-        rows.extend(
-            conn.execute(
-                f"SELECT {select} FROM session_model_usage "
-                f"WHERE session_id IN ({placeholders}) ORDER BY session_id, last_seen",
-                group,
-            ).fetchall()
-        )
+    rows = sqlite_select_chunked(
+        conn,
+        f"SELECT {select} FROM session_model_usage "
+        "WHERE session_id IN ({placeholders}) ORDER BY session_id, last_seen",
+        session_ids,
+    )
     return RowBatch(rows)
 
 
@@ -158,20 +144,13 @@ def read_delegations(outbox, conn) -> RowBatch:
     if not sqlite_table_exists(conn, "async_delegations"):
         return RowBatch([])
     watermark = Watermark(outbox, DELEGATION_WATERMARK, overlap=DELEGATION_OVERLAP)
-    high_water = max(
-        watermark.read(),
-        int(
-            conn.execute(
-                "SELECT COALESCE(MAX(rowid), 0) FROM async_delegations"
-            ).fetchone()[0]
-        ),
+    rows, high_water = watermark.bounded_rows(
+        conn,
+        "async_delegations",
+        "delegation_id, origin_session, parent_session_id, state, "
+        "delivery_state, owner_pid, dispatched_at, event_json, result_json",
+        "rowid",
     )
-    rows = conn.execute(
-        "SELECT delegation_id, origin_session, parent_session_id, state, "
-        "delivery_state, owner_pid, dispatched_at, event_json, result_json "
-        "FROM async_delegations WHERE rowid > ? AND rowid <= ? ORDER BY rowid",
-        (watermark.lower_bound(), high_water),
-    ).fetchall()
     return RowBatch(rows, watermark, high_water)
 
 
@@ -182,14 +161,7 @@ def read_sessions(outbox, conn, subject_ids: set[str]) -> SessionBatch:
         for name, default in _SESSION_COLUMNS
     )
     watermark = Watermark(outbox, SESSION_WATERMARK, overlap=SESSION_OVERLAP)
-    high_water = max(
-        watermark.read(),
-        int(conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM sessions").fetchone()[0]),
-    )
-    recent = conn.execute(
-        f"SELECT {select} FROM sessions WHERE rowid > ? AND rowid <= ? ORDER BY rowid",
-        (watermark.lower_bound(), high_water),
-    ).fetchall()
+    recent, high_water = watermark.bounded_rows(conn, "sessions", select, "rowid")
     open_ids = _read_open_session_ids(outbox)
     context = {row["id"]: row for row in recent if row["id"] is not None}
     needed = set(subject_ids) | open_ids
@@ -232,28 +204,16 @@ def read_sessions(outbox, conn, subject_ids: set[str]) -> SessionBatch:
 
 
 def _read_open_session_ids(outbox) -> set[str]:
-    raw = outbox.get_meta(_OPEN_SESSIONS_META)
-    if raw is None:
-        return set()
-    try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
-        return set()
-    if not isinstance(value, list):
-        return set()
+    value = load_meta_json(outbox, _OPEN_SESSIONS_META, [])
     return {item for item in value if isinstance(item, str) and item}
 
 
 def _read_session_ids(conn, select: str, ids: set[str], rows: dict[str, Any]) -> None:
-    values = list(ids)
-    for start in range(0, len(values), 500):
-        group = values[start : start + 500]
-        placeholders = ",".join("?" for _ in group)
-        for row in conn.execute(
-            f"SELECT {select} FROM sessions WHERE id IN ({placeholders})", group
-        ):
-            if row["id"] is not None:
-                rows[row["id"]] = row
+    for row in sqlite_select_chunked(
+        conn, f"SELECT {select} FROM sessions WHERE id IN ({{placeholders}})", ids
+    ):
+        if row["id"] is not None:
+            rows[row["id"]] = row
 
 
 __all__ = [

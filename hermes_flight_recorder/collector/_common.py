@@ -11,6 +11,7 @@ import datetime
 import json
 import os
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,31 @@ def sqlite_select_list(conn: sqlite3.Connection, table: str, names: tuple[str, .
     """
     columns = sqlite_table_columns(conn, table)
     return ", ".join(sqlite_column_or_default(columns, name) for name in names)
+
+
+def sqlite_select_chunked(
+    conn: sqlite3.Connection,
+    sql_template: str,
+    values: Iterable[Any],
+    chunk: int = 500,
+) -> list[Any]:
+    """Run an ``IN (...)`` select in chunks below the SQLite parameter limit.
+
+    ``sql_template`` carries one ``{placeholders}`` slot that each chunk fills
+    with the matching number of ``?`` markers. Rows come back concatenated in
+    chunk order.
+    """
+    items = list(values)
+    rows: list[Any] = []
+    for start in range(0, len(items), chunk):
+        group = items[start : start + chunk]
+        placeholders = ",".join("?" for _ in group)
+        rows.extend(
+            conn.execute(
+                sql_template.format(placeholders=placeholders), group
+            ).fetchall()
+        )
+    return rows
 
 
 def executions_db_path(home: Path) -> Path:

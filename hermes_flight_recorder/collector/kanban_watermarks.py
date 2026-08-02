@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._common import open_sqlite_read_only, sqlite_select_list, sqlite_table_exists
-from .watermark import Watermark
+from ._common import (
+    open_sqlite_read_only,
+    sqlite_select_chunked,
+    sqlite_select_list,
+    sqlite_table_exists,
+)
+from .watermark import Watermark, load_meta_json, save_meta_json
 
 BOARD_OVERLAP = 64
 TASK_META_COLUMNS = (
@@ -52,9 +56,8 @@ class BoardBatch:
     def advance(self) -> None:
         self.event_watermark.advance(self.event_high_water)
         self.run_watermark.advance(self.run_high_water)
-        self.meta_store.set_meta(
-            _open_runs_meta_key(self.board),
-            json.dumps(self.open_run_ids, separators=(",", ":")),
+        save_meta_json(
+            self.meta_store, _open_runs_meta_key(self.board), self.open_run_ids
         )
 
 
@@ -96,15 +99,7 @@ def read_board(outbox, board: str, db_path: Path) -> BoardBatch | None:
 
 def _read_events(conn, watermark: Watermark) -> tuple[list[Any], int]:
     select = sqlite_select_list(conn, "task_events", _EVENT_COLUMNS)
-    high_water = max(
-        watermark.read(),
-        int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]),
-    )
-    rows = conn.execute(
-        f"SELECT {select} FROM task_events WHERE id > ? AND id <= ? ORDER BY id",
-        (watermark.lower_bound(), high_water),
-    ).fetchall()
-    return rows, high_water
+    return watermark.bounded_rows(conn, "task_events", select, "id")
 
 
 def _read_runs(
@@ -113,14 +108,7 @@ def _read_runs(
     if not sqlite_table_exists(conn, "task_runs"):
         return {}, [], watermark.read()
     select = sqlite_select_list(conn, "task_runs", _RUN_COLUMNS)
-    high_water = max(
-        watermark.read(),
-        int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_runs").fetchone()[0]),
-    )
-    changed = conn.execute(
-        f"SELECT {select} FROM task_runs WHERE id > ? AND id <= ? ORDER BY id",
-        (watermark.lower_bound(), high_water),
-    ).fetchall()
+    changed, high_water = watermark.bounded_rows(conn, "task_runs", select, "id")
     runs = {row["id"]: row for row in changed}
     referenced = {
         event["run_id"]
@@ -134,14 +122,7 @@ def _read_runs(
 
 
 def open_run_ids(outbox, board: str) -> set[Any]:
-    raw = outbox.get_meta(_open_runs_meta_key(board))
-    if raw is None:
-        return set()
-    try:
-        values = json.loads(raw)
-    except (TypeError, ValueError):
-        return set()
-    return set(values) if isinstance(values, list) else set()
+    return set(load_meta_json(outbox, _open_runs_meta_key(board), []))
 
 
 def _open_runs_meta_key(board: str) -> str:
@@ -158,18 +139,9 @@ def _read_tasks(conn, events: list[Any], changed_runs: list[Any]) -> dict[Any, A
 
 
 def _select_ids(conn, table: str, select: str, ids: set[Any]) -> list[Any]:
-    values = list(ids)
-    rows = []
-    for start in range(0, len(values), 500):
-        group = values[start : start + 500]
-        placeholders = ",".join("?" for _ in group)
-        rows.extend(
-            conn.execute(
-                f"SELECT {select} FROM {table} WHERE id IN ({placeholders})",
-                group,
-            ).fetchall()
-        )
-    return rows
+    return sqlite_select_chunked(
+        conn, f"SELECT {select} FROM {table} WHERE id IN ({{placeholders}})", ids
+    )
 
 
 __all__ = ["BoardBatch", "TASK_META_COLUMNS", "open_run_ids", "read_board"]

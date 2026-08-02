@@ -77,6 +77,7 @@ from .reconcile_runtime import (
     detect_stale_task_leases as _detect_stale_task_leases,
     ticker_is_stale as _ticker_is_stale,
 )
+from .watermark import meta_float
 
 
 @dataclass(frozen=True)
@@ -212,13 +213,7 @@ def _install_horizon(outbox: Any) -> float:
     install over a long-lived Hermes home immediately reports the whole historic
     store as uncaptured.
     """
-    raw = outbox.get_meta(INSTALLED_AT_META_KEY)
-    if raw is not None:
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            pass
-    return 0.0
+    return meta_float(outbox, INSTALLED_AT_META_KEY, 0.0)
 
 
 # --- sequence gaps ------------------------------------------------------
