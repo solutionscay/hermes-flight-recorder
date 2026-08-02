@@ -163,7 +163,7 @@ def _coverage_messages(
     )
     if not roles:
         return
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    columns = sqlite_table_columns(conn, "messages")
     if not columns:
         return  # no messages table on this Hermes home — nothing to reconcile
     # Some narrow synthetic/legacy schemas do not expose content. In that
