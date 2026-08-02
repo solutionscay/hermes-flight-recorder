@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -582,3 +583,191 @@ def test_knowledge_bundle_v1_matches_the_compatibility_fixture(tmp_path):
     event = knowledge_events(ob)[0]
     assert event["payload"]["content_format"] == "knowledge.bundle.v1"
     assert json.loads(ob.decrypt_content(event)) == fixture
+
+
+# --- capture-tick efficiency: stat short-circuit (#159), cursor query (#161)
+
+
+def settle(monkeypatch):
+    """Disable the racily-clean window so fresh test files cache immediately.
+
+    ctime cannot be backdated from userspace, so a test that needs the stat
+    cache to engage right after writing its fixture files shrinks the window
+    instead of waiting it out.
+    """
+    monkeypatch.setattr(knowledge_store, "_RACY_WINDOW_SECONDS", -1.0)
+
+
+def count_snapshots(monkeypatch):
+    """Record every artifact `_snapshot_files` reads (the read+hash path)."""
+    reads: list[str] = []
+    real = knowledge_store._snapshot_files
+
+    def counting(outbox, config, artifact_id, files, **kwargs):
+        reads.append(artifact_id)
+        return real(outbox, config, artifact_id, files, **kwargs)
+
+    monkeypatch.setattr(knowledge_store, "_snapshot_files", counting)
+    return reads
+
+
+def test_unchanged_artifacts_are_not_reread_or_rehashed(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    write(home / "memories" / "MEMORY.md", "stable\n")
+    write_skill(
+        home / "skills", "steady", "# steady\n", files={"references/a.md": "alpha"}
+    )
+    settle(monkeypatch)
+    ob = new_outbox(tmp_path)
+    knowledge_store.poll(ob, home)
+
+    reads = count_snapshots(monkeypatch)
+    hashes: list[bytes] = []
+    monkeypatch.setattr(
+        ob, "put_blob", lambda raw: pytest.fail("unchanged poll stored a blob")
+    )
+    monkeypatch.setattr(
+        type(ob), "_content_hash", staticmethod(lambda raw: hashes.append(raw))
+    )
+
+    assert knowledge_store.poll(ob, home) == {}
+    assert reads == []
+    assert hashes == []
+
+
+def test_changed_file_is_recaptured_after_a_cached_poll(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    memory = home / "memories" / "MEMORY.md"
+    write(memory, "v1\n")
+    settle(monkeypatch)
+    ob = new_outbox(tmp_path)
+    knowledge_store.poll(ob, home)
+
+    write(memory, "v2 is longer\n")
+    reads = count_snapshots(monkeypatch)
+
+    counts = knowledge_store.poll(ob, home)
+
+    assert counts == {knowledge_store.KNOWLEDGE_EVENT: 1}
+    assert reads == ["memory:memory"]
+    assert ob.latest_knowledge_version("memory:memory")["seq"] == 2
+
+
+def test_same_mtime_same_size_edit_is_still_captured(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    memory = home / "memories" / "MEMORY.md"
+    write(memory, "aaaa\n")
+    old = time.time() - 60.0
+    os.utime(memory, (old, old))
+    settle(monkeypatch)
+    ob = new_outbox(tmp_path)
+    knowledge_store.poll(ob, home)
+
+    # Same byte count, mtime restored to the cached value. Only ctime moves
+    # (utime cannot set it back), which the fingerprint must catch. The sleep
+    # guarantees the rewrite lands on a later coarse-clock tick than the
+    # cached ctime — the same separation the real 2 s window enforces.
+    time.sleep(0.05)
+    write(memory, "bbbb\n")
+    os.utime(memory, (old, old))
+    knowledge_store.poll(ob, home)
+
+    latest = ob.latest_knowledge_version("memory:memory")
+    assert latest["seq"] == 2
+    assert ob.get_blob(latest["manifest"][0]["blob_hash"]) == b"bbbb\n"
+
+
+def test_recently_modified_file_is_reread_on_the_next_poll(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    write(home / "memories" / "MEMORY.md", "fresh\n")  # mtime = now
+    ob = new_outbox(tmp_path)
+    knowledge_store.poll(ob, home)
+
+    reads = count_snapshots(monkeypatch)
+
+    # Inside the racily-clean window the fingerprint is not cached, so the
+    # next tick re-reads (and finds nothing new).
+    assert knowledge_store.poll(ob, home) == {}
+    assert reads == ["memory:memory"]
+
+
+def test_deleted_then_restored_skill_is_recaptured(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    skill = write_skill(home / "skills", "phoenix", "# v1\n")
+    settle(monkeypatch)
+    ob = new_outbox(tmp_path)
+    knowledge_store.poll(ob, home)
+    knowledge_store.poll(ob, home)  # cached, no-op
+
+    (skill / "SKILL.md").unlink()
+    skill.rmdir()
+    knowledge_store.poll(ob, home)  # tombstone
+    assert ob.latest_knowledge_version("skill:phoenix")["is_tombstone"]
+
+    write_skill(home / "skills", "phoenix", "# v1\n")
+    knowledge_store.poll(ob, home)
+
+    latest = ob.latest_knowledge_version("skill:phoenix")
+    assert latest["seq"] == 3
+    assert not latest["is_tombstone"]
+
+
+def test_knowledge_versions_after_returns_only_rows_above_seq(tmp_path):
+    ob = new_outbox(tmp_path)
+    ob.upsert_knowledge_artifact(
+        "memory:memory", kind="memory", name="memory", category=None,
+        provenance="agent", first_seen=1.0,
+    )
+    for step, text in enumerate(["v1\n", "v2\n", "v3\n"], start=1):
+        blob = ob.put_blob(text)
+        ob.append_knowledge_version(
+            "memory:memory",
+            manifest=[{"path": "MEMORY.md", "blob_hash": blob}],
+            occurred_at=float(step),
+            origin="background",
+        )
+
+    assert [v["seq"] for v in ob.knowledge_versions_after("memory:memory", 0)] == [1, 2, 3]
+    assert [v["seq"] for v in ob.knowledge_versions_after("memory:memory", 2)] == [3]
+    assert ob.knowledge_versions_after("memory:memory", 3) == []
+
+
+def test_steady_state_emit_decodes_no_version_rows(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    write_skill(home / "skills", "quiet", "# quiet\n")
+    ob = new_outbox(tmp_path)
+    knowledge_store.poll(ob, home)  # capture + emit advance the cursor
+
+    decoded: list[object] = []
+    real_row = type(ob)._version_row
+    monkeypatch.setattr(
+        type(ob),
+        "_version_row",
+        staticmethod(lambda row: decoded.append(row) or real_row(row)),
+    )
+
+    assert knowledge_store._emit_pending_events(ob, "auto") == 0
+    assert decoded == []
+
+
+def test_emit_resumes_strictly_above_the_cursor(tmp_path):
+    ob = new_outbox(tmp_path)
+    ob.upsert_knowledge_artifact(
+        "memory:memory", kind="memory", name="memory", category=None,
+        provenance="agent", first_seen=1.0,
+    )
+    for step, text in enumerate(["v1\n", "v2\n", "v3\n"], start=1):
+        blob = ob.put_blob(text)
+        ob.append_knowledge_version(
+            "memory:memory",
+            manifest=[{"path": "MEMORY.md", "blob_hash": blob}],
+            occurred_at=float(step),
+            origin="background",
+        )
+    ob.set_meta("knowledge:emitted:memory:memory", "1")
+
+    emitted = knowledge_store._emit_pending_events(ob, "auto")
+
+    assert emitted == 2
+    assert [e["payload"]["version_seq"] for e in knowledge_events(ob)] == [2, 3]
+    assert ob.get_meta("knowledge:emitted:memory:memory") == "3"

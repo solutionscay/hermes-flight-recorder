@@ -165,6 +165,22 @@ class KnowledgeOutboxMixin:
         ).fetchall()
         return [v for v in (self._version_row(r) for r in rows) if v is not None]
 
+    def knowledge_versions_after(
+        self, artifact_id: str, seq: int
+    ) -> list[dict[str, Any]]:
+        """Versions of one artifact strictly above ``seq``, oldest first.
+
+        The emit pass's cursor query (issue #161): the primary key on
+        ``(artifact_id, seq)`` answers it with a range scan, and a cursor
+        already at the latest seq decodes zero rows.
+        """
+        rows = self._conn.execute(
+            f"SELECT {self._VERSION_COLUMNS} FROM knowledge_version "
+            "WHERE artifact_id=? AND seq>? ORDER BY seq",
+            (artifact_id, int(seq)),
+        ).fetchall()
+        return [v for v in (self._version_row(r) for r in rows) if v is not None]
+
     def append_knowledge_version(
         self,
         artifact_id: str,
