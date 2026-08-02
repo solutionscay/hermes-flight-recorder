@@ -40,19 +40,19 @@ def after_state(
 
 
 def _latest_files(outbox: Any, artifact_id: str) -> dict[str, bytes] | None:
-    cached = outbox._knowledge_plaintext.get(artifact_id)
+    cached = outbox.cached_knowledge_plaintext(artifact_id)
     if cached is not None:
-        return dict(cached)
+        return cached
     latest = outbox.latest_knowledge_version(artifact_id)
     if latest is None or latest["is_tombstone"]:
         return None
-    if not has_secret(outbox._flight_recorder_home):
+    if not has_secret(outbox.flight_recorder_home):
         return None
     files = {
         entry["path"]: outbox.get_blob(entry["blob_hash"])
         for entry in latest["manifest"]
     }
-    outbox._knowledge_plaintext[artifact_id] = dict(files)
+    outbox.cache_knowledge_plaintext(artifact_id, files)
     return files
 
 

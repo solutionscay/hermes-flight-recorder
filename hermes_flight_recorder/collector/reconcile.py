@@ -545,7 +545,7 @@ def _detect_knowledge_drift(
             continue  # a live file vanished/locked between listing and read
         if not manifest and not skipped_files:
             continue
-        disk_hash = outbox._manifest_hash(manifest)
+        disk_hash = outbox.manifest_hash(manifest)
         latest = outbox.latest_knowledge_version(artifact_id)
         stored_hash = (
             None if (latest is None or latest["is_tombstone"]) else latest["manifest_hash"]

@@ -17,14 +17,54 @@ class KnowledgeOutboxMixin:
     # memories (Phase 3). It shares the outbox's content encryption and
     # connection but its own tables, so event retention never touches
     # knowledge state and knowledge retention never touches events.
-    @staticmethod
-    def _content_hash(raw: bytes) -> str:
-        return "sha256:" + hashlib.sha256(raw).hexdigest()
+    def _init_knowledge_state(self) -> None:
+        """Initialize the mixin-owned in-memory knowledge state.
+
+        Called from ``Outbox.__init__``. The attributes live here so sibling
+        modules never invent or reach for state on ``Outbox`` directly.
+        """
+        # Current knowledge plaintext by artifact_id. A fleet host uses it for
+        # consecutive mutations without a private decryption key.
+        self._knowledge_plaintext: dict[str, dict[str, bytes]] = {}
+        # Per-process stat fingerprints for the scanner's steady-state
+        # short-circuit. Scoped to this outbox instance, so a fresh process or
+        # a second store never inherits another store's idea of "unchanged" —
+        # a cold start re-hashes once, which is fine.
+        self._knowledge_stat_cache: dict[str, dict[str, Any]] = {}
 
     @staticmethod
-    def _manifest_hash(manifest: list[dict[str, str]]) -> str:
+    def content_hash(raw: bytes) -> str:
+        """Plaintext content hash in the store's canonical format."""
+        return cc.content_hash(raw)
+
+    @staticmethod
+    def manifest_hash(manifest: list[dict[str, str]]) -> str:
+        """Hash of a canonical (sorted, compact) JSON manifest."""
         canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
         return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    # --- in-memory knowledge state ---------------------------------------
+    def cached_knowledge_plaintext(
+        self, artifact_id: str
+    ) -> dict[str, bytes] | None:
+        """A copy of the cached plaintext files for one artifact, if any."""
+        cached = self._knowledge_plaintext.get(artifact_id)
+        return dict(cached) if cached is not None else None
+
+    def cache_knowledge_plaintext(
+        self, artifact_id: str, files: dict[str, bytes]
+    ) -> None:
+        """Remember an artifact's current plaintext files (stored as a copy)."""
+        self._knowledge_plaintext[artifact_id] = dict(files)
+
+    def invalidate_knowledge_plaintext(self, artifact_id: str) -> None:
+        """Drop the cached plaintext for one artifact (e.g. on tombstone)."""
+        self._knowledge_plaintext.pop(artifact_id, None)
+
+    @property
+    def knowledge_stat_cache(self) -> dict[str, dict[str, Any]]:
+        """The scanner's per-artifact stat-fingerprint cache (mixin-owned)."""
+        return self._knowledge_stat_cache
 
     def put_blob(self, content: str | bytes) -> str:
         """Store one file's content, encrypted, deduplicated by plaintext hash.
@@ -33,7 +73,7 @@ class KnowledgeOutboxMixin:
         multi-file skill that changes one file adds a single new blob.
         """
         raw = content.encode("utf-8") if isinstance(content, str) else content
-        digest = self._content_hash(raw)
+        digest = self.content_hash(raw)
         if (
             self._conn.execute(
                 "SELECT 1 FROM knowledge_blob WHERE content_hash=?", (digest,)
@@ -198,7 +238,7 @@ class KnowledgeOutboxMixin:
         a re-scan of unchanged content writes nothing, while a revert to an
         earlier state is a genuine new version (it differs from the latest).
         """
-        manifest_hash = self._manifest_hash(manifest)
+        manifest_hash = self.manifest_hash(manifest)
         skipped = skipped_files or []
         latest = self.latest_knowledge_version(artifact_id)
         if (

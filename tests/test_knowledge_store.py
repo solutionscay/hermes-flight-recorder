@@ -627,7 +627,7 @@ def test_unchanged_artifacts_are_not_reread_or_rehashed(tmp_path, monkeypatch):
         ob, "put_blob", lambda raw: pytest.fail("unchanged poll stored a blob")
     )
     monkeypatch.setattr(
-        type(ob), "_content_hash", staticmethod(lambda raw: hashes.append(raw))
+        type(ob), "content_hash", staticmethod(lambda raw: hashes.append(raw))
     )
 
     assert knowledge_store.poll(ob, home) == {}
