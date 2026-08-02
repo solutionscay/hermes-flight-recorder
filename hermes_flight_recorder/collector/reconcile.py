@@ -58,6 +58,7 @@ from ._common import (
     INSTALLED_AT_META_KEY,
     executions_db_path,
     jobs_path,
+    kanban_board_dbs,
     load_json_dict,
     open_sqlite_read_only,
     read_home_mode,
@@ -150,9 +151,21 @@ def reconcile(
 
     if source_enabled(capture, "gateway_log"):
         _detect_gateway_start_failed(outbox, home, counts, when)
+    # One board listing per reconcile pass: lease detection here and, in the
+    # audit below, Kanban coverage read the same list instead of re-walking
+    # (and re-sniffing) every board file.
+    kanban_boards = (
+        kanban_board_dbs(home) if source_enabled(capture, "kanban") else []
+    )
     if source_enabled(capture, "kanban"):
         _detect_stale_task_leases(
-            outbox, home, counts, when, cfg, bounded=not full_audit
+            outbox,
+            home,
+            counts,
+            when,
+            cfg,
+            bounded=not full_audit,
+            boards=kanban_boards,
         )
     _detect_capture_stale(outbox, counts, when, cfg)
     ticker_dead = False
@@ -189,7 +202,16 @@ def reconcile(
                 cfg.sequence_gap_limit,
             )
         _detect_coverage_gaps(
-            outbox, events, home, exec_rows, counts, when, cfg, capture, horizon
+            outbox,
+            events,
+            home,
+            exec_rows,
+            counts,
+            when,
+            cfg,
+            capture,
+            horizon,
+            boards=kanban_boards,
         )
         if source_enabled(capture, "hook"):
             with outbox.batch():

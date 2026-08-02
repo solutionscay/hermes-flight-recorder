@@ -499,7 +499,7 @@ class Outbox(KnowledgeOutboxMixin):
             raise OutboxError("chunked content metadata is invalid")
 
         chunks = []
-        for event in self.iter_events(record.get("installation_id")):
+        for event in self._chunk_candidates(record, chunk_count):
             chunk_payload = event.get("payload", {})
             if (
                 chunk_payload.get("event_type") == _CONTENT_CHUNK_EVENT
@@ -522,6 +522,33 @@ class Outbox(KnowledgeOutboxMixin):
         if expected_bytes != len(raw) or expected_hash != self._content_hash(raw):
             raise OutboxError(f"chunked content {content_ref} failed verification")
         return raw
+
+    def _chunk_candidates(
+        self, record: dict[str, Any], chunk_count: int
+    ) -> Iterator[dict[str, Any]]:
+        """Candidate chunk records for one chunked parent, bounded in SQL.
+
+        ``_content_chunk_records`` writes the chunks contiguously immediately
+        before their parent (``producer_sequence`` = parent − chunk_count …
+        parent − 1), so a parent that carries its stamped identity bounds the
+        scan to that sequence range instead of reading the whole event table.
+        A caller-built record without a stamped sequence falls back to the
+        full scan; the caller still filters by ``content_ref`` and validates
+        the chunk set either way.
+        """
+        parent_sequence = record.get("producer_sequence")
+        installation_id = record.get("installation_id")
+        if isinstance(parent_sequence, int) and isinstance(installation_id, str):
+            cur = self._conn.execute(
+                "SELECT envelope_json FROM events "
+                "WHERE installation_id=? AND producer_sequence BETWEEN ? AND ? "
+                "ORDER BY producer_sequence",
+                (installation_id, parent_sequence - chunk_count, parent_sequence - 1),
+            )
+            for (blob,) in cur:
+                yield parse(blob)
+            return
+        yield from self.iter_events(installation_id)
 
     def _decrypt_inline_content(
         self, record: dict[str, Any], keypair: cc.OperatorKeyPair
@@ -1190,26 +1217,38 @@ class Outbox(KnowledgeOutboxMixin):
         installation_id: str | None = None,
         *,
         after_sequence: int = 0,
+        since: float | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield records in (installation_id, producer_sequence) order.
 
         ``after_sequence`` skips records at or below a cursor in SQL (a range
         scan on the unique index), so a caller resuming from a cursor never
-        pays to load and parse the already-handled history.
+        pays to load and parse the already-handled history. ``since`` keeps
+        records whose ``occurred_at`` is at or after an epoch; the predicate
+        runs as ``json_extract`` inside SQLite, so a time-filtered read never
+        JSON-parses the out-of-window envelopes into Python. A record without
+        a numeric ``occurred_at`` compares as ``0.0`` — the same fold the
+        observe filter has always applied.
         """
-        if installation_id is None:
-            cur = self._conn.execute(
-                "SELECT envelope_json FROM events WHERE producer_sequence>? "
-                "ORDER BY installation_id, producer_sequence",
-                (after_sequence,),
+        conditions = ["producer_sequence>?"]
+        params: list[Any] = [after_sequence]
+        order = "installation_id, producer_sequence"
+        if installation_id is not None:
+            conditions.insert(0, "installation_id=?")
+            params.insert(0, installation_id)
+            order = "producer_sequence"
+        if since is not None:
+            conditions.append(
+                "COALESCE(CAST(json_extract(envelope_json, '$.occurred_at') "
+                "AS REAL), 0.0)>=?"
             )
-        else:
-            cur = self._conn.execute(
-                "SELECT envelope_json FROM events "
-                "WHERE installation_id=? AND producer_sequence>? "
-                "ORDER BY producer_sequence",
-                (installation_id, after_sequence),
-            )
+            params.append(since)
+        cur = self._conn.execute(
+            "SELECT envelope_json FROM events WHERE "
+            + " AND ".join(conditions)
+            + f" ORDER BY {order}",
+            params,
+        )
         for (blob,) in cur:
             yield parse(blob)
 

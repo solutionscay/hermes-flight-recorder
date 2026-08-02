@@ -22,9 +22,23 @@ from .watermark import meta_float
 
 # --- coverage gaps ------------------------------------------------------
 def _detect_coverage_gaps(
-    outbox, events, home, exec_rows, counts, when, config, capture_config, horizon
+    outbox,
+    events,
+    home,
+    exec_rows,
+    counts,
+    when,
+    config,
+    capture_config,
+    horizon,
+    *,
+    boards=None,
 ):
-    """A durable row with no captured event proves a dropped capture."""
+    """A durable row with no captured event proves a dropped capture.
+
+    ``boards`` reuses a caller's Kanban board list (one listing per reconcile
+    pass); when None, the board list is read here.
+    """
     captured = _captured_subjects(events)
     pending = _CoveragePending(outbox)
     session_rows = []
@@ -111,7 +125,15 @@ def _detect_coverage_gaps(
                 )
     if source_enabled(capture_config, "kanban"):
         _coverage_kanban(
-            outbox, home, captured, pending, counts, when, config, horizon
+            outbox,
+            home,
+            captured,
+            pending,
+            counts,
+            when,
+            config,
+            horizon,
+            boards=boards,
         )
     pending.flush()
 
@@ -255,7 +277,7 @@ def _coverage_model_usage(
 
 
 def _coverage_kanban(
-    outbox, home, captured, pending, counts, when, config, horizon
+    outbox, home, captured, pending, counts, when, config, horizon, *, boards=None
 ) -> None:
     """A durable Kanban task/run with no captured ``task.*`` event.
 
@@ -265,7 +287,9 @@ def _coverage_kanban(
     board-scoped (``board:id``) so equal ids across boards never collide and the
     shared ``reconcile:cover:*`` dedup key stays unique per board.
     """
-    for board, db_path in kanban_board_dbs(home):
+    if boards is None:
+        boards = kanban_board_dbs(home)
+    for board, db_path in boards:
         conn = open_sqlite_read_only(db_path)
         try:
             present = {

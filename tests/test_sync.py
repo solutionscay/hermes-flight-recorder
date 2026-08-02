@@ -282,3 +282,85 @@ def test_delivery_cursor_is_independent_of_other_outbox_state(tmp_path):
     assert outbox.high_water() == 3
     assert DELIVERY_CURSOR_NAME != HOOK_CURSOR_NAME
     outbox.close()
+
+
+# --- serialize-once batching (issue #166) ---------------------------------
+def _fresh_wire(batch) -> bytes:
+    """Re-serialize a batch from scratch with the protocol encoding."""
+    import json
+
+    return json.dumps(
+        {"protocol_version": batch["protocol_version"], "records": batch["records"]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _reference_grouping(records, max_records, max_bytes):
+    """The pre-#166 grouping semantics, computed by full re-serialization."""
+    target = min(max_bytes, MAX_INGEST_BATCH_BYTES)
+    groups, current = [], []
+    for record in records:
+        candidate = current + [record]
+        size = len(
+            _fresh_wire({"protocol_version": "1", "records": candidate})
+        )
+        if current and (len(candidate) > max_records or size > target):
+            groups.append(current)
+            current = [record]
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+    return groups
+
+
+def test_batches_for_mixed_workload_match_grouping_and_exact_wire_bytes(tmp_path):
+    # A mixed workload: plain metadata records, one inline-content record,
+    # and one oversized content record (chunked into two transport chunks
+    # plus a parent). The cached wire bytes must equal a from-scratch
+    # serialization, and the grouping must equal the byte-arithmetic the
+    # pre-cache implementation applied.
+    outbox = new_outbox(tmp_path)
+    append_n(outbox, 3)
+    outbox.append(base_record("tool.call_completed"), content="secret args")
+    outbox.append(base_record("knowledge.record_written"), content=b"x" * 3_200_000)
+    records = list(outbox.iter_events())
+    assert len(records) == 7  # 3 plain + 1 inline + 2 chunks + 1 parent
+
+    max_records, max_bytes = 3, 64 * 1024
+    batches = list(build_batches(records, max_records=max_records, max_bytes=max_bytes))
+
+    assert [batch["records"] for batch in batches] == _reference_grouping(
+        records, max_records, max_bytes
+    )
+    assert [
+        record["producer_sequence"] for batch in batches for record in batch["records"]
+    ] == [record["producer_sequence"] for record in records]
+    for batch in batches:
+        assert batch["protocol_version"] == "1"
+        assert serialize_batch(batch) == _fresh_wire(batch)
+    outbox.close()
+
+
+def test_sync_ships_the_exact_bytes_the_sizing_step_measured(tmp_path):
+    outbox = new_outbox(tmp_path)
+    append_n(outbox, 4)
+
+    sent_bodies = []
+
+    class _CapturingTransport(InMemoryTransport):
+        def send(self, batch):
+            sent_bodies.append(serialize_batch(batch))
+            return super().send(batch)
+
+    sync(outbox, _CapturingTransport(), max_records=3)
+
+    assert len(sent_bodies) == 2
+    for body in sent_bodies:
+        import json
+
+        parsed = json.loads(body)
+        assert parsed["protocol_version"] == "1"
+        assert body == _fresh_wire(parsed)
+    outbox.close()

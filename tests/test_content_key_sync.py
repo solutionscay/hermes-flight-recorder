@@ -274,3 +274,63 @@ def test_retrying_transport_retries_send_keys():
 
     assert ack.accepted == 1
     assert inner.fail_times == 0  # exhausted the transient failures
+
+
+# --- serialize-once key batching (issue #166) ----------------------------
+def _fresh_key_wire(batch) -> bytes:
+    return json.dumps(
+        {"protocol_version": batch["protocol_version"], "records": batch["records"]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _reference_key_grouping(records, max_records):
+    """The pre-#166 O(n^2) grouping semantics, by full re-serialization."""
+    from hermes_flight_recorder.collector.sync import MAX_INGEST_BATCH_BYTES
+
+    groups, current = [], []
+    for record in records:
+        candidate = current + [record]
+        size = len(_fresh_key_wire({"protocol_version": "1", "records": candidate}))
+        if current and (len(candidate) > max_records or size > MAX_INGEST_BATCH_BYTES):
+            groups.append(current)
+            current = [record]
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _wrapped_key_record(index: int, dek_bytes: int = 120) -> dict:
+    return {
+        "installation_id": "inst-1",
+        "key_version": f"op#{index:016x}",
+        "recipient_key_id": "op",
+        "wrapped_dek": "A" * dek_bytes,
+    }
+
+
+def test_key_batches_match_prior_grouping_and_exact_wire_bytes():
+    from hermes_flight_recorder.collector.sync import (
+        _build_key_batches,
+        serialize_batch,
+    )
+
+    # A mixed workload: many small wrapped DEKs plus pathological large ones
+    # that force the byte ceiling (not just max_records) to split batches.
+    records = [_wrapped_key_record(i) for i in range(7)]
+    records += [_wrapped_key_record(100 + i, dek_bytes=1_500_000) for i in range(3)]
+
+    batches = list(_build_key_batches(records, max_records=4))
+
+    assert [batch["records"] for batch in batches] == _reference_key_grouping(
+        records, max_records=4
+    )
+    assert [
+        record["key_version"] for batch in batches for record in batch["records"]
+    ] == [record["key_version"] for record in records]
+    for batch in batches:
+        assert batch["protocol_version"] == "1"
+        assert serialize_batch(batch) == _fresh_key_wire(batch)
