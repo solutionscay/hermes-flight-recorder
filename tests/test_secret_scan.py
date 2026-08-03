@@ -22,7 +22,8 @@ from hermes_flight_recorder.collector._common import build_record
 from hermes_flight_recorder.collector.outbox import Outbox
 
 
-OPENAI_KEY = "sk-abcdefghijklmnopqrstuvwxyz1234567890"
+OPENAI_KEY = "sk-" + ("a" * 20) + "T3BlbkFJ" + ("b" * 20)
+BARE_SUSPECT = "MLpjxP9y1TKhH1aNUaq630GOgTvtSRvb"
 
 
 def _record(event_type: str = "invocation.started") -> dict:
@@ -60,7 +61,7 @@ def test_message_secret_creates_one_atomic_encrypted_finding(tmp_path):
     assert finding["causation_id"] == source["event_id"]
     assert finding["payload"] == {
         "event_type": "security.secret_detected",
-        "detector": "hfr-secret-scan-v1",
+        "detector": "detect-secrets-1.5.0",
         "match_count": 1,
         "artifact_ref": source["event_id"],
         "scan_status": "complete",
@@ -103,17 +104,20 @@ def test_unicode_offsets_are_byte_offsets():
 @pytest.mark.parametrize(
     ("detector_type", "text"),
     [
-        ("private_key_pem", "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0g=\n-----END PRIVATE KEY-----"),
+        (
+            "private_key_pem",
+            "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0g=\n-----END PRIVATE KEY-----",
+        ),
         ("aws_access_key_id", "AKIA" + "ABCDEFGHIJKLMNOP"),
         (
             "aws_secret_access_key",
-            "AWS_SECRET_ACCESS_KEY='" + "abcdEFGHijklMNOPqrstUVWXyz0123456789ABCD" + "'",
+            "AWS_SECRET_ACCESS_KEY='"
+            + "abcdEFGHijklMNOPqrstUVWXyz0123456789ABCD"
+            + "'",
         ),
         ("github_token", "ghp_abcdefghijklmnopqrstuvwxyz1234567890"),
-        ("bearer_token", "Bearer abcdefghijklmnopqrstuvwxyz.123456"),
-        ("authorization_token", "Authorization: Token abcdefghijklmnopqrstuvwxyz123456"),
         ("secret_assignment", "password = 'correct-horse-battery-staple'"),
-        ("high_entropy_quoted_value", '"aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY"'),
+        ("high_entropy_string", '"aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY"'),
     ],
 )
 def test_first_release_rule_families(detector_type, text):
@@ -139,6 +143,55 @@ def test_limit_and_deadline_return_partial_results():
         clock=lambda: next(ticks, 1.0),
     )
     assert timed.status == "partial"
+
+
+def test_bare_high_entropy_message_is_flagged():
+    raw = BARE_SUSPECT.encode()
+    result = secret_detector.scan(
+        {"content": raw}, max_bytes=len(raw), deadline_ms=1000
+    )
+
+    assert result.status == "complete"
+    assert [(match.type, match.value) for match in result.matches] == [
+        ("high_entropy_string", raw)
+    ]
+
+
+def test_bare_high_entropy_message_creates_an_encrypted_finding(tmp_path):
+    outbox = new_outbox(tmp_path)
+    source = outbox.append(_record(), content=BARE_SUSPECT)
+
+    finding = _events(outbox, "security.secret_detected")[0]
+    assert finding["causation_id"] == source["event_id"]
+    assert _finding_matches(outbox, finding)[0]["type"] == "high_entropy_string"
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        f"WHEATEVER_KEY={BARE_SUSPECT}",
+        f"some_service_token={BARE_SUSPECT}",
+        f'future-credential="{BARE_SUSPECT}"',
+    ],
+)
+def test_generic_credential_identifiers_flag_quoted_and_unquoted_values(assignment):
+    result = secret_detector.scan(
+        {"content": assignment.encode()}, max_bytes=100_000, deadline_ms=1000
+    )
+
+    assert [(match.type, match.value) for match in result.matches] == [
+        ("generic_secret_assignment", BARE_SUSPECT.encode())
+    ]
+
+
+def test_uuid_is_not_reported_as_a_secret():
+    raw = b"550e8400-e29b-41d4-a716-446655440000"
+    result = secret_detector.scan(
+        {"content": raw}, max_bytes=len(raw), deadline_ms=1000
+    )
+
+    assert result.status == "complete"
+    assert result.matches == ()
 
 
 def test_partial_scan_status_does_not_drop_the_source(tmp_path):
