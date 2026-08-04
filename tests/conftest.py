@@ -5,6 +5,15 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _disable_native_service(monkeypatch):
+    """No test may touch the real systemd user manager. install/update/uninstall
+    run through the service module, so disable it suite-wide; the dedicated
+    service tests drive the module directly with a fake runner instead.
+    """
+    monkeypatch.setenv("HFR_SERVICE_DISABLED", "1")
+
+
 @pytest.fixture
 def clean_env(monkeypatch):
     """Clear recorder-related environment variables for env-sensitive tests.

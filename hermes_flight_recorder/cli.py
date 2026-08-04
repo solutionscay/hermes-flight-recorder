@@ -107,6 +107,7 @@ def _cmd_install(args: argparse.Namespace) -> int:
             args.hermes_home,
             backfill=not args.no_backfill,
             operator_pubkey=args.operator_pubkey,
+            manage_service=not args.no_service,
         )
     except InstallError as exc:
         print(f"install failed: {exc}", file=sys.stderr)
@@ -642,6 +643,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install as a fleet agent that seals content to this operator public "
         "key; no private key is written to the host. Omit for a solo install "
         "(a keypair is minted locally). Generate the key with `keygen`.",
+    )
+    p_install.add_argument(
+        "--no-service",
+        action="store_true",
+        help="Do not register the native serve service; run "
+        "`hermes-flight-recorder serve` yourself. Without this, install enables a "
+        "systemd user service (Linux) that captures and transmits continuously.",
     )
     p_install.set_defaults(func=_cmd_install)
 

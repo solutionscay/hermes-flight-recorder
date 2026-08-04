@@ -36,6 +36,13 @@ INSTALLED_AT_META_KEY = "installed_at"
 # of ingesting the whole Hermes history.
 CAPTURE_BACKFILL_META_KEY = "capture:backfill"
 
+# Records whether install registered the native ``serve`` service (``"true"``)
+# or the operator opted out with ``--no-service`` (``"false"``). ``update`` reads
+# it to keep the service in the state the operator chose. Unset on installs that
+# predate the service manager, which ``update`` treats as "manage it" so an
+# `update` heals them.
+SERVICE_MANAGED_META_KEY = "service:managed"
+
 
 def resolve_hermes_home(hermes_home: str | Path | None) -> Path:
     """The Hermes data root: explicit arg, then $HERMES_HOME, then ~/.hermes."""

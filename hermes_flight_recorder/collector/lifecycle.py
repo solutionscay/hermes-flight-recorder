@@ -4,9 +4,10 @@
 creates ``$HERMES_HOME/flight-recorder``, initializes the outbox identity,
 establishes the operator key (solo: auto-mint both halves; fleet:
 ``--operator-pubkey`` writes only the public half), writes configuration with
-restrictive permissions, installs (or repoints) the in-gateway hook, and
-verifies the result. It is idempotent and never registers an OS service —
-native service registration wraps ``serve`` separately.
+restrictive permissions, installs (or repoints) the in-gateway hook, verifies
+the result, and (unless ``--no-service``) registers the native ``serve`` service
+so capture and transmit run continuously without a manual step. It is
+idempotent.
 
 Legacy ``~/.hermes-flight-recorder`` data is never moved silently: ``install``
 detects it and stops with an actionable message. (A ``migrate`` command that
@@ -29,6 +30,7 @@ from ._common import (
     CAPTURE_BACKFILL_META_KEY,
     INSTALLED_AT_META_KEY,
     LEGACY_FLIGHT_RECORDER_HOME,
+    SERVICE_MANAGED_META_KEY,
     resolve_flight_recorder_home,
     resolve_hermes_home,
 )
@@ -70,6 +72,7 @@ def install(
     *,
     backfill: bool = True,
     operator_pubkey: str | os.PathLike[str] | None = None,
+    manage_service: bool = False,
     log=print,
 ) -> Path:
     """Install (or update) the Flight Recorder into ``hermes_home``.
@@ -137,6 +140,11 @@ def install(
             # written when disabled, so a re-install never silently flips it on.
             if not backfill:
                 outbox.set_meta(CAPTURE_BACKFILL_META_KEY, "false")
+            # Record whether this install manages the native service, so a later
+            # `update` keeps the operator's choice.
+            outbox.set_meta(
+                SERVICE_MANAGED_META_KEY, "true" if manage_service else "false"
+            )
             from .update import write_installed_version
 
             version = write_installed_version(fr_home)
@@ -162,11 +170,21 @@ def install(
 
         _verify(fr_home, hook_dir)
         log("verified outbox, operator key, config, and hook.")
-        log("restart the Hermes gateway to load the hook, then run "
-            "`hermes-flight-recorder serve`.")
-        return fr_home
     finally:
+        # Release the runtime lock before enabling the service: `enable --now`
+        # starts `serve`, which acquires the same lock.
         runtime_lock.release()
+
+    if manage_service:
+        from .service import register_service
+
+        register_service(fr_home, hermes, log=log)
+        log("restart the Hermes gateway to load the hook. The recorder service "
+            "captures and transmits automatically.")
+    else:
+        log("restart the Hermes gateway to load the hook, then run "
+            "`hermes-flight-recorder serve` (or a service that wraps it).")
+    return fr_home
 
 
 def _stop_if_legacy_present(fr_home: Path, *, log) -> None:
@@ -326,6 +344,13 @@ def uninstall(
     """
     hermes = resolve_hermes_home(hermes_home)
     fr_home = resolve_flight_recorder_home(flight_recorder_home, hermes_home)
+
+    # Stop and remove the native service first: `disable --now` stops `serve`,
+    # which frees the runtime lock the refuse-if-serving check needs. Idempotent
+    # and a no-op when no service was ever registered.
+    from .service import unregister_service
+
+    unregister_service(log=log)
 
     _refuse_if_serving(fr_home)
 

@@ -22,7 +22,11 @@ from ..version import VersionInfo, build_identity, current_version
 from . import atomic_file
 from . import recorder_config
 from . import security_scan
-from ._common import resolve_flight_recorder_home, resolve_hermes_home
+from ._common import (
+    SERVICE_MANAGED_META_KEY,
+    resolve_flight_recorder_home,
+    resolve_hermes_home,
+)
 from .hook import HOOK_DIR_NAME, install_hook
 from .outbox import Outbox
 from .runtime_lock import LOCK_FILENAME, RuntimeLock, RuntimeLockError
@@ -356,6 +360,7 @@ def complete_update(
         )
 
     lock: RuntimeLock | None = None
+    manage_service = False
     if guard_owner_pid is None:
         lock = _refuse_if_serving(fr_home)
     else:
@@ -376,6 +381,10 @@ def complete_update(
                 selected_commit=expected_revision,
             )
             outbox.set_meta("installed_build", info.build)
+            # Keep the native service in the state the operator chose. Unset
+            # (installs older than the service manager) means "manage it", so an
+            # `update` heals a host that has been capturing but never shipping.
+            manage_service = outbox.get_meta(SERVICE_MANAGED_META_KEY) != "false"
         finally:
             outbox.close()
 
@@ -405,6 +414,14 @@ def complete_update(
         if lock is not None:
             lock.release()
 
+    # After the lock is free (so `enable --now` can start `serve`), re-assert the
+    # service. This is what makes `hermes-flight-recorder update` transmit again
+    # on a host whose recorder was capturing locally but never shipping.
+    if manage_service:
+        from .service import register_service
+
+        register_service(fr_home, hermes, log=log)
+
     log(f"updated build:        {build_identity()}")
     requested = expected_revision or "local checkout"
     installed = installed_info.revision or "unknown"
@@ -412,7 +429,12 @@ def complete_update(
     log(f"installed revision:   {installed}")
     log(f"installation id:      {installation_id}")
     log(f"hook refreshed:       {hook_dir}")
-    log("restart the Hermes gateway, then restart `hermes-flight-recorder serve`.")
+    if manage_service:
+        log("restart the Hermes gateway to load the hook. The recorder service "
+            "was restarted and resumes capture and transmit.")
+    else:
+        log("restart the Hermes gateway, then restart "
+            "`hermes-flight-recorder serve`.")
     return fr_home
 
 
