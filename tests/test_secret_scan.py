@@ -61,7 +61,7 @@ def test_message_secret_creates_one_atomic_encrypted_finding(tmp_path):
     assert finding["causation_id"] == source["event_id"]
     assert finding["payload"] == {
         "event_type": "security.secret_detected",
-        "detector": "detect-secrets-1.5.0",
+        "detector": "detect-secrets-1.5.0-policy-v2",
         "match_count": 1,
         "artifact_ref": source["event_id"],
         "scan_status": "complete",
@@ -117,7 +117,6 @@ def test_unicode_offsets_are_byte_offsets():
         ),
         ("github_token", "ghp_abcdefghijklmnopqrstuvwxyz1234567890"),
         ("secret_assignment", "password = 'correct-horse-battery-staple'"),
-        ("high_entropy_string", '"aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY"'),
     ],
 )
 def test_first_release_rule_families(detector_type, text):
@@ -145,31 +144,27 @@ def test_limit_and_deadline_return_partial_results():
     assert timed.status == "partial"
 
 
-def test_bare_high_entropy_message_is_flagged():
+def test_bare_high_entropy_message_is_not_flagged():
     raw = BARE_SUSPECT.encode()
     result = secret_detector.scan(
         {"content": raw}, max_bytes=len(raw), deadline_ms=1000
     )
 
     assert result.status == "complete"
-    assert [(match.type, match.value) for match in result.matches] == [
-        ("high_entropy_string", raw)
-    ]
+    assert result.matches == ()
 
 
-def test_bare_high_entropy_message_creates_an_encrypted_finding(tmp_path):
+def test_bare_high_entropy_message_does_not_create_a_finding(tmp_path):
     outbox = new_outbox(tmp_path)
-    source = outbox.append(_record(), content=BARE_SUSPECT)
+    outbox.append(_record(), content=BARE_SUSPECT)
 
-    finding = _events(outbox, "security.secret_detected")[0]
-    assert finding["causation_id"] == source["event_id"]
-    assert _finding_matches(outbox, finding)[0]["type"] == "high_entropy_string"
+    assert _events(outbox, "security.secret_detected") == []
 
 
 @pytest.mark.parametrize(
     "assignment",
     [
-        f"WHEATEVER_KEY={BARE_SUSPECT}",
+        f"unknown_service_api_key={BARE_SUSPECT}",
         f"some_service_token={BARE_SUSPECT}",
         f'future-credential="{BARE_SUSPECT}"',
     ],
@@ -182,6 +177,24 @@ def test_generic_credential_identifiers_flag_quoted_and_unquoted_values(assignme
     assert [(match.type, match.value) for match in result.matches] == [
         ("generic_secret_assignment", BARE_SUSPECT.encode())
     ]
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        f"WHEATEVER_KEY={BARE_SUSPECT}",
+        "api_token=${TOKEN_FROM_ENV}",
+        "api_token=https://vault.example/token",
+        "api_token=your-token",
+        "api_token=************",
+    ],
+)
+def test_generic_assignment_rejects_weak_context_and_non_literals(assignment):
+    result = secret_detector.scan(
+        {"content": assignment.encode()}, max_bytes=100_000, deadline_ms=1000
+    )
+
+    assert result.matches == ()
 
 
 def test_uuid_is_not_reported_as_a_secret():

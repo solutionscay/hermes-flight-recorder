@@ -15,36 +15,27 @@ from dataclasses import dataclass
 
 from detect_secrets.core.scan import scan_line
 from detect_secrets.plugins.base import RegexBasedDetector
-from detect_secrets.plugins.high_entropy_strings import (
-    Base64HighEntropyString,
-    HexHighEntropyString,
-)
 from detect_secrets.settings import get_plugins, transient_settings
 
-DETECTOR_NAME = "detect-secrets-1.5.0"
+# Policy v2 reports structured credential formats and explicit literal
+# assignments only. A high-entropy string is common in normal agent traffic,
+# so it is never a finding on its own.
+DETECTOR_NAME = "detect-secrets-1.5.0-policy-v2"
 CHUNK_BYTES = 16 * 1024
 CHUNK_OVERLAP = 2 * 1024
 MAX_CANDIDATE_BYTES = 16 * 1024
 MAX_MATCHES = 512
 
 _SETTINGS_LOCK = threading.RLock()
-_BASE64_DETECTOR = Base64HighEntropyString(limit=4.5)
-_HEX_DETECTOR = HexHighEntropyString(limit=3.0)
-_ENTROPY_TYPES = {
-    _BASE64_DETECTOR.secret_type: (_BASE64_DETECTOR, 20),
-    _HEX_DETECTOR.secret_type: (_HEX_DETECTOR, 32),
-}
 _PLUGIN_CONFIG = (
     "ArtifactoryDetector",
     "AWSKeyDetector",
     "AzureStorageKeyDetector",
-    "Base64HighEntropyString",
     "BasicAuthDetector",
     "CloudantDetector",
     "DiscordBotTokenDetector",
     "GitHubTokenDetector",
     "GitLabTokenDetector",
-    "HexHighEntropyString",
     "IbmCloudIamDetector",
     "IbmCosHmacDetector",
     "JwtTokenDetector",
@@ -65,10 +56,8 @@ _SETTINGS = {"plugins_used": [{"name": name} for name in _PLUGIN_CONFIG]}
 
 _TYPE_NAMES = {
     "AWS Access Key": "aws_access_key_id",
-    "Base64 High Entropy String": "high_entropy_string",
     "GitHub Token": "github_token",
     "GitLab Token": "gitlab_token",
-    "Hex High Entropy String": "high_entropy_string",
     "NPM tokens": "npm_token",
     "OpenAI Token": "openai_api_key",
     "Secret Keyword": "secret_assignment",
@@ -77,13 +66,10 @@ _TYPE_NAMES = {
 }
 _IDENTIFIER_RE = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*")
 _UNQUOTED_VALUE_RE = re.compile(r"[^\s#;,]{8,1024}")
-_SUSPECT_SUFFIXES = frozenset(
+_SENSITIVE_IDENTIFIER_WORDS = frozenset(
     {
-        "auth",
         "credential",
         "credentials",
-        "key",
-        "pass",
         "passwd",
         "password",
         "pwd",
@@ -91,8 +77,24 @@ _SUSPECT_SUFFIXES = frozenset(
         "token",
     }
 )
-_UUID_RE = re.compile(
-    r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+_KEY_QUALIFIERS = frozenset({"access", "api", "auth", "client", "private", "secret"})
+_PLACEHOLDER_VALUES = frozenset(
+    {
+        "changeme",
+        "change-me",
+        "example",
+        "not-a-secret",
+        "null",
+        "password",
+        "placeholder",
+        "redacted",
+        "replace-me",
+        "secret",
+        "test",
+        "todo",
+        "your-api-key",
+        "your-token",
+    }
 )
 _PEM_RE = re.compile(
     rb"-----BEGIN ((?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY)-----"
@@ -125,9 +127,31 @@ def _type_name(upstream_name: str) -> str:
 
 def _is_suspect_identifier(identifier: str) -> bool:
     parts = tuple(part for part in re.split(r"[_.-]+", identifier.lower()) if part)
-    return bool(parts) and (
-        parts[-1] in _SUSPECT_SUFFIXES or identifier.lower() in _SUSPECT_SUFFIXES
-    )
+    if not parts:
+        return False
+    if any(part in _SENSITIVE_IDENTIFIER_WORDS for part in parts):
+        return True
+    # `key` alone is a noisy field name. Require context that says what kind
+    # of key the assignment contains.
+    return "key" in parts and bool(set(parts) & _KEY_QUALIFIERS)
+
+
+def _is_literal_secret_value(value: str) -> bool:
+    """Accept a plausible literal and reject a reference, mask, or sample."""
+    candidate = value.strip()
+    if len(candidate) < 12 or candidate.lower() in _PLACEHOLDER_VALUES:
+        return False
+    if candidate.startswith(("$", "<", "{{", "vault://", "secret://", "env:")):
+        return False
+    if candidate.endswith((">", "}}")) or candidate.lower().startswith(
+        ("http://", "https://")
+    ):
+        return False
+    return candidate not in {
+        "*" * len(candidate),
+        "x" * len(candidate),
+        "X" * len(candidate),
+    }
 
 
 def _assignment_values(text: str) -> Iterable[tuple[int, int, str]]:
@@ -140,12 +164,14 @@ def _assignment_values(text: str) -> Iterable[tuple[int, int, str]]:
         quote = text[value_start] if text[value_start] in {"'", '"'} else None
         if quote:
             value_end = text.find(quote, value_start + 1)
-            if value_end < 0 or value_end - value_start - 1 < 8:
+            if value_end < 0:
                 continue
-            yield value_start + 1, value_end, text[value_start + 1 : value_end]
+            value = text[value_start + 1 : value_end]
+            if _is_literal_secret_value(value):
+                yield value_start + 1, value_end, value
             continue
         value = _UNQUOTED_VALUE_RE.match(text, value_start)
-        if value:
+        if value and _is_literal_secret_value(value.group(0)):
             yield value.start(), value.end(), value.group(0)
 
 
@@ -173,19 +199,8 @@ def _add_text_match(
     key = (target, byte_start, byte_end)
     candidate = Match(detector_type, target, byte_start, byte_end, value)
     existing = matches.get(key)
-    if existing is None or existing.type == "high_entropy_string":
+    if existing is None:
         matches[key] = candidate
-
-
-def _entropy_candidate(upstream_type: str, value: str) -> bool:
-    detector, minimum_length = _ENTROPY_TYPES[upstream_type]
-    if len(value) < minimum_length or _UUID_RE.fullmatch(value):
-        return False
-    # An eager scan can return a complete NAME=value expression. The generic
-    # assignment policy records only its value.
-    if "=" in value[:-2]:
-        return False
-    return detector.calculate_shannon_entropy(value) > detector.entropy_limit
 
 
 def _regex_value(match: re.Match[str]) -> tuple[int, int]:
@@ -239,10 +254,6 @@ def _scan_segment(
     for finding in findings:
         value = finding.secret_value
         if not value or finding.type in regex_plugin_types:
-            continue
-        if finding.type in _ENTROPY_TYPES and not _entropy_candidate(
-            finding.type, value
-        ):
             continue
         start = 0
         while True:

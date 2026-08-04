@@ -230,6 +230,11 @@ shows a secret preview. Exit code `1` means that a finding exists. Exit code
 `2` means that the configuration or decryption failed. A fleet agent needs the
 operator private key on a separate operator machine to read this report.
 
+The scanner reports known provider token formats, private key blocks, and
+literal values assigned to a credential field. It does not report a
+high-entropy value by itself. It ignores placeholder values, masked values,
+URLs, and environment or vault references.
+
 Suppress one known finding by its type and fingerprint:
 
 ```bash
